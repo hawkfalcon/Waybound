@@ -6,5 +6,7 @@
 	<array>
 		<string>remote-notification</string>
 	</array>
+   <key>NSLocationWhenInUseUsageDescription</key>
+   <string>Waybound needs your location to show nearby transit stops and routes.</string>
 </dict>
 </plist>
