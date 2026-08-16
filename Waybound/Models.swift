@@ -258,12 +258,31 @@ struct APIStopTimeEvent: Decodable {
         case estimatedDelay = "estimated_delay"
     }
 
+    var scheduledDate: Date? {
+        TransitTime.date(from: scheduledUTC)
+    }
+
+    var estimatedDate: Date? {
+        TransitTime.date(from: estimatedUTC)
+    }
+
+    /// Some feeds leave a stale realtime timestamp attached to an otherwise
+    /// valid scheduled event. Never let an estimate several hours away from the
+    /// schedule turn a nearby bus into an all-day wait.
     var effectiveDate: Date? {
-        TransitTime.date(from: estimatedUTC ?? scheduledUTC)
+        let scheduled = scheduledDate
+        guard let estimated = estimatedDate else { return scheduled }
+        guard let scheduled else { return estimated }
+        return abs(estimated.timeIntervalSince(scheduled)) <= 3 * 60 * 60
+            ? estimated : scheduled
     }
 
     var isRealtime: Bool {
-        estimatedUTC != nil || estimatedDelay != nil
+        guard estimatedDate != nil else { return estimatedDelay != nil }
+        guard let scheduled = scheduledDate, let estimated = estimatedDate else {
+            return true
+        }
+        return abs(estimated.timeIntervalSince(scheduled)) <= 3 * 60 * 60
     }
 }
 

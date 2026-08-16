@@ -27,6 +27,7 @@ struct ContentView: View {
     )
     @State private var selectedJourneyID: Int?
     @State private var selectedStopID: Int?
+    @State private var selectedStopRouteIDs: Set<Int>?
     @State private var expansionPrototype: RouteExpansionPrototype = .sheet
 
     private var selectedJourney: RouteJourney? {
@@ -39,7 +40,7 @@ struct ContentView: View {
 
     private var highlightedRouteIDs: Set<Int>? {
         if let selectedJourneyID { return [selectedJourneyID] }
-        return selectedStop?.routeIDs
+        return selectedStopRouteIDs
     }
 
     private var routesWithoutJourneys: [TransitRoute] {
@@ -63,7 +64,9 @@ struct ContentView: View {
                         && expansionPrototype == .map,
                     cameraRequest: cameraRequest,
                     onSelectJourney: selectJourney,
-                    onSelectStop: selectStop
+                    onSelectStop: { stopID, routeIDs in
+                        selectStop(stopID, routeIDs: routeIDs)
+                    }
                 )
                 .ignoresSafeArea()
 
@@ -81,6 +84,7 @@ struct ContentView: View {
             guard let region else { return }
             selectedJourneyID = nil
             selectedStopID = nil
+            selectedStopRouteIDs = nil
             cameraRequest = WayboundCameraRequest(region: region)
         }
         .onChange(of: viewModel.journeys) { oldJourneys, newJourneys in
@@ -209,6 +213,7 @@ struct ContentView: View {
         else { return }
         withAnimation(.snappy(duration: 0.3)) {
             selectedStopID = nil
+            selectedStopRouteIDs = nil
             selectedJourneyID = routeID
         }
         if expansionPrototype == .map {
@@ -218,17 +223,19 @@ struct ContentView: View {
         }
     }
 
-    private func selectStop(_ stopID: Int) {
+    private func selectStop(_ stopID: Int, routeIDs: Set<Int>) {
         guard viewModel.stops.contains(where: { $0.id == stopID }) else { return }
         withAnimation(.snappy(duration: 0.3)) {
             selectedJourneyID = nil
             selectedStopID = stopID
+            selectedStopRouteIDs = routeIDs
         }
     }
 
     private func clearStopSelection() {
         withAnimation(.snappy(duration: 0.3)) {
             selectedStopID = nil
+            selectedStopRouteIDs = nil
         }
     }
 
@@ -316,7 +323,7 @@ private struct JourneyOverviewSheet: View {
                         .foregroundStyle(WayboundPalette.ink)
                     Text(
                         selectedStopName.map { "Routes serving \($0)" }
-                            ?? "One useful destination per boardable route"
+                            ?? "Up to six nearest boardable routes · one destination each"
                     )
                     .font(.system(size: 12, weight: .regular, design: .rounded))
                     .foregroundStyle(WayboundPalette.ink.opacity(0.62))
@@ -345,7 +352,7 @@ private struct JourneyOverviewSheet: View {
                 ContentUnavailableView {
                     Label("No boardable trips", systemImage: "bus")
                 } description: {
-                    Text("No real trip with a trusted street shape departs in the next 12 hours.")
+                    Text("No real trip with a trusted street shape departs in the next 3 hours.")
                 }
                 .fontDesign(.rounded)
             } else {
@@ -367,7 +374,7 @@ private struct JourneyOverviewSheet: View {
 
                         if !unavailableRoutes.isEmpty && !isLoading {
                             HStack {
-                                Text("No boardable trip in the next 12 hours")
+                                Text("No boardable trip in the next 3 hours")
                                     .font(
                                         .system(
                                             size: 13,

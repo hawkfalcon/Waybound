@@ -78,7 +78,11 @@ final class TransitViewModel: NSObject, ObservableObject {
     /// Trip geometry is sampled per route so payloads stay bounded. Generated
     /// stop-to-stop shapes are discarded rather than drawn as real alignments.
     private let maximumTripGeometriesPerRoute = 12
-    private let upcomingDepartureWindowSeconds = 43_200 // 12 hours
+    /// Keep the map to a glanceable set of routes a rider can actually reach.
+    private let maximumVisibleJourneys = 6
+    private let upcomingDepartureWindowSeconds = 10_800 // 3 hours
+    private let maximumFlagshipRideMinutes = 180
+    private let routeLaneSpacingPoints: Double = 5.5
     private let minimumBoardingBufferMinutes = 2
     private let walkingMetersPerMinute: Double = 80
     // Transitland's REST endpoint filters by radius but does not guarantee
@@ -150,7 +154,6 @@ final class TransitViewModel: NSObject, ObservableObject {
                         near: origin
                     )
                     guard self.activeFetchID == fetchID else { return }
-                    self.routes = fetchedRoutes
                     self.isLoadingJourneys = true
                     let fetchedJourneys = await fetchJourneys(
                         for: fetchedRoutes,
@@ -158,7 +161,12 @@ final class TransitViewModel: NSObject, ObservableObject {
                         from: origin
                     )
                     guard self.activeFetchID == fetchID else { return }
+
+                    // Only boardable journeys survive to the render model. Do
+                    // not briefly publish every route in the half-mile search
+                    // area while schedule details are still loading.
                     self.journeys = fetchedJourneys
+                    self.routes = fetchedJourneys.map(\.route)
                     self.isLoadingJourneys = false
                 } catch {
                     errors.append("Routes: \(error.localizedDescription)")
@@ -697,6 +705,9 @@ final class TransitViewModel: NSObject, ObservableObject {
         )
         let departuresByStop = await fetchUpcomingDepartures(for: sourceStopIDs)
         let now = Date()
+        let latestUsefulDeparture = now.addingTimeInterval(
+            Double(upcomingDepartureWindowSeconds)
+        )
         var selections: [JourneyDepartureSelection] = []
 
         for route in routes {
@@ -709,7 +720,8 @@ final class TransitViewModel: NSObject, ObservableObject {
                     guard departure.trip?.route?.id == route.transitlandID,
                           let event = departure.departure ?? departure.arrival,
                           let departureDate = event.effectiveDate,
-                          departureDate >= earliestBoardableDate
+                          departureDate >= earliestBoardableDate,
+                          departureDate <= latestUsefulDeparture
                     else { continue }
 
                     candidates.append(
@@ -777,7 +789,7 @@ final class TransitViewModel: NSObject, ObservableObject {
             grouping: journeyCandidates,
             by: { $0.route.transitlandID }
         )
-        var journeys = routes.compactMap { route -> RouteJourney? in
+        let allJourneys = routes.compactMap { route -> RouteJourney? in
             let candidates = candidatesByRoute[route.transitlandID] ?? []
             let usefulCandidates = candidates.filter { $0.rideMinutes >= 8 }
             let pool = usefulCandidates.isEmpty ? candidates : usefulCandidates
@@ -788,18 +800,38 @@ final class TransitViewModel: NSObject, ObservableObject {
                 return $0.totalMinutes < $1.totalMinutes
             }
         }
-        .sorted {
-            if $0.departureDate != $1.departureDate {
-                return $0.departureDate < $1.departureDate
+
+        // Proximity is the primary map-ranking signal. Departure time breaks
+        // ties between routes boarding at the same pole or intersection.
+        var journeys = Array(
+            allJourneys.sorted { lhs, rhs in
+                let lhsDistance = originLocation.distance(from: CLLocation(
+                    latitude: lhs.boardingStop.coordinate.latitude,
+                    longitude: lhs.boardingStop.coordinate.longitude
+                ))
+                let rhsDistance = originLocation.distance(from: CLLocation(
+                    latitude: rhs.boardingStop.coordinate.latitude,
+                    longitude: rhs.boardingStop.coordinate.longitude
+                ))
+                if abs(lhsDistance - rhsDistance) > 1 {
+                    return lhsDistance < rhsDistance
+                }
+                if lhs.departureDate != rhs.departureDate {
+                    return lhs.departureDate < rhs.departureDate
+                }
+                return lhs.route.fullDisplayName.localizedStandardCompare(
+                    rhs.route.fullDisplayName
+                ) == .orderedAscending
             }
-            return $0.route.fullDisplayName.localizedStandardCompare(
-                $1.route.fullDisplayName
-            ) == .orderedAscending
-        }
+            .prefix(maximumVisibleJourneys)
+        )
 
         let midpoint = Double(max(0, journeys.count - 1)) / 2
         journeys = journeys.enumerated().map { index, journey in
-            copy(journey: journey, laneOffsetPoints: (Double(index) - midpoint) * 3)
+            copy(
+                journey: journey,
+                laneOffsetPoints: (Double(index) - midpoint) * routeLaneSpacingPoints
+            )
         }
         return journeys
     }
@@ -921,12 +953,13 @@ final class TransitViewModel: NSObject, ObservableObject {
         }
         guard downstream.count >= 2 else { return nil }
 
-        let flagshipIndex = selectFlagshipIndex(
+        guard let flagshipIndex = selectFlagshipIndex(
             in: downstream,
             headsign: trip.tripHeadsign
-        )
+        ) else { return nil }
         let flagship = downstream[flagshipIndex]
         guard flagship.offset > 0,
+              flagship.offset <= maximumFlagshipRideMinutes,
               let flagshipCoordinate = coordinate(for: flagship.stopTime.stop)
         else { return nil }
 
@@ -1002,7 +1035,7 @@ final class TransitViewModel: NSObject, ObservableObject {
     private func selectFlagshipIndex(
         in stops: [(stopTime: APITripStopTime, offset: Int)],
         headsign: String?
-    ) -> Int {
+    ) -> Int? {
         let landmarkTerms = [
             "airport", "beach", "campus", "center", "college", "courthouse",
             "downtown", "harbor", "hospital", "library", "mall", "museum",
@@ -1019,10 +1052,11 @@ final class TransitViewModel: NSObject, ObservableObject {
             .filter { $0.count >= 3 }
         let finalIndex = stops.count - 1
         let eligible = stops.indices.filter {
-            stops[$0].offset >= 8 && stops[$0].offset <= 180
+            stops[$0].offset >= 8
+                && stops[$0].offset <= maximumFlagshipRideMinutes
         }
-        return (eligible.isEmpty ? Array(stops.indices.dropFirst()) : eligible)
-            .max { lhs, rhs in
+        guard !eligible.isEmpty else { return nil }
+        return eligible.max { lhs, rhs in
                 func score(_ index: Int) -> Int {
                     let item = stops[index]
                     let name = (item.stopTime.stop.stopName ?? "")
@@ -1056,7 +1090,7 @@ final class TransitViewModel: NSObject, ObservableObject {
                         + usefulRideScore + progressScore - veryLongPenalty
                 }
                 return score(lhs) < score(rhs)
-            } ?? finalIndex
+            }
     }
 
     private func coordinate(for stop: APITripStop) -> CLLocationCoordinate2D? {

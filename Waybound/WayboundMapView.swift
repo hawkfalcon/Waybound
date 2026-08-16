@@ -21,7 +21,7 @@ struct WayboundMapView: UIViewRepresentable {
     let showsMapLadder: Bool
     let cameraRequest: WayboundCameraRequest
     let onSelectJourney: (Int) -> Void
-    let onSelectStop: (Int) -> Void
+    let onSelectStop: (Int, Set<Int>) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -76,29 +76,9 @@ struct WayboundMapView: UIViewRepresentable {
 
             let selectedID = parent.selectedJourneyID
             let highlightedRouteIDs = parent.highlightedRouteIDs
-            let journeyRouteIDs = Set(parent.journeys.map(\.id))
 
-            // Keep nearby real route geometry visible while schedules load or
-            // when a line has no boardable trip in the current time window.
-            for (routeIndex, route) in parent.routes.enumerated()
-            where !journeyRouteIDs.contains(route.transitlandID) {
-                let opacity = highlightedRouteIDs.map {
-                    $0.contains(route.transitlandID) ? 0.82 : 0.09
-                } ?? 0.45
-                let midpoint = Double(max(0, parent.routes.count - 1)) / 2
-                let laneOffset = (Double(routeIndex) - midpoint) * 3
-                addOverlays(
-                    for: route.polylines,
-                    routeID: route.transitlandID,
-                    color: UIColor(route.color),
-                    opacity: opacity,
-                    lineWidth: 2.5,
-                    laneOffset: laneOffset,
-                    dashed: false,
-                    to: mapView
-                )
-            }
-
+            // The render model contains only the capped, boardable journeys.
+            // Never fall back to drawing every route associated with nearby stops.
             for journey in parent.journeys {
                 let isSelected = selectedID == journey.id
                 let isHighlighted = highlightedRouteIDs?.contains(journey.id) ?? true
@@ -108,7 +88,7 @@ struct WayboundMapView: UIViewRepresentable {
                     routeID: journey.id,
                     color: UIColor(journey.route.color),
                     opacity: opacity,
-                    lineWidth: isSelected ? 5 : (isHighlighted ? 4 : 3.5),
+                    lineWidth: isSelected ? 4.5 : (isHighlighted ? 3 : 2.5),
                     laneOffset: journey.laneOffsetPoints,
                     dashed: false,
                     to: mapView
@@ -128,33 +108,17 @@ struct WayboundMapView: UIViewRepresentable {
                 }
             }
 
-            let journeyByRoute = Dictionary(
-                uniqueKeysWithValues: parent.journeys.map { ($0.id, $0) }
-            )
-            for stop in parent.stops {
-                let stopJourneys = stop.routeIDs.compactMap { journeyByRoute[$0] }
-                guard !stopJourneys.isEmpty || parent.journeys.isEmpty else { continue }
-                let colors = stopJourneys
-                    .sorted { $0.route.fullDisplayName < $1.route.fullDisplayName }
-                    .map { UIColor($0.route.color) }
-                let isDimmed = highlightedRouteIDs.map {
-                    stop.routeIDs.isDisjoint(with: $0)
-                } ?? false
-                mapView.addAnnotation(
-                    StopClusterMapAnnotation(
-                        stop: stop,
-                        colors: colors,
-                        routeCount: max(stopJourneys.count, stop.routeIDs.count),
-                        isDimmed: isDimmed,
-                        isSelected: stop.id == parent.selectedStopID
-                    )
-                )
-            }
+            // Mark only the stops the retained journeys actually board at. Nearby
+            // source records within one map-marker footprint become one badge.
+            mapView.addAnnotations(boardingStopAnnotations())
 
-            for journey in parent.journeys {
+            for (rank, journey) in parent.journeys.enumerated()
+            where selectedID == nil || journey.id == selectedID {
                 mapView.addAnnotation(
                     DestinationMapAnnotation(
                         journey: journey,
+                        rank: rank,
+                        isSelected: journey.id == selectedID,
                         isDimmed: highlightedRouteIDs.map {
                             !$0.contains(journey.id)
                         } ?? false
@@ -170,6 +134,61 @@ struct WayboundMapView: UIViewRepresentable {
                         LadderStopMapAnnotation(stop: stop, journey: journey)
                     )
                 }
+            }
+        }
+
+        private func boardingStopAnnotations() -> [StopClusterMapAnnotation] {
+            let mergeDistance: CLLocationDistance = 28
+            var groups: [[RouteJourney]] = []
+
+            for journey in parent.journeys {
+                let location = CLLocation(
+                    latitude: journey.boardingStop.coordinate.latitude,
+                    longitude: journey.boardingStop.coordinate.longitude
+                )
+                if let groupIndex = groups.firstIndex(where: { group in
+                    group.contains { member in
+                        let memberLocation = CLLocation(
+                            latitude: member.boardingStop.coordinate.latitude,
+                            longitude: member.boardingStop.coordinate.longitude
+                        )
+                        return location.distance(from: memberLocation) <= mergeDistance
+                    }
+                }) {
+                    groups[groupIndex].append(journey)
+                } else {
+                    groups.append([journey])
+                }
+            }
+
+            return groups.compactMap { group in
+                guard let representative = group.min(by: {
+                    if $0.walkMinutes != $1.walkMinutes {
+                        return $0.walkMinutes < $1.walkMinutes
+                    }
+                    return $0.departureDate < $1.departureDate
+                }) else { return nil }
+
+                let sortedJourneys = group.sorted {
+                    $0.route.fullDisplayName.localizedStandardCompare(
+                        $1.route.fullDisplayName
+                    ) == .orderedAscending
+                }
+                let routeIDs = Set(sortedJourneys.map(\.id))
+                let colors = sortedJourneys.map { UIColor($0.route.color) }
+                let isDimmed = parent.highlightedRouteIDs.map {
+                    routeIDs.isDisjoint(with: $0)
+                } ?? false
+                return StopClusterMapAnnotation(
+                    stop: representative.boardingStop,
+                    sourceStopIDs: Set(group.map { $0.boardingStop.id }),
+                    routeIDs: routeIDs,
+                    colors: colors,
+                    isDimmed: isDimmed,
+                    isSelected: group.contains {
+                        $0.boardingStop.id == parent.selectedStopID
+                    }
+                )
             }
         }
 
@@ -274,7 +293,7 @@ struct WayboundMapView: UIViewRepresentable {
                 parent.onSelectJourney(destination.journey.id)
                 mapView.deselectAnnotation(destination, animated: false)
             } else if let cluster = view.annotation as? StopClusterMapAnnotation {
-                parent.onSelectStop(cluster.stop.id)
+                parent.onSelectStop(cluster.stop.id, cluster.routeIDs)
                 mapView.deselectAnnotation(cluster, animated: false)
             }
         }
@@ -432,11 +451,13 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
             )
         }
 
+        let path = CGMutablePath()
+        path.move(to: offsetPoints[0])
+        for point in offsetPoints.dropFirst() {
+            path.addLine(to: point)
+        }
+
         context.saveGState()
-        context.setStrokeColor(
-            routeOverlay.color.withAlphaComponent(routeOverlay.opacity).cgColor
-        )
-        context.setLineWidth(CGFloat(routeOverlay.lineWidth) / zoomScale)
         context.setLineCap(.round)
         context.setLineJoin(.round)
         if routeOverlay.dashed {
@@ -445,10 +466,24 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
                 lengths: [8 / zoomScale, 7 / zoomScale]
             )
         }
-        context.move(to: offsetPoints[0])
-        for point in offsetPoints.dropFirst() {
-            context.addLine(to: point)
-        }
+
+        // A narrow cream casing keeps adjacent route colors discrete even when
+        // several trips share exactly the same source shape.
+        context.addPath(path)
+        context.setStrokeColor(
+            UIColor(red: 0.965, green: 0.945, blue: 0.89, alpha: routeOverlay.opacity)
+                .cgColor
+        )
+        context.setLineWidth(
+            CGFloat(routeOverlay.lineWidth + 2) / zoomScale
+        )
+        context.strokePath()
+
+        context.addPath(path)
+        context.setStrokeColor(
+            routeOverlay.color.withAlphaComponent(routeOverlay.opacity).cgColor
+        )
+        context.setLineWidth(CGFloat(routeOverlay.lineWidth) / zoomScale)
         context.strokePath()
         context.restoreGState()
     }
@@ -458,35 +493,48 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
 
 private final class DestinationMapAnnotation: NSObject, MKAnnotation {
     let journey: RouteJourney
+    let rank: Int
+    let isSelected: Bool
     let isDimmed: Bool
     dynamic var coordinate: CLLocationCoordinate2D { journey.destinationCoordinate }
     var title: String? { journey.destinationName }
 
-    init(journey: RouteJourney, isDimmed: Bool) {
+    init(
+        journey: RouteJourney,
+        rank: Int,
+        isSelected: Bool,
+        isDimmed: Bool
+    ) {
         self.journey = journey
+        self.rank = rank
+        self.isSelected = isSelected
         self.isDimmed = isDimmed
     }
 }
 
 private final class StopClusterMapAnnotation: NSObject, MKAnnotation {
     let stop: TransitStop
+    let sourceStopIDs: Set<Int>
+    let routeIDs: Set<Int>
     let colors: [UIColor]
-    let routeCount: Int
     let isDimmed: Bool
     let isSelected: Bool
     dynamic var coordinate: CLLocationCoordinate2D { stop.coordinate }
     var title: String? { stop.name }
+    var routeCount: Int { routeIDs.count }
 
     init(
         stop: TransitStop,
+        sourceStopIDs: Set<Int>,
+        routeIDs: Set<Int>,
         colors: [UIColor],
-        routeCount: Int,
         isDimmed: Bool,
         isSelected: Bool
     ) {
         self.stop = stop
+        self.sourceStopIDs = sourceStopIDs
+        self.routeIDs = routeIDs
         self.colors = colors
-        self.routeCount = routeCount
         self.isDimmed = isDimmed
         self.isSelected = isSelected
     }
@@ -508,7 +556,7 @@ private final class DestinationAnnotationView: MKAnnotationView {
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
         collisionMode = .rectangle
-        displayPriority = .required
+        displayPriority = .defaultHigh
         canShowCallout = false
     }
 
@@ -518,11 +566,14 @@ private final class DestinationAnnotationView: MKAnnotationView {
 
     func configure(with annotation: DestinationMapAnnotation) {
         subviews.forEach { $0.removeFromSuperview() }
-        frame = CGRect(x: 0, y: 0, width: 184, height: 58)
-        centerOffset = CGPoint(x: 0, y: -27)
+        frame = CGRect(x: 0, y: 0, width: 210, height: 72)
+        centerOffset = CGPoint(x: 0, y: -34)
         alpha = annotation.isDimmed ? 0.28 : 1
+        displayPriority = annotation.isSelected
+            ? .required
+            : (annotation.rank < 3 ? .defaultHigh : .defaultLow)
 
-        let card = UIView(frame: CGRect(x: 5, y: 0, width: 174, height: 48))
+        let card = UIView(frame: CGRect(x: 5, y: 0, width: 200, height: 62))
         card.backgroundColor = UIColor(red: 0.965, green: 0.945, blue: 0.89, alpha: 0.98)
         card.layer.cornerRadius = 12
         card.layer.borderWidth = 1.5
@@ -533,25 +584,30 @@ private final class DestinationAnnotationView: MKAnnotationView {
         card.layer.shadowOffset = CGSize(width: 0, height: 2)
         addSubview(card)
 
-        let colorBar = UIView(frame: CGRect(x: 0, y: 0, width: 8, height: 48))
+        let colorBar = UIView(frame: CGRect(x: 0, y: 0, width: 8, height: 62))
         colorBar.backgroundColor = UIColor(annotation.journey.route.color)
         colorBar.layer.cornerRadius = 4
         card.addSubview(colorBar)
 
-        let destinationLabel = UILabel(frame: CGRect(x: 16, y: 5, width: 150, height: 20))
-        destinationLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        destinationLabel.textColor = UIColor(red: 0.14, green: 0.19, blue: 0.18, alpha: 1)
+        let destinationLabel = UILabel(
+            frame: CGRect(x: 16, y: 5, width: 176, height: 34)
+        )
+        destinationLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        destinationLabel.textColor = UIColor(
+            red: 0.14, green: 0.19, blue: 0.18, alpha: 1
+        )
         destinationLabel.text = annotation.journey.destinationName
+        destinationLabel.numberOfLines = 2
         destinationLabel.lineBreakMode = .byTruncatingTail
         card.addSubview(destinationLabel)
 
-        let timeLabel = UILabel(frame: CGRect(x: 16, y: 25, width: 150, height: 17))
+        let timeLabel = UILabel(frame: CGRect(x: 16, y: 40, width: 176, height: 17))
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .bold)
         timeLabel.textColor = UIColor(annotation.journey.route.color)
         timeLabel.text = "\(annotation.journey.totalMinutes) min total"
         card.addSubview(timeLabel)
 
-        let pin = UIView(frame: CGRect(x: 86, y: 45, width: 12, height: 12))
+        let pin = UIView(frame: CGRect(x: 99, y: 59, width: 12, height: 12))
         pin.backgroundColor = UIColor(annotation.journey.route.color)
         pin.layer.cornerRadius = 6
         pin.layer.borderWidth = 2
