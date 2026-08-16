@@ -19,6 +19,7 @@ struct WayboundMapView: UIViewRepresentable {
     let selectedStopID: Int?
     let highlightedRouteIDs: Set<Int>?
     let showsMapLadder: Bool
+    let viewportBottomInset: CGFloat
     let cameraRequest: WayboundCameraRequest
     let onSelectJourney: (Int) -> Void
     let onSelectStop: (Int, Set<Int>) -> Void
@@ -33,6 +34,8 @@ struct WayboundMapView: UIViewRepresentable {
         mapView.showsUserLocation = true
         mapView.showsCompass = true
         mapView.showsScale = true
+        mapView.isRotateEnabled = false
+        mapView.isPitchEnabled = false
         mapView.tintColor = UIColor(WayboundPalette.routeColors[1])
         mapView.preferredConfiguration = MKStandardMapConfiguration(
             elevationStyle: .flat,
@@ -62,29 +65,59 @@ struct WayboundMapView: UIViewRepresentable {
         var parent: WayboundMapView
         var lastCameraRequestID: UUID?
         private var routeOverlays: [RouteLaneOverlay] = []
+        private var viewportRefreshWorkItem: DispatchWorkItem?
 
         init(parent: WayboundMapView) {
             self.parent = parent
         }
 
         func rebuildMapContent(on mapView: MKMapView) {
+            viewportRefreshWorkItem?.cancel()
             mapView.removeOverlays(mapView.overlays)
             mapView.removeAnnotations(
                 mapView.annotations.filter { !($0 is MKUserLocation) }
             )
             routeOverlays = []
 
+            // Mark only the stops the retained journeys actually board at. Nearby
+            // source records within one map-marker footprint become one badge.
+            mapView.addAnnotations(boardingStopAnnotations())
+
+            if parent.showsMapLadder,
+               let selectedID = parent.selectedJourneyID,
+               let journey = parent.journeys.first(where: { $0.id == selectedID }) {
+                for stop in journey.stops where !stop.isBoarding && !stop.isFlagship {
+                    mapView.addAnnotation(
+                        LadderStopMapAnnotation(stop: stop, journey: journey)
+                    )
+                }
+            }
+
+            refreshViewportContent(on: mapView)
+        }
+
+        /// Route strokes stop at the unobscured map viewport rather than continuing
+        /// beneath the sheet. If a flagship is farther away, its compact tag sits at
+        /// the first edge crossed by the trip shape.
+        private func refreshViewportContent(on mapView: MKMapView) {
+            mapView.removeOverlays(
+                mapView.overlays.filter { $0 is RouteLaneOverlay }
+            )
+            mapView.removeAnnotations(
+                mapView.annotations.filter { $0 is DestinationMapAnnotation }
+            )
+            routeOverlays = []
+
+            guard let viewport = activeViewportMapRect(in: mapView) else { return }
             let selectedID = parent.selectedJourneyID
             let highlightedRouteIDs = parent.highlightedRouteIDs
 
-            // The render model contains only the capped, boardable journeys.
-            // Never fall back to drawing every route associated with nearby stops.
             for journey in parent.journeys {
                 let isSelected = selectedID == journey.id
                 let isHighlighted = highlightedRouteIDs?.contains(journey.id) ?? true
                 let opacity = isHighlighted ? 0.92 : 0.12
                 addOverlays(
-                    for: journey.flagshipPolylines,
+                    for: clippedPolylines(journey.flagshipPolylines, to: viewport),
                     routeID: journey.id,
                     color: UIColor(journey.route.color),
                     opacity: opacity,
@@ -96,7 +129,7 @@ struct WayboundMapView: UIViewRepresentable {
 
                 if isSelected && parent.showsMapLadder {
                     addOverlays(
-                        for: journey.continuationPolylines,
+                        for: clippedPolylines(journey.continuationPolylines, to: viewport),
                         routeID: journey.id,
                         color: UIColor(journey.route.color),
                         opacity: 0.58,
@@ -108,15 +141,40 @@ struct WayboundMapView: UIViewRepresentable {
                 }
             }
 
-            // Mark only the stops the retained journeys actually board at. Nearby
-            // source records within one map-marker footprint become one badge.
-            mapView.addAnnotations(boardingStopAnnotations())
-
+            // Tags are ranked, collision-tested before insertion, and explicitly
+            // budgeted. Selecting a route bypasses the overview budget, so every
+            // route remains discoverable without forcing six labels onto the map.
+            var occupiedTagFrames: [CGRect] = []
+            var insertedTagCount = 0
+            let tagBudget = destinationTagBudget(in: mapView)
             for (rank, journey) in parent.journeys.enumerated()
             where selectedID == nil || journey.id == selectedID {
+                guard insertedTagCount < tagBudget,
+                      let anchor = destinationAnchor(
+                        for: journey,
+                        in: viewport
+                      )
+                else { continue }
+
+                let anchorPoint = mapView.convert(
+                    anchor.coordinate,
+                    toPointTo: mapView
+                )
+                let tagFrame = destinationTagFrame(
+                    at: anchorPoint,
+                    edge: anchor.edge
+                ).insetBy(dx: -5, dy: -4)
+                guard selectedID != nil || occupiedTagFrames.allSatisfy({
+                    !$0.intersects(tagFrame)
+                }) else { continue }
+
+                occupiedTagFrames.append(tagFrame)
+                insertedTagCount += 1
                 mapView.addAnnotation(
                     DestinationMapAnnotation(
                         journey: journey,
+                        coordinate: anchor.coordinate,
+                        edge: anchor.edge,
                         rank: rank,
                         isSelected: journey.id == selectedID,
                         isDimmed: highlightedRouteIDs.map {
@@ -125,16 +183,233 @@ struct WayboundMapView: UIViewRepresentable {
                     )
                 )
             }
+        }
 
-            if parent.showsMapLadder,
-               let selectedID,
-               let journey = parent.journeys.first(where: { $0.id == selectedID }) {
-                for stop in journey.stops where !stop.isBoarding && !stop.isFlagship {
-                    mapView.addAnnotation(
-                        LadderStopMapAnnotation(stop: stop, journey: journey)
-                    )
+        private func destinationTagBudget(in mapView: MKMapView) -> Int {
+            if parent.selectedJourneyID != nil { return 1 }
+            let usableHeight = mapView.bounds.height
+                - parent.viewportBottomInset
+                - mapView.safeAreaInsets.top
+            return mapView.bounds.width < 390 || usableHeight < 350 ? 3 : 4
+        }
+
+        private func destinationTagFrame(
+            at anchor: CGPoint,
+            edge: DestinationViewportEdge
+        ) -> CGRect {
+            let offset: CGPoint
+            switch edge {
+            case .inside, .bottom: offset = CGPoint(x: 0, y: -21)
+            case .top: offset = CGPoint(x: 0, y: 21)
+            case .right: offset = CGPoint(x: -79, y: 0)
+            case .left: offset = CGPoint(x: 79, y: 0)
+            }
+            return CGRect(
+                x: anchor.x + offset.x - 79,
+                y: anchor.y + offset.y - 21,
+                width: 158,
+                height: 42
+            )
+        }
+
+        func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
+            viewportRefreshWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self, weak mapView] in
+                guard let self, let mapView else { return }
+                self.refreshViewportContent(on: mapView)
+            }
+            viewportRefreshWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: workItem)
+        }
+
+        private func activeViewportMapRect(in mapView: MKMapView) -> MKMapRect? {
+            // Keep the centerline far enough inside the active area that the
+            // outermost 5.5-point lane and its cream casing also stop cleanly.
+            let insets = UIEdgeInsets(
+                top: max(18, mapView.safeAreaInsets.top + 14),
+                left: 18,
+                bottom: max(
+                    mapView.safeAreaInsets.bottom + 18,
+                    parent.viewportBottomInset + 18
+                ),
+                right: 18
+            )
+            let screenRect = mapView.bounds.inset(by: insets)
+            guard screenRect.width > 80, screenRect.height > 80 else { return nil }
+
+            let screenPoints = [
+                CGPoint(x: screenRect.minX, y: screenRect.minY),
+                CGPoint(x: screenRect.maxX, y: screenRect.minY),
+                CGPoint(x: screenRect.maxX, y: screenRect.maxY),
+                CGPoint(x: screenRect.minX, y: screenRect.maxY),
+            ]
+            let mapPoints = screenPoints.map {
+                MKMapPoint(mapView.convert($0, toCoordinateFrom: mapView))
+            }
+            guard let first = mapPoints.first else { return nil }
+            let minimumX = mapPoints.dropFirst().reduce(first.x) { min($0, $1.x) }
+            let maximumX = mapPoints.dropFirst().reduce(first.x) { max($0, $1.x) }
+            let minimumY = mapPoints.dropFirst().reduce(first.y) { min($0, $1.y) }
+            let maximumY = mapPoints.dropFirst().reduce(first.y) { max($0, $1.y) }
+            return MKMapRect(
+                x: minimumX,
+                y: minimumY,
+                width: maximumX - minimumX,
+                height: maximumY - minimumY
+            )
+        }
+
+        private func clippedPolylines(
+            _ polylines: [[CLLocationCoordinate2D]],
+            to rect: MKMapRect
+        ) -> [[CLLocationCoordinate2D]] {
+            polylines.flatMap { coordinates -> [[CLLocationCoordinate2D]] in
+                guard coordinates.count >= 2 else { return [] }
+                var result: [[CLLocationCoordinate2D]] = []
+                var current: [CLLocationCoordinate2D] = []
+
+                func finishCurrent() {
+                    if current.count >= 2 { result.append(current) }
+                    current = []
+                }
+
+                for index in 0..<(coordinates.count - 1) {
+                    let start = MKMapPoint(coordinates[index])
+                    let end = MKMapPoint(coordinates[index + 1])
+                    guard let clipped = clippedSegment(
+                        from: start,
+                        to: end,
+                        inside: rect
+                    ) else {
+                        finishCurrent()
+                        continue
+                    }
+
+                    let clippedStart = clipped.start.coordinate
+                    let clippedEnd = clipped.end.coordinate
+                    if let previous = current.last,
+                       MKMapPoint(previous).distance(to: clipped.start) > 0.25 {
+                        finishCurrent()
+                    }
+                    if current.isEmpty { current.append(clippedStart) }
+                    if MKMapPoint(current.last!).distance(to: clipped.end) > 0.05 {
+                        current.append(clippedEnd)
+                    }
+                }
+                finishCurrent()
+                return result
+            }
+        }
+
+        private func destinationAnchor(
+            for journey: RouteJourney,
+            in rect: MKMapRect
+        ) -> (coordinate: CLLocationCoordinate2D, edge: DestinationViewportEdge)? {
+            let destination = MKMapPoint(journey.destinationCoordinate)
+            if contains(destination, in: rect) {
+                return (journey.destinationCoordinate, .inside)
+            }
+
+            var hasEnteredViewport = false
+            var lastVisiblePoint: MKMapPoint?
+            for coordinates in journey.flagshipPolylines where coordinates.count >= 2 {
+                for index in 0..<(coordinates.count - 1) {
+                    let start = MKMapPoint(coordinates[index])
+                    let end = MKMapPoint(coordinates[index + 1])
+                    let startIsInside = contains(start, in: rect)
+                    let endIsInside = contains(end, in: rect)
+                    let clipped = clippedSegment(from: start, to: end, inside: rect)
+
+                    if startIsInside { hasEnteredViewport = true }
+                    if let clipped { lastVisiblePoint = clipped.end }
+
+                    if hasEnteredViewport, !endIsInside, let clipped {
+                        return (
+                            clipped.end.coordinate,
+                            nearestEdge(to: clipped.end, in: rect)
+                        )
+                    }
+                    if !startIsInside, endIsInside {
+                        hasEnteredViewport = true
+                    } else if !startIsInside, !endIsInside,
+                              !hasEnteredViewport, let clipped {
+                        // A long segment can cross the entire viewport without a
+                        // source vertex landing inside it.
+                        return (
+                            clipped.end.coordinate,
+                            nearestEdge(to: clipped.end, in: rect)
+                        )
+                    }
                 }
             }
+
+            guard let lastVisiblePoint else { return nil }
+            return (
+                lastVisiblePoint.coordinate,
+                nearestEdge(to: lastVisiblePoint, in: rect)
+            )
+        }
+
+        private func contains(_ point: MKMapPoint, in rect: MKMapRect) -> Bool {
+            point.x >= rect.minX && point.x <= rect.maxX
+                && point.y >= rect.minY && point.y <= rect.maxY
+        }
+
+        private func nearestEdge(
+            to point: MKMapPoint,
+            in rect: MKMapRect
+        ) -> DestinationViewportEdge {
+            let distances: [(DestinationViewportEdge, Double)] = [
+                (.left, abs(point.x - rect.minX)),
+                (.right, abs(point.x - rect.maxX)),
+                (.top, abs(point.y - rect.minY)),
+                (.bottom, abs(point.y - rect.maxY)),
+            ]
+            return distances.min { $0.1 < $1.1 }?.0 ?? .inside
+        }
+
+        private func clippedSegment(
+            from start: MKMapPoint,
+            to end: MKMapPoint,
+            inside rect: MKMapRect
+        ) -> (start: MKMapPoint, end: MKMapPoint)? {
+            let deltaX = end.x - start.x
+            let deltaY = end.y - start.y
+            var lower = 0.0
+            var upper = 1.0
+
+            func update(_ denominator: Double, _ numerator: Double) -> Bool {
+                if abs(denominator) < 0.000_000_001 {
+                    return numerator >= 0
+                }
+                let ratio = numerator / denominator
+                if denominator < 0 {
+                    if ratio > upper { return false }
+                    lower = max(lower, ratio)
+                } else {
+                    if ratio < lower { return false }
+                    upper = min(upper, ratio)
+                }
+                return true
+            }
+
+            guard update(-deltaX, start.x - rect.minX),
+                  update(deltaX, rect.maxX - start.x),
+                  update(-deltaY, start.y - rect.minY),
+                  update(deltaY, rect.maxY - start.y),
+                  upper >= lower
+            else { return nil }
+
+            return (
+                MKMapPoint(
+                    x: start.x + lower * deltaX,
+                    y: start.y + lower * deltaY
+                ),
+                MKMapPoint(
+                    x: start.x + upper * deltaX,
+                    y: start.y + upper * deltaY
+                )
+            )
         }
 
         private func boardingStopAnnotations() -> [StopClusterMapAnnotation] {
@@ -306,33 +581,24 @@ struct WayboundMapView: UIViewRepresentable {
             var best: (routeID: Int, distance: CGFloat)?
 
             for overlay in routeOverlays {
-                let coordinates = overlay.coordinates
-                guard coordinates.count >= 2 else { continue }
-                for index in 0..<(coordinates.count - 1) {
-                    var start = mapView.convert(
-                        coordinates[index],
-                        toPointTo: mapView
-                    )
-                    var end = mapView.convert(
-                        coordinates[index + 1],
-                        toPointTo: mapView
-                    )
-                    let deltaX = end.x - start.x
-                    let deltaY = end.y - start.y
-                    let length = hypot(deltaX, deltaY)
-                    if length > 0 {
-                        let laneOffset = CGFloat(overlay.laneOffsetPoints)
-                        let offsetX = -deltaY / length * laneOffset
-                        let offsetY = deltaX / length * laneOffset
-                        start.x += offsetX
-                        start.y += offsetY
-                        end.x += offsetX
-                        end.y += offsetY
-                    }
+                let rawPoints = overlay.coordinates.map {
+                    mapView.convert($0, toPointTo: mapView)
+                }
+                let basePoints = simplifiedRoutePoints(
+                    rawPoints,
+                    tolerance: 0.7
+                )
+                let lanePoints = stableRouteOffsetPoints(
+                    basePoints,
+                    offset: CGFloat(overlay.laneOffsetPoints)
+                )
+                guard lanePoints.count >= 2 else { continue }
+
+                for index in 0..<(lanePoints.count - 1) {
                     let distance = distanceFromPoint(
                         tapPoint,
-                        toSegmentFrom: start,
-                        to: end
+                        toSegmentFrom: lanePoints[index],
+                        to: lanePoints[index + 1]
                     )
                     if best.map({ distance < $0.distance }) ?? true {
                         best = (overlay.routeID, distance)
@@ -431,25 +697,14 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
     ) {
         let coordinates = routeOverlay.coordinates
         guard coordinates.count >= 2 else { return }
-        let basePoints = coordinates.map { point(for: MKMapPoint($0)) }
+        let rawPoints = coordinates.map { point(for: MKMapPoint($0)) }
+        let basePoints = simplifiedRoutePoints(
+            rawPoints,
+            tolerance: 0.7 / zoomScale
+        )
+        guard basePoints.count >= 2 else { return }
         let offset = CGFloat(routeOverlay.laneOffsetPoints) / zoomScale
-        var offsetPoints: [CGPoint] = []
-
-        for index in basePoints.indices {
-            let previous = basePoints[index == 0 ? index : index - 1]
-            let next = basePoints[index == basePoints.count - 1 ? index : index + 1]
-            let deltaX = next.x - previous.x
-            let deltaY = next.y - previous.y
-            let length = max(0.0001, hypot(deltaX, deltaY))
-            let normalX = -deltaY / length
-            let normalY = deltaX / length
-            offsetPoints.append(
-                CGPoint(
-                    x: basePoints[index].x + normalX * offset,
-                    y: basePoints[index].y + normalY * offset
-                )
-            )
-        }
+        let offsetPoints = stableRouteOffsetPoints(basePoints, offset: offset)
 
         let path = CGMutablePath()
         path.move(to: offsetPoints[0])
@@ -489,23 +744,163 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
     }
 }
 
+/// A small screen-space simplification removes duplicate/backtracking shape
+/// samples before lane offsets can magnify them into visible crossbars.
+private func simplifiedRoutePoints(
+    _ points: [CGPoint],
+    tolerance: CGFloat
+) -> [CGPoint] {
+    guard points.count > 2 else { return points }
+    var deduplicated: [CGPoint] = []
+    for point in points {
+        if let previous = deduplicated.last,
+           hypot(point.x - previous.x, point.y - previous.y) <= tolerance * 0.35 {
+            continue
+        }
+        deduplicated.append(point)
+    }
+    guard deduplicated.count > 2 else { return deduplicated }
+
+    func simplifyRange(_ start: Int, _ end: Int) -> [CGPoint] {
+        guard end > start + 1 else {
+            return [deduplicated[start], deduplicated[end]]
+        }
+        var maximumDistance: CGFloat = 0
+        var splitIndex: Int?
+        for index in (start + 1)..<end {
+            let distance = routePerpendicularDistance(
+                deduplicated[index],
+                from: deduplicated[start],
+                to: deduplicated[end]
+            )
+            if distance > maximumDistance {
+                maximumDistance = distance
+                splitIndex = index
+            }
+        }
+        guard maximumDistance > tolerance, let splitIndex else {
+            return [deduplicated[start], deduplicated[end]]
+        }
+        let first = simplifyRange(start, splitIndex)
+        let second = simplifyRange(splitIndex, end)
+        return Array(first.dropLast()) + second
+    }
+
+    return simplifyRange(0, deduplicated.count - 1)
+}
+
+private func stableRouteOffsetPoints(
+    _ points: [CGPoint],
+    offset: CGFloat
+) -> [CGPoint] {
+    guard points.count >= 2, abs(offset) > 0.0001 else { return points }
+    var directions: [CGPoint] = []
+    var previousDirection: CGPoint?
+
+    for index in 0..<(points.count - 1) {
+        let deltaX = points[index + 1].x - points[index].x
+        let deltaY = points[index + 1].y - points[index].y
+        let length = max(0.0001, hypot(deltaX, deltaY))
+        var direction = CGPoint(x: deltaX / length, y: deltaY / length)
+
+        // An abrupt reversal is almost always duplicate GTFS shape sampling.
+        // Keep the lane normal on the same side instead of drawing a rung
+        // across all of the parallel strands.
+        if let previousDirection,
+           direction.x * previousDirection.x
+                + direction.y * previousDirection.y < -0.8 {
+            direction.x *= -1
+            direction.y *= -1
+        }
+        directions.append(direction)
+        previousDirection = direction
+    }
+
+    return points.indices.map { index in
+        let previousDirection = directions[index == 0 ? 0 : index - 1]
+        let nextDirection = directions[
+            index == points.count - 1 ? directions.count - 1 : index
+        ]
+        let previousNormal = CGPoint(
+            x: -previousDirection.y,
+            y: previousDirection.x
+        )
+        let nextNormal = CGPoint(x: -nextDirection.y, y: nextDirection.x)
+        let sumX = previousNormal.x + nextNormal.x
+        let sumY = previousNormal.y + nextNormal.y
+        let sumLength = hypot(sumX, sumY)
+
+        var normal = nextNormal
+        var scale = offset
+        if sumLength > 0.001 {
+            normal = CGPoint(x: sumX / sumLength, y: sumY / sumLength)
+            let denominator = normal.x * nextNormal.x + normal.y * nextNormal.y
+            if abs(denominator) > 0.25 {
+                scale = offset / denominator
+            }
+        }
+        let maximumMiter = abs(offset) * 1.75
+        scale = max(-maximumMiter, min(maximumMiter, scale))
+        return CGPoint(
+            x: points[index].x + normal.x * scale,
+            y: points[index].y + normal.y * scale
+        )
+    }
+}
+
+private func routePerpendicularDistance(
+    _ point: CGPoint,
+    from start: CGPoint,
+    to end: CGPoint
+) -> CGFloat {
+    let deltaX = end.x - start.x
+    let deltaY = end.y - start.y
+    let lengthSquared = deltaX * deltaX + deltaY * deltaY
+    guard lengthSquared > 0 else {
+        return hypot(point.x - start.x, point.y - start.y)
+    }
+    let progress = max(
+        0,
+        min(1, ((point.x - start.x) * deltaX
+            + (point.y - start.y) * deltaY) / lengthSquared)
+    )
+    let projection = CGPoint(
+        x: start.x + progress * deltaX,
+        y: start.y + progress * deltaY
+    )
+    return hypot(point.x - projection.x, point.y - projection.y)
+}
+
 // MARK: - Map annotations
+
+private enum DestinationViewportEdge {
+    case inside
+    case top
+    case right
+    case bottom
+    case left
+}
 
 private final class DestinationMapAnnotation: NSObject, MKAnnotation {
     let journey: RouteJourney
+    let edge: DestinationViewportEdge
     let rank: Int
     let isSelected: Bool
     let isDimmed: Bool
-    dynamic var coordinate: CLLocationCoordinate2D { journey.destinationCoordinate }
+    dynamic var coordinate: CLLocationCoordinate2D
     var title: String? { journey.destinationName }
 
     init(
         journey: RouteJourney,
+        coordinate: CLLocationCoordinate2D,
+        edge: DestinationViewportEdge,
         rank: Int,
         isSelected: Bool,
         isDimmed: Bool
     ) {
         self.journey = journey
+        self.coordinate = coordinate
+        self.edge = edge
         self.rank = rank
         self.isSelected = isSelected
         self.isDimmed = isDimmed
@@ -566,51 +961,76 @@ private final class DestinationAnnotationView: MKAnnotationView {
 
     func configure(with annotation: DestinationMapAnnotation) {
         subviews.forEach { $0.removeFromSuperview() }
-        frame = CGRect(x: 0, y: 0, width: 210, height: 72)
-        centerOffset = CGPoint(x: 0, y: -34)
-        alpha = annotation.isDimmed ? 0.28 : 1
+        let width: CGFloat = 158
+        let height: CGFloat = 42
+        frame = CGRect(x: 0, y: 0, width: width, height: height)
+        switch annotation.edge {
+        case .left:
+            centerOffset = CGPoint(x: width / 2, y: 0)
+        case .right:
+            centerOffset = CGPoint(x: -width / 2, y: 0)
+        case .top:
+            centerOffset = CGPoint(x: 0, y: height / 2)
+        case .bottom, .inside:
+            centerOffset = CGPoint(x: 0, y: -height / 2)
+        }
+        alpha = annotation.isDimmed ? 0.24 : 1
         displayPriority = annotation.isSelected
             ? .required
             : (annotation.rank < 3 ? .defaultHigh : .defaultLow)
 
-        let card = UIView(frame: CGRect(x: 5, y: 0, width: 200, height: 62))
-        card.backgroundColor = UIColor(red: 0.965, green: 0.945, blue: 0.89, alpha: 0.98)
-        card.layer.cornerRadius = 12
-        card.layer.borderWidth = 1.5
-        card.layer.borderColor = UIColor(annotation.journey.route.color).cgColor
+        let routeColor = UIColor(annotation.journey.route.color)
+        let card = UIView(frame: CGRect(x: 4, y: 4, width: 150, height: 34))
+        card.backgroundColor = UIColor(
+            red: 0.965, green: 0.945, blue: 0.89, alpha: 0.97
+        )
+        card.layer.cornerRadius = 9
+        card.layer.borderWidth = 1
+        card.layer.borderColor = routeColor.cgColor
         card.layer.shadowColor = UIColor.black.cgColor
-        card.layer.shadowOpacity = 0.14
-        card.layer.shadowRadius = 4
-        card.layer.shadowOffset = CGSize(width: 0, height: 2)
+        card.layer.shadowOpacity = 0.12
+        card.layer.shadowRadius = 3
+        card.layer.shadowOffset = CGSize(width: 0, height: 1)
         addSubview(card)
 
-        let colorBar = UIView(frame: CGRect(x: 0, y: 0, width: 8, height: 62))
-        colorBar.backgroundColor = UIColor(annotation.journey.route.color)
-        colorBar.layer.cornerRadius = 4
+        let colorBar = UIView(frame: CGRect(x: 0, y: 0, width: 5, height: 34))
+        colorBar.backgroundColor = routeColor
+        colorBar.layer.cornerRadius = 2.5
         card.addSubview(colorBar)
 
-        let destinationLabel = UILabel(
-            frame: CGRect(x: 16, y: 5, width: 176, height: 34)
-        )
-        destinationLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        let routePrefix = annotation.journey.route.routeNumber.map { "\($0) · " } ?? ""
+        let destinationLabel = UILabel(frame: CGRect(x: 10, y: 3, width: 134, height: 15))
+        destinationLabel.font = .systemFont(ofSize: 10.5, weight: .semibold)
         destinationLabel.textColor = UIColor(
             red: 0.14, green: 0.19, blue: 0.18, alpha: 1
         )
-        destinationLabel.text = annotation.journey.destinationName
-        destinationLabel.numberOfLines = 2
+        destinationLabel.text = routePrefix + annotation.journey.destinationName
         destinationLabel.lineBreakMode = .byTruncatingTail
         card.addSubview(destinationLabel)
 
-        let timeLabel = UILabel(frame: CGRect(x: 16, y: 40, width: 176, height: 17))
-        timeLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .bold)
-        timeLabel.textColor = UIColor(annotation.journey.route.color)
+        let timeLabel = UILabel(frame: CGRect(x: 10, y: 18, width: 134, height: 13))
+        timeLabel.font = .monospacedDigitSystemFont(ofSize: 9, weight: .bold)
+        timeLabel.textColor = routeColor
         timeLabel.text = "\(annotation.journey.totalMinutes) min total"
         card.addSubview(timeLabel)
 
-        let pin = UIView(frame: CGRect(x: 99, y: 59, width: 12, height: 12))
-        pin.backgroundColor = UIColor(annotation.journey.route.color)
-        pin.layer.cornerRadius = 6
-        pin.layer.borderWidth = 2
+        let pinOrigin: CGPoint
+        switch annotation.edge {
+        case .left:
+            pinOrigin = CGPoint(x: 0, y: 17.5)
+        case .right:
+            pinOrigin = CGPoint(x: 151, y: 17.5)
+        case .top:
+            pinOrigin = CGPoint(x: 75.5, y: 0)
+        case .bottom, .inside:
+            pinOrigin = CGPoint(x: 75.5, y: 35)
+        }
+        let pin = UIView(
+            frame: CGRect(x: pinOrigin.x, y: pinOrigin.y, width: 7, height: 7)
+        )
+        pin.backgroundColor = routeColor
+        pin.layer.cornerRadius = 3.5
+        pin.layer.borderWidth = 1.5
         pin.layer.borderColor = UIColor.white.cgColor
         addSubview(pin)
 

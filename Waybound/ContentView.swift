@@ -52,6 +52,7 @@ struct ContentView: View {
 
     var body: some View {
         GeometryReader { geometry in
+            let bottomSheetHeight = sheetHeight(for: geometry.size.height)
             ZStack(alignment: .bottom) {
                 WayboundMapView(
                     routes: viewModel.routes,
@@ -62,6 +63,7 @@ struct ContentView: View {
                     highlightedRouteIDs: highlightedRouteIDs,
                     showsMapLadder: selectedJourney != nil
                         && expansionPrototype == .map,
+                    viewportBottomInset: bottomSheetHeight,
                     cameraRequest: cameraRequest,
                     onSelectJourney: selectJourney,
                     onSelectStop: { stopID, routeIDs in
@@ -70,11 +72,9 @@ struct ContentView: View {
                 )
                 .ignoresSafeArea()
 
-                mapChrome
-
                 destinationSheet
                     .frame(
-                        maxHeight: sheetHeight(for: geometry.size.height),
+                        maxHeight: bottomSheetHeight,
                         alignment: .bottom
                     )
             }
@@ -87,12 +87,6 @@ struct ContentView: View {
             selectedStopRouteIDs = nil
             cameraRequest = WayboundCameraRequest(region: region)
         }
-        .onChange(of: viewModel.journeys) { oldJourneys, newJourneys in
-            guard oldJourneys.isEmpty, !newJourneys.isEmpty else { return }
-            cameraRequest = WayboundCameraRequest(
-                region: overviewRegion(for: newJourneys)
-            )
-        }
         .onChange(of: expansionPrototype) { _, prototype in
             guard prototype == .map, let selectedJourney else { return }
             cameraRequest = WayboundCameraRequest(
@@ -103,49 +97,6 @@ struct ContentView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(viewModel.errorMessage)
-        }
-    }
-
-    private var mapChrome: some View {
-        VStack {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("WAYBOUND")
-                        .font(
-                            .system(size: 21, weight: .black, design: .rounded)
-                            .width(.condensed)
-                        )
-                        .tracking(0.6)
-                    Text("Where transit takes you")
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundStyle(WayboundPalette.ink.opacity(0.68))
-                }
-                .foregroundStyle(WayboundPalette.ink)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(WayboundPalette.cream.opacity(0.96))
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
-
-                Spacer()
-
-                Button {
-                    viewModel.recenter()
-                } label: {
-                    Image(systemName: "location.fill")
-                        .font(.system(size: 17, weight: .bold))
-                        .foregroundStyle(WayboundPalette.ink)
-                        .frame(width: 44, height: 44)
-                        .background(WayboundPalette.cream.opacity(0.96))
-                        .clipShape(Circle())
-                        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
-                }
-                .accessibilityLabel("Center on my location")
-            }
-            .padding(.horizontal, 14)
-            .padding(.top, 8)
-
-            Spacer()
         }
     }
 
@@ -161,7 +112,8 @@ struct ContentView: View {
                 JourneyDetailSheet(
                     journey: selectedJourney,
                     prototype: $expansionPrototype,
-                    onBack: clearSelection
+                    onBack: clearSelection,
+                    onRecenter: recenterMap
                 )
             } else {
                 JourneyOverviewSheet(
@@ -171,7 +123,8 @@ struct ContentView: View {
                     highlightedRouteIDs: highlightedRouteIDs,
                     selectedStopName: selectedStop?.name,
                     onSelect: selectJourney,
-                    onClearStop: clearStopSelection
+                    onClearStop: clearStopSelection,
+                    onRecenter: recenterMap
                 )
             }
         }
@@ -243,18 +196,14 @@ struct ContentView: View {
         withAnimation(.snappy(duration: 0.3)) {
             selectedJourneyID = nil
         }
-        if !viewModel.journeys.isEmpty {
-            cameraRequest = WayboundCameraRequest(
-                region: overviewRegion(for: viewModel.journeys)
-            )
-        }
+        recenterMap()
     }
 
-    private func overviewRegion(for journeys: [RouteJourney]) -> MKCoordinateRegion {
-        let coordinates = [viewModel.userCoordinate]
-            + journeys.map(\.boardingStop.coordinate)
-            + journeys.map(\.destinationCoordinate)
-        return region(containing: coordinates, reservesBottomSheet: true)
+    private func recenterMap() {
+        viewModel.recenter()
+        if let region = viewModel.targetRegion {
+            cameraRequest = WayboundCameraRequest(region: region)
+        }
     }
 
     private func expandedRegion(for journey: RouteJourney) -> MKCoordinateRegion {
@@ -310,6 +259,7 @@ private struct JourneyOverviewSheet: View {
     let selectedStopName: String?
     let onSelect: (Int) -> Void
     let onClearStop: () -> Void
+    let onRecenter: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -344,6 +294,17 @@ private struct JourneyOverviewSheet: View {
                     ProgressView()
                         .tint(WayboundPalette.ink)
                 }
+
+                Button(action: onRecenter) {
+                    Image(systemName: "location.fill")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(WayboundPalette.ink)
+                        .frame(width: 32, height: 32)
+                        .background(.white.opacity(0.72))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Center on my location")
             }
             .padding(.horizontal, 18)
             .padding(.bottom, 10)
@@ -504,6 +465,7 @@ private struct JourneyDetailSheet: View {
     let journey: RouteJourney
     @Binding var prototype: RouteExpansionPrototype
     let onBack: () -> Void
+    let onRecenter: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -529,6 +491,16 @@ private struct JourneyDetailSheet: View {
                         .foregroundStyle(journey.route.color)
                 }
                 Spacer()
+                Button(action: onRecenter) {
+                    Image(systemName: "location.fill")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(WayboundPalette.ink)
+                        .frame(width: 32, height: 32)
+                        .background(.white.opacity(0.72))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Center on my location")
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
