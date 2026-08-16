@@ -11,6 +11,21 @@ struct ContentView: View {
         ZStack(alignment: .bottom) {
             // MARK: - Map (iOS 17+ MapContentBuilder API)
             Map(position: $cameraPosition) {
+                // Route geometry is drawn first so stop pins stay visible above it.
+                ForEach(viewModel.routes) { route in
+                    ForEach(route.polylines.indices, id: \.self) { index in
+                        MapPolyline(coordinates: route.polylines[index])
+                            .stroke(
+                                route.color.opacity(0.55),
+                                style: StrokeStyle(
+                                    lineWidth: 3,
+                                    lineCap: .round,
+                                    lineJoin: .round
+                                )
+                            )
+                    }
+                }
+
                 // User location
                 UserAnnotation()
 

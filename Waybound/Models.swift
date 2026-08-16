@@ -10,6 +10,8 @@ struct TransitStop: Identifiable, Equatable {
     let name: String
     let coordinate: CLLocationCoordinate2D
     let routeNames: [String]
+    /// Transitland's internal IDs for routes that actually serve this stop.
+    let routeIDs: Set<Int>
 
     static func == (lhs: TransitStop, rhs: TransitStop) -> Bool {
         lhs.id == rhs.id
@@ -25,6 +27,8 @@ struct TransitRoute: Identifiable, Equatable {
     let agencyName: String
     let routeType: Int
     let color: Color
+    /// One or more GeoJSON line strings that make up the route.
+    let polylines: [[CLLocationCoordinate2D]]
 
     static func == (lhs: TransitRoute, rhs: TransitRoute) -> Bool {
         lhs.id == rhs.id
@@ -56,11 +60,53 @@ struct GeoJSONPoint: Decodable {
     let coordinates: [Double] // [lon, lat]
 }
 
+/// Transitland route geometry can be either a GeoJSON LineString or
+/// MultiLineString. Normalize both forms into an array of coordinate arrays.
+struct GeoJSONRouteGeometry: Decodable {
+    let coordinateLines: [[CLLocationCoordinate2D]]
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case coordinates
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decode(String.self, forKey: .type)
+        let rawLines: [[[Double]]]
+
+        switch type {
+        case "LineString":
+            rawLines = [try container.decode([[Double]].self, forKey: .coordinates)]
+        case "MultiLineString":
+            rawLines = try container.decode([[[Double]]].self, forKey: .coordinates)
+        default:
+            rawLines = []
+        }
+
+        coordinateLines = rawLines.compactMap { rawLine in
+            let line = rawLine.compactMap { position -> CLLocationCoordinate2D? in
+                guard position.count >= 2,
+                      position[0] >= -180, position[0] <= 180,
+                      position[1] >= -90, position[1] <= 90
+                else { return nil }
+
+                return CLLocationCoordinate2D(
+                    latitude: position[1],
+                    longitude: position[0]
+                )
+            }
+            return line.count >= 2 ? line : nil
+        }
+    }
+}
+
 struct APIRouteStop: Decodable {
     let route: APIRouteRef?
 }
 
 struct APIRouteRef: Decodable {
+    let id: Int?
     let routeShortName: String?
     let routeLongName: String?
     let routeType: Int?
@@ -69,6 +115,7 @@ struct APIRouteRef: Decodable {
     let agency: APIAgencyRef?
 
     enum CodingKeys: String, CodingKey {
+        case id
         case routeShortName = "route_short_name"
         case routeLongName  = "route_long_name"
         case routeType      = "route_type"
@@ -98,6 +145,7 @@ struct APIRoute: Decodable {
     let routeColor: String?
     let onestopId: String?
     let agency: APIAgencyRef?
+    let geometry: GeoJSONRouteGeometry?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -107,6 +155,7 @@ struct APIRoute: Decodable {
         case routeColor     = "route_color"
         case onestopId      = "onestop_id"
         case agency
+        case geometry
     }
 }
 
