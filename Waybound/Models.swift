@@ -10,6 +10,7 @@ struct TransitStop: Identifiable, Equatable {
     let name: String
     let coordinate: CLLocationCoordinate2D
     let routeNames: [String]
+    let agencyNames: [String]
     /// Transitland's internal IDs for routes that actually serve this stop.
     let routeIDs: Set<Int>
 
@@ -22,6 +23,8 @@ struct TransitStop: Identifiable, Equatable {
 
 struct TransitRoute: Identifiable, Equatable {
     let id: String
+    /// Transitland's internal ID joins this route back to nearby stops.
+    let transitlandID: Int
     let shortName: String
     let longName: String
     let agencyName: String

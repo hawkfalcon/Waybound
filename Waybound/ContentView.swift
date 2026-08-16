@@ -6,6 +6,19 @@ struct ContentView: View {
     @State private var cameraPosition: MapCameraPosition = .region(TransitViewModel.defaultRegion)
     @State private var showList = false
     @State private var selectedStop: TransitStop?
+    /// Transitland's internal route ID connects route lines to served stops.
+    @State private var selectedRouteID: Int?
+
+    private var selectedRoute: TransitRoute? {
+        viewModel.routes.first { $0.transitlandID == selectedRouteID }
+    }
+
+    private var selectedRouteStopCount: Int {
+        guard let selectedRouteID else { return 0 }
+        return viewModel.stops.filter {
+            $0.routeIDs.contains(selectedRouteID)
+        }.count
+    }
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -16,9 +29,13 @@ struct ContentView: View {
                     ForEach(route.polylines.indices, id: \.self) { index in
                         MapPolyline(coordinates: route.polylines[index])
                             .stroke(
-                                route.color.opacity(0.55),
+                                route.color.opacity(
+                                    selectedRouteID == nil
+                                        || selectedRouteID == route.transitlandID
+                                        ? 0.7 : 0.12
+                                ),
                                 style: StrokeStyle(
-                                    lineWidth: 3,
+                                    lineWidth: selectedRouteID == route.transitlandID ? 6 : 3,
                                     lineCap: .round,
                                     lineJoin: .round
                                 )
@@ -34,9 +51,18 @@ struct ContentView: View {
                     Annotation(stop.name, coordinate: stop.coordinate) {
                         StopAnnotationView(
                             stop: stop,
-                            isSelected: selectedStop?.id == stop.id
+                            isSelected: selectedStop?.id == stop.id,
+                            isDimmed: selectedRouteID.map {
+                                !stop.routeIDs.contains($0)
+                            } ?? false
                         )
-                        .onTapGesture { selectedStop = stop }
+                        .onTapGesture {
+                            if let routeID = selectedRouteID,
+                               !stop.routeIDs.contains(routeID) {
+                                selectedRouteID = nil
+                            }
+                            selectedStop = stop
+                        }
                     }
                 }
             }
@@ -71,15 +97,34 @@ struct ContentView: View {
                 // Status / title
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Nearby Transit")
+                        Text(selectedRoute == nil ? "Nearby Transit" : "Selected Route")
                             .font(.headline)
-                        Text("\(viewModel.stops.count) stops · \(viewModel.routes.count) routes within 0.5 mi")
+                        if let route = selectedRoute {
+                            Text(
+                                "\(route.shortName) · \(selectedRouteStopCount) nearby stops · \(route.agencyName)"
+                            )
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        } else {
+                            Text("\(viewModel.stops.count) stops · \(viewModel.routes.count) routes within 0.5 mi")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     Spacer()
                     if viewModel.isLoading {
                         ProgressView()
+                    } else if selectedRouteID != nil {
+                        Button {
+                            selectedRouteID = nil
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                                .font(.title3)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Show all routes")
                     }
                 }
                 .padding(.horizontal)
@@ -96,6 +141,19 @@ struct ContentView: View {
                                 SectionHeader(title: "Routes", icon: "tram.fill")
                                 ForEach(viewModel.routes) { route in
                                     RouteRow(route: route)
+                                        .background(
+                                            selectedRouteID == route.transitlandID
+                                                ? route.color.opacity(0.14)
+                                                : Color.clear
+                                        )
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            selectedRouteID =
+                                                selectedRouteID == route.transitlandID
+                                                ? nil : route.transitlandID
+                                            selectedStop = nil
+                                            showList = false
+                                        }
                                     Divider().padding(.leading)
                                 }
                             }
@@ -104,7 +162,16 @@ struct ContentView: View {
                                 SectionHeader(title: "Stops", icon: "mappin.circle.fill")
                                 ForEach(viewModel.stops) { stop in
                                     StopRow(stop: stop)
+                                        .opacity(
+                                            selectedRouteID.map {
+                                                stop.routeIDs.contains($0) ? 1 : 0.3
+                                            } ?? 1
+                                        )
                                         .onTapGesture {
+                                            if let routeID = selectedRouteID,
+                                               !stop.routeIDs.contains(routeID) {
+                                                selectedRouteID = nil
+                                            }
                                             selectedStop = stop
                                             withAnimation {
                                                 cameraPosition = .region(
@@ -137,9 +204,19 @@ struct ContentView: View {
 
             // MARK: - Selected stop detail
             if let stop = selectedStop {
-                StopDetailCard(stop: stop) {
-                    selectedStop = nil
-                }
+                StopDetailCard(
+                    stop: stop,
+                    routes: viewModel.routes.filter {
+                        stop.routeIDs.contains($0.transitlandID)
+                    },
+                    selectedRouteID: selectedRouteID,
+                    onSelectRoute: { routeID in
+                        selectedRouteID = selectedRouteID == routeID ? nil : routeID
+                    },
+                    onDismiss: {
+                        selectedStop = nil
+                    }
+                )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .zIndex(1)
             }
@@ -147,6 +224,8 @@ struct ContentView: View {
         .animation(.easeInOut, value: selectedStop)
         .onChange(of: viewModel.targetRegion) { _, newRegion in
             guard let region = newRegion else { return }
+            selectedStop = nil
+            selectedRouteID = nil
             withAnimation {
                 cameraPosition = .region(region)
             }
@@ -164,6 +243,7 @@ struct ContentView: View {
 struct StopAnnotationView: View {
     let stop: TransitStop
     let isSelected: Bool
+    let isDimmed: Bool
 
     var body: some View {
         ZStack {
@@ -175,7 +255,10 @@ struct StopAnnotationView: View {
                 .font(.system(size: isSelected ? 14 : 10))
                 .foregroundColor(.white)
         }
+        .opacity(isDimmed ? 0.25 : 1)
+        .scaleEffect(isDimmed ? 0.8 : 1)
         .animation(.spring(), value: isSelected)
+        .animation(.easeInOut(duration: 0.2), value: isDimmed)
     }
 }
 
@@ -266,10 +349,13 @@ struct StopRow: View {
 
 struct StopDetailCard: View {
     let stop: TransitStop
+    let routes: [TransitRoute]
+    let selectedRouteID: Int?
+    let onSelectRoute: (Int) -> Void
     let onDismiss: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Image(systemName: "mappin.circle.fill")
                     .foregroundColor(.orange)
@@ -280,12 +366,49 @@ struct StopDetailCard: View {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close stop details")
             }
-            if !stop.routeNames.isEmpty {
+
+            if !stop.agencyNames.isEmpty {
+                Label {
+                    Text(
+                        (stop.agencyNames.count == 1 ? "Operator: " : "Operators: ")
+                            + stop.agencyNames.joined(separator: " · ")
+                    )
+                } icon: {
+                    Image(systemName: "building.2.fill")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            if !routes.isEmpty {
+                Text("Serving routes")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(routes) { route in
+                            Button {
+                                onSelectRoute(route.transitlandID)
+                            } label: {
+                                StopRouteBadge(
+                                    route: route,
+                                    isSelected: selectedRouteID == route.transitlandID
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            } else if !stop.routeNames.isEmpty {
                 Text("Routes: " + stop.routeNames.joined(separator: ", "))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
             Text("Lat: \(stop.coordinate.latitude, specifier: "%.5f")  Lon: \(stop.coordinate.longitude, specifier: "%.5f")")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
@@ -296,6 +419,53 @@ struct StopDetailCard: View {
         .shadow(radius: 8)
         .padding()
         .padding(.bottom, 120)
+    }
+}
+
+struct StopRouteBadge: View {
+    let route: TransitRoute
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: 5)
+                .fill(route.color)
+                .frame(width: 34, height: 34)
+                .overlay {
+                    Text(route.shortName.prefix(3))
+                        .font(.caption2.bold())
+                        .foregroundStyle(.white)
+                        .minimumScaleFactor(0.5)
+                }
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(route.longName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(route.agencyName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .frame(width: 190, alignment: .leading)
+        .padding(8)
+        .background(
+            route.color.opacity(isSelected ? 0.18 : 0.06),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(
+                    route.color.opacity(isSelected ? 1 : 0.4),
+                    lineWidth: isSelected ? 2 : 1
+                )
+        }
+        .accessibilityLabel(
+            "\(route.shortName), \(route.longName), operated by \(route.agencyName)"
+        )
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 

@@ -227,12 +227,20 @@ final class TransitViewModel: NSObject, ObservableObject {
                 }
                 return nil
             }
+            let agencyNames = routeReferences.compactMap { route -> String? in
+                guard let rawAgencyName = route.agency?.agencyName else { return nil }
+                let agencyName = rawAgencyName.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                return agencyName.isEmpty ? nil : agencyName
+            }
 
             return TransitStop(
                 id: apiStop.id,
                 name: apiStop.stopName ?? "Unknown Stop",
                 coordinate: coordinate,
                 routeNames: Array(Set(routeNames)).sorted(),
+                agencyNames: Array(Set(agencyNames)).sorted(),
                 routeIDs: routeIDs
             )
         }
@@ -321,6 +329,7 @@ final class TransitViewModel: NSObject, ObservableObject {
                 name: winner.name,
                 coordinate: winner.coordinate,
                 routeNames: Array(Set(cluster.flatMap { $0.routeNames })).sorted(),
+                agencyNames: Array(Set(cluster.flatMap { $0.agencyNames })).sorted(),
                 routeIDs: Set(cluster.flatMap { $0.routeIDs })
             )
         }
@@ -469,6 +478,7 @@ final class TransitViewModel: NSObject, ObservableObject {
 
         return TransitRoute(
             id: route.id,
+            transitlandID: route.transitlandID,
             shortName: route.shortName,
             longName: route.longName,
             agencyName: route.agencyName,
@@ -646,6 +656,7 @@ final class TransitViewModel: NSObject, ObservableObject {
 
         return TransitRoute(
             id: apiRoute.onestopId ?? "\(apiRoute.id)",
+            transitlandID: apiRoute.id,
             shortName: apiRoute.routeShortName ?? "?",
             longName: apiRoute.routeLongName ?? "Unknown Route",
             agencyName: apiRoute.agency?.agencyName ?? "Unknown Agency",
