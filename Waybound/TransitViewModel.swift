@@ -963,17 +963,14 @@ final class TransitViewModel: NSObject, ObservableObject {
               let flagshipCoordinate = coordinate(for: flagship.stopTime.stop)
         else { return nil }
 
-        let finalCoordinate = downstream.last.flatMap {
+        let downstreamCoordinates = downstream.compactMap {
             coordinate(for: $0.stopTime.stop)
-        } ?? flagshipCoordinate
-        guard let boardingCoordinate = coordinate(
-            for: downstream[0].stopTime.stop
-        ),
+        }
+        guard downstreamCoordinates.count == downstream.count,
               let path = tripPath(
                 in: geometry.coordinateLines,
-                from: boardingCoordinate,
-                through: flagshipCoordinate,
-                to: finalCoordinate
+                alignedTo: downstreamCoordinates,
+                flagshipStopIndex: flagshipIndex
               )
         else { return nil }
 
@@ -1111,39 +1108,65 @@ final class TransitViewModel: NSObject, ObservableObject {
         return cleaned
     }
 
+    /// Align every downstream stop to one monotonic occurrence on the trip shape.
+    /// Matching only the boarding and destination coordinates is ambiguous on a
+    /// loop or repeated corridor and can select endpoints from different passes,
+    /// which produces a plausible-looking but rider-impossible local diagonal.
     private func tripPath(
         in coordinateLines: [[CLLocationCoordinate2D]],
-        from boarding: CLLocationCoordinate2D,
-        through flagship: CLLocationCoordinate2D,
-        to finalStop: CLLocationCoordinate2D
+        alignedTo orderedStops: [CLLocationCoordinate2D],
+        flagshipStopIndex: Int
     ) -> (flagship: [[CLLocationCoordinate2D]], continuation: [[CLLocationCoordinate2D]])? {
-        var best: (line: [CLLocationCoordinate2D], score: Double)?
+        guard orderedStops.count >= 2,
+              flagshipStopIndex > 0,
+              flagshipStopIndex < orderedStops.count
+        else { return nil }
+
+        var best: (
+            line: [CLLocationCoordinate2D],
+            indices: [Int],
+            objective: Double,
+            fitScore: Double,
+            maximumDistance: Double
+        )?
+
         for rawLine in coordinateLines {
-            let line = removingSinglePointSpikes(from: rawLine)
-            guard line.count >= 2 else { continue }
-            let score = nearestIndex(to: boarding, in: line).distance
-                + nearestIndex(to: flagship, in: line).distance
-                + nearestIndex(to: finalStop, in: line).distance
-            if best.map({ score < $0.score }) ?? true {
-                best = (line, score)
+            let cleanedLine = removingSinglePointSpikes(from: rawLine)
+            guard cleanedLine.count >= 2 else { continue }
+
+            // GTFS shapes should already follow trip order, but evaluating both
+            // orientations lets stop progression—not endpoint proximity—decide.
+            for line in [cleanedLine, Array(cleanedLine.reversed())] {
+                guard let alignment = monotonicShapeAlignment(
+                    stops: orderedStops,
+                    line: line
+                ) else { continue }
+                if best.map({ alignment.objective < $0.objective }) ?? true {
+                    best = (
+                        line,
+                        alignment.indices,
+                        alignment.objective,
+                        alignment.fitScore,
+                        alignment.maximumDistance
+                    )
+                }
             }
         }
-        guard var line = best?.line else { return nil }
 
-        var boardingIndex = nearestIndex(to: boarding, in: line).index
-        var flagshipIndex = nearestIndex(to: flagship, in: line).index
-        if flagshipIndex < boardingIndex {
-            line.reverse()
-            boardingIndex = nearestIndex(to: boarding, in: line).index
-            flagshipIndex = nearestIndex(to: flagship, in: line).index
-        }
-        guard flagshipIndex > boardingIndex else { return nil }
+        guard let best,
+              best.maximumDistance <= 500,
+              best.fitScore <= 200,
+              let boardingIndex = best.indices.first,
+              let finalIndex = best.indices.last
+        else { return nil }
+        let flagshipIndex = best.indices[flagshipStopIndex]
+        guard flagshipIndex > boardingIndex,
+              finalIndex >= flagshipIndex
+        else { return nil }
 
-        var finalIndex = nearestIndex(to: finalStop, in: line).index
-        if finalIndex < flagshipIndex { finalIndex = flagshipIndex }
-        let flagshipLine = Array(line[boardingIndex...flagshipIndex])
+        let flagshipLine = Array(best.line[boardingIndex...flagshipIndex])
         let continuationLine = finalIndex > flagshipIndex
-            ? Array(line[flagshipIndex...finalIndex]) : []
+            ? Array(best.line[flagshipIndex...finalIndex]) : []
         let maximumJump = maximumGeometryJump(for: 3)
         let flagshipSegments = splitPolyline(
             flagshipLine,
@@ -1155,16 +1178,98 @@ final class TransitViewModel: NSObject, ObservableObject {
         return (flagshipSegments, continuationSegments)
     }
 
-    private func nearestIndex(
-        to coordinate: CLLocationCoordinate2D,
-        in line: [CLLocationCoordinate2D]
-    ) -> (index: Int, distance: Double) {
-        let point = MKMapPoint(coordinate)
-        return line.indices.reduce((0, Double.greatestFiniteMagnitude)) {
-            best, index in
-            let distance = point.distance(to: MKMapPoint(line[index]))
-            return distance < best.1 ? (index, distance) : best
+    /// Dynamic programming finds the lowest-error stop-to-shape assignment while
+    /// preserving stop order. Shapes with enough samples require forward progress
+    /// at every stop; sparse shapes fall back to nondecreasing assignments.
+    private func monotonicShapeAlignment(
+        stops: [CLLocationCoordinate2D],
+        line: [CLLocationCoordinate2D]
+    ) -> (
+        indices: [Int],
+        objective: Double,
+        fitScore: Double,
+        maximumDistance: Double
+    )? {
+        guard stops.count >= 2, line.count >= 2 else { return nil }
+        let stopPoints = stops.map { MKMapPoint($0) }
+        let linePoints = line.map { MKMapPoint($0) }
+        let requiresForwardProgress = linePoints.count >= stopPoints.count
+        let infinity = Double.greatestFiniteMagnitude
+        let progressPenalty = 1.0
+        var cumulativeDistances = Array(repeating: 0.0, count: linePoints.count)
+        for index in 1..<linePoints.count {
+            cumulativeDistances[index] = cumulativeDistances[index - 1]
+                + linePoints[index - 1].distance(to: linePoints[index])
         }
+
+        var previousCosts = linePoints.map { point -> Double in
+            let distance = stopPoints[0].distance(to: point)
+            return distance * distance
+        }
+        var backPointers = Array(
+            repeating: Array(repeating: -1, count: linePoints.count),
+            count: stopPoints.count
+        )
+
+        for stopIndex in 1..<stopPoints.count {
+            var currentCosts = Array(repeating: infinity, count: linePoints.count)
+            var bestPreviousCost = infinity
+            var bestPreviousIndex = -1
+
+            for lineIndex in linePoints.indices {
+                let eligibleIndex = requiresForwardProgress
+                    ? lineIndex - 1 : lineIndex
+                if eligibleIndex >= 0 {
+                    let adjustedCost = previousCosts[eligibleIndex]
+                        - progressPenalty * cumulativeDistances[eligibleIndex]
+                    if adjustedCost < bestPreviousCost {
+                        bestPreviousCost = adjustedCost
+                        bestPreviousIndex = eligibleIndex
+                    }
+                }
+                guard bestPreviousIndex >= 0 else { continue }
+
+                let distance = stopPoints[stopIndex].distance(
+                    to: linePoints[lineIndex]
+                )
+                currentCosts[lineIndex] = bestPreviousCost
+                    + progressPenalty * cumulativeDistances[lineIndex]
+                    + distance * distance
+                backPointers[stopIndex][lineIndex] = bestPreviousIndex
+            }
+            previousCosts = currentCosts
+        }
+
+        guard let finalIndex = previousCosts.indices.min(by: {
+            previousCosts[$0] < previousCosts[$1]
+        }),
+              previousCosts[finalIndex] < infinity
+        else { return nil }
+
+        var indices = Array(repeating: 0, count: stopPoints.count)
+        indices[indices.count - 1] = finalIndex
+        if indices.count > 1 {
+            for stopIndex in stride(
+                from: indices.count - 1,
+                through: 1,
+                by: -1
+            ) {
+                let previousIndex = backPointers[stopIndex][indices[stopIndex]]
+                guard previousIndex >= 0 else { return nil }
+                indices[stopIndex - 1] = previousIndex
+            }
+        }
+
+        let distances = zip(stopPoints, indices).map { pair in
+            pair.0.distance(to: linePoints[pair.1])
+        }
+        let squaredError = distances.reduce(0) { $0 + $1 * $1 }
+        return (
+            indices,
+            previousCosts[finalIndex],
+            sqrt(squaredError / Double(distances.count)),
+            distances.max() ?? infinity
+        )
     }
 
     private func copy(

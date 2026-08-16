@@ -79,8 +79,13 @@ struct WayboundMapView: UIViewRepresentable {
             )
             routeOverlays = []
 
-            // Mark only the stops the retained journeys actually board at. Nearby
-            // source records within one map-marker footprint become one badge.
+            // Every stop through each flagship is a tiny route-colored dot. The
+            // selected route's inline ladder replaces its dots rather than stacking
+            // labels on top of them.
+            mapView.addAnnotations(routeStopAnnotations())
+
+            // Only each route's nearest boardable stop receives a prominent badge.
+            // Nearby source records within one marker footprint become one cluster.
             mapView.addAnnotations(boardingStopAnnotations())
 
             if parent.showsMapLadder,
@@ -96,9 +101,9 @@ struct WayboundMapView: UIViewRepresentable {
             refreshViewportContent(on: mapView)
         }
 
-        /// Route strokes stop at the unobscured map viewport rather than continuing
-        /// beneath the sheet. If a flagship is farther away, its compact tag sits at
-        /// the first edge crossed by the trip shape.
+        /// Centerlines clip to the real drawable map boundary: the screen edges and
+        /// the exact top of the sheet. Destination cards use a separate safe layout
+        /// rectangle, so keeping labels readable never shortens the route itself.
         private func refreshViewportContent(on mapView: MKMapView) {
             mapView.removeOverlays(
                 mapView.overlays.filter { $0 is RouteLaneOverlay }
@@ -108,7 +113,9 @@ struct WayboundMapView: UIViewRepresentable {
             )
             routeOverlays = []
 
-            guard let viewport = activeViewportMapRect(in: mapView) else { return }
+            guard let routeViewport = routeViewportMapRect(in: mapView),
+                  let tagViewport = destinationTagViewportMapRect(in: mapView)
+            else { return }
             let selectedID = parent.selectedJourneyID
             let highlightedRouteIDs = parent.highlightedRouteIDs
 
@@ -117,7 +124,10 @@ struct WayboundMapView: UIViewRepresentable {
                 let isHighlighted = highlightedRouteIDs?.contains(journey.id) ?? true
                 let opacity = isHighlighted ? 0.92 : 0.12
                 addOverlays(
-                    for: clippedPolylines(journey.flagshipPolylines, to: viewport),
+                    for: clippedPolylines(
+                        journey.flagshipPolylines,
+                        to: routeViewport
+                    ),
                     routeID: journey.id,
                     color: UIColor(journey.route.color),
                     opacity: opacity,
@@ -129,7 +139,10 @@ struct WayboundMapView: UIViewRepresentable {
 
                 if isSelected && parent.showsMapLadder {
                     addOverlays(
-                        for: clippedPolylines(journey.continuationPolylines, to: viewport),
+                        for: clippedPolylines(
+                            journey.continuationPolylines,
+                            to: routeViewport
+                        ),
                         routeID: journey.id,
                         color: UIColor(journey.route.color),
                         opacity: 0.58,
@@ -152,7 +165,7 @@ struct WayboundMapView: UIViewRepresentable {
                 guard insertedTagCount < tagBudget,
                       let anchor = destinationAnchor(
                         for: journey,
-                        in: viewport
+                        in: tagViewport
                       )
                 else { continue }
 
@@ -160,15 +173,17 @@ struct WayboundMapView: UIViewRepresentable {
                     anchor.coordinate,
                     toPointTo: mapView
                 )
-                let tagFrame = destinationTagFrame(
+                let layout = destinationTagLayout(
                     at: anchorPoint,
-                    edge: anchor.edge
-                ).insetBy(dx: -5, dy: -4)
+                    edge: anchor.edge,
+                    in: mapView
+                )
+                let collisionFrame = layout.frame.insetBy(dx: -5, dy: -4)
                 guard selectedID != nil || occupiedTagFrames.allSatisfy({
-                    !$0.intersects(tagFrame)
+                    !$0.intersects(collisionFrame)
                 }) else { continue }
 
-                occupiedTagFrames.append(tagFrame)
+                occupiedTagFrames.append(collisionFrame)
                 insertedTagCount += 1
                 mapView.addAnnotation(
                     DestinationMapAnnotation(
@@ -179,7 +194,9 @@ struct WayboundMapView: UIViewRepresentable {
                         isSelected: journey.id == selectedID,
                         isDimmed: highlightedRouteIDs.map {
                             !$0.contains(journey.id)
-                        } ?? false
+                        } ?? false,
+                        viewCenterOffset: layout.centerOffset,
+                        pinCenter: layout.pinCenter
                     )
                 )
             }
@@ -193,22 +210,60 @@ struct WayboundMapView: UIViewRepresentable {
             return mapView.bounds.width < 390 || usableHeight < 350 ? 3 : 4
         }
 
-        private func destinationTagFrame(
+        private struct DestinationTagLayout {
+            let frame: CGRect
+            let centerOffset: CGPoint
+            let pinCenter: CGPoint
+        }
+
+        private func destinationTagLayout(
             at anchor: CGPoint,
-            edge: DestinationViewportEdge
-        ) -> CGRect {
-            let offset: CGPoint
+            edge: DestinationViewportEdge,
+            in mapView: MKMapView
+        ) -> DestinationTagLayout {
+            let width: CGFloat = 158
+            let height: CGFloat = 42
+            let preferredOffset: CGPoint
             switch edge {
-            case .inside, .bottom: offset = CGPoint(x: 0, y: -21)
-            case .top: offset = CGPoint(x: 0, y: 21)
-            case .right: offset = CGPoint(x: -79, y: 0)
-            case .left: offset = CGPoint(x: 79, y: 0)
+            case .inside, .bottom:
+                preferredOffset = CGPoint(x: 0, y: -height / 2)
+            case .top:
+                preferredOffset = CGPoint(x: 0, y: height / 2)
+            case .right:
+                preferredOffset = CGPoint(x: -width / 2, y: 0)
+            case .left:
+                preferredOffset = CGPoint(x: width / 2, y: 0)
             }
-            return CGRect(
-                x: anchor.x + offset.x - 79,
-                y: anchor.y + offset.y - 21,
-                width: 158,
-                height: 42
+
+            let safeRect = destinationLabelScreenRect(in: mapView)
+            let minimumCenterX = safeRect.minX + width / 2
+            let maximumCenterX = safeRect.maxX - width / 2
+            let minimumCenterY = safeRect.minY + height / 2
+            let maximumCenterY = safeRect.maxY - height / 2
+            let preferredCenter = CGPoint(
+                x: anchor.x + preferredOffset.x,
+                y: anchor.y + preferredOffset.y
+            )
+            let center = CGPoint(
+                x: max(minimumCenterX, min(maximumCenterX, preferredCenter.x)),
+                y: max(minimumCenterY, min(maximumCenterY, preferredCenter.y))
+            )
+            let frame = CGRect(
+                x: center.x - width / 2,
+                y: center.y - height / 2,
+                width: width,
+                height: height
+            )
+            return DestinationTagLayout(
+                frame: frame,
+                centerOffset: CGPoint(
+                    x: center.x - anchor.x,
+                    y: center.y - anchor.y
+                ),
+                pinCenter: CGPoint(
+                    x: max(3.5, min(width - 3.5, anchor.x - frame.minX)),
+                    y: max(3.5, min(height - 3.5, anchor.y - frame.minY))
+                )
             )
         }
 
@@ -222,21 +277,50 @@ struct WayboundMapView: UIViewRepresentable {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: workItem)
         }
 
-        private func activeViewportMapRect(in mapView: MKMapView) -> MKMapRect? {
-            // Keep the centerline far enough inside the active area that the
-            // outermost 5.5-point lane and its cream casing also stop cleanly.
-            let insets = UIEdgeInsets(
-                top: max(18, mapView.safeAreaInsets.top + 14),
-                left: 18,
-                bottom: max(
-                    mapView.safeAreaInsets.bottom + 18,
-                    parent.viewportBottomInset + 18
-                ),
-                right: 18
+        private func routeViewportMapRect(in mapView: MKMapView) -> MKMapRect? {
+            let sheetTop = max(
+                mapView.bounds.minY,
+                mapView.bounds.maxY - parent.viewportBottomInset
             )
-            let screenRect = mapView.bounds.inset(by: insets)
-            guard screenRect.width > 80, screenRect.height > 80 else { return nil }
+            let screenRect = CGRect(
+                x: mapView.bounds.minX,
+                y: mapView.bounds.minY,
+                width: mapView.bounds.width,
+                height: sheetTop - mapView.bounds.minY
+            )
+            return mapRect(for: screenRect, in: mapView)
+        }
 
+        private func destinationTagViewportMapRect(
+            in mapView: MKMapView
+        ) -> MKMapRect? {
+            mapRect(for: destinationLabelScreenRect(in: mapView), in: mapView)
+        }
+
+        private func destinationLabelScreenRect(in mapView: MKMapView) -> CGRect {
+            let horizontalMargin: CGFloat = 6
+            let top = max(
+                mapView.bounds.minY + 6,
+                mapView.safeAreaInsets.top + 4
+            )
+            let sheetTop = mapView.bounds.maxY - parent.viewportBottomInset
+            let bottom = min(
+                mapView.bounds.maxY - 6,
+                sheetTop - 6
+            )
+            return CGRect(
+                x: mapView.bounds.minX + horizontalMargin,
+                y: top,
+                width: max(158, mapView.bounds.width - horizontalMargin * 2),
+                height: max(42, bottom - top)
+            )
+        }
+
+        private func mapRect(
+            for screenRect: CGRect,
+            in mapView: MKMapView
+        ) -> MKMapRect? {
+            guard screenRect.width > 80, screenRect.height > 80 else { return nil }
             let screenPoints = [
                 CGPoint(x: screenRect.minX, y: screenRect.minY),
                 CGPoint(x: screenRect.maxX, y: screenRect.minY),
@@ -412,6 +496,78 @@ struct WayboundMapView: UIViewRepresentable {
             )
         }
 
+        private struct RouteStopMarker {
+            let stop: JourneyStop
+            let journey: RouteJourney
+        }
+
+        private func routeStopAnnotations() -> [RouteStopMapAnnotation] {
+            let mergeDistance: CLLocationDistance = 12
+            var groups: [[RouteStopMarker]] = []
+
+            for journey in parent.journeys {
+                if parent.showsMapLadder,
+                   parent.selectedJourneyID == journey.id {
+                    continue
+                }
+                guard let flagshipIndex = journey.stops.firstIndex(where: {
+                    $0.isFlagship
+                }) else { continue }
+
+                for stop in journey.stops[...flagshipIndex] where !stop.isBoarding {
+                    let marker = RouteStopMarker(stop: stop, journey: journey)
+                    let location = CLLocation(
+                        latitude: stop.coordinate.latitude,
+                        longitude: stop.coordinate.longitude
+                    )
+                    if let groupIndex = groups.firstIndex(where: { group in
+                        group.contains { member in
+                            let memberLocation = CLLocation(
+                                latitude: member.stop.coordinate.latitude,
+                                longitude: member.stop.coordinate.longitude
+                            )
+                            return location.distance(from: memberLocation)
+                                <= mergeDistance
+                        }
+                    }) {
+                        groups[groupIndex].append(marker)
+                    } else {
+                        groups.append([marker])
+                    }
+                }
+            }
+
+            return groups.compactMap { group in
+                guard let first = group.first else { return nil }
+                let coordinate = CLLocationCoordinate2D(
+                    latitude: group.map { $0.stop.coordinate.latitude }
+                        .reduce(0, +) / Double(group.count),
+                    longitude: group.map { $0.stop.coordinate.longitude }
+                        .reduce(0, +) / Double(group.count)
+                )
+                let sortedJourneys = group.map(\.journey).sorted {
+                    $0.route.fullDisplayName.localizedStandardCompare(
+                        $1.route.fullDisplayName
+                    ) == .orderedAscending
+                }
+                var seenRouteIDs: Set<Int> = []
+                let uniqueJourneys = sortedJourneys.filter {
+                    seenRouteIDs.insert($0.id).inserted
+                }
+                let routeIDs = Set(uniqueJourneys.map(\.id))
+                let isDimmed = parent.highlightedRouteIDs.map {
+                    routeIDs.isDisjoint(with: $0)
+                } ?? false
+                return RouteStopMapAnnotation(
+                    coordinate: coordinate,
+                    name: first.stop.name,
+                    routeIDs: routeIDs,
+                    colors: uniqueJourneys.map { UIColor($0.route.color) },
+                    isDimmed: isDimmed
+                )
+            }
+        }
+
         private func boardingStopAnnotations() -> [StopClusterMapAnnotation] {
             let mergeDistance: CLLocationDistance = 28
             var groups: [[RouteJourney]] = []
@@ -507,6 +663,23 @@ struct WayboundMapView: UIViewRepresentable {
             viewFor annotation: MKAnnotation
         ) -> MKAnnotationView? {
             switch annotation {
+            case let routeStop as RouteStopMapAnnotation:
+                let identifier = "route-stop"
+                let view: RouteStopAnnotationView
+                if let reused = mapView.dequeueReusableAnnotationView(
+                    withIdentifier: identifier
+                ) as? RouteStopAnnotationView {
+                    view = reused
+                } else {
+                    view = RouteStopAnnotationView(
+                        annotation: routeStop,
+                        reuseIdentifier: identifier
+                    )
+                }
+                view.annotation = routeStop
+                view.configure(with: routeStop)
+                return view
+
             case let destination as DestinationMapAnnotation:
                 let identifier = "destination"
                 let view: DestinationAnnotationView
@@ -887,6 +1060,8 @@ private final class DestinationMapAnnotation: NSObject, MKAnnotation {
     let rank: Int
     let isSelected: Bool
     let isDimmed: Bool
+    let viewCenterOffset: CGPoint
+    let pinCenter: CGPoint
     dynamic var coordinate: CLLocationCoordinate2D
     var title: String? { journey.destinationName }
 
@@ -896,13 +1071,40 @@ private final class DestinationMapAnnotation: NSObject, MKAnnotation {
         edge: DestinationViewportEdge,
         rank: Int,
         isSelected: Bool,
-        isDimmed: Bool
+        isDimmed: Bool,
+        viewCenterOffset: CGPoint,
+        pinCenter: CGPoint
     ) {
         self.journey = journey
         self.coordinate = coordinate
         self.edge = edge
         self.rank = rank
         self.isSelected = isSelected
+        self.isDimmed = isDimmed
+        self.viewCenterOffset = viewCenterOffset
+        self.pinCenter = pinCenter
+    }
+}
+
+private final class RouteStopMapAnnotation: NSObject, MKAnnotation {
+    let name: String
+    let routeIDs: Set<Int>
+    let colors: [UIColor]
+    let isDimmed: Bool
+    dynamic var coordinate: CLLocationCoordinate2D
+    var title: String? { name }
+
+    init(
+        coordinate: CLLocationCoordinate2D,
+        name: String,
+        routeIDs: Set<Int>,
+        colors: [UIColor],
+        isDimmed: Bool
+    ) {
+        self.coordinate = coordinate
+        self.name = name
+        self.routeIDs = routeIDs
+        self.colors = colors
         self.isDimmed = isDimmed
     }
 }
@@ -964,16 +1166,7 @@ private final class DestinationAnnotationView: MKAnnotationView {
         let width: CGFloat = 158
         let height: CGFloat = 42
         frame = CGRect(x: 0, y: 0, width: width, height: height)
-        switch annotation.edge {
-        case .left:
-            centerOffset = CGPoint(x: width / 2, y: 0)
-        case .right:
-            centerOffset = CGPoint(x: -width / 2, y: 0)
-        case .top:
-            centerOffset = CGPoint(x: 0, y: height / 2)
-        case .bottom, .inside:
-            centerOffset = CGPoint(x: 0, y: -height / 2)
-        }
+        centerOffset = annotation.viewCenterOffset
         alpha = annotation.isDimmed ? 0.24 : 1
         displayPriority = annotation.isSelected
             ? .required
@@ -1014,19 +1207,13 @@ private final class DestinationAnnotationView: MKAnnotationView {
         timeLabel.text = "\(annotation.journey.totalMinutes) min total"
         card.addSubview(timeLabel)
 
-        let pinOrigin: CGPoint
-        switch annotation.edge {
-        case .left:
-            pinOrigin = CGPoint(x: 0, y: 17.5)
-        case .right:
-            pinOrigin = CGPoint(x: 151, y: 17.5)
-        case .top:
-            pinOrigin = CGPoint(x: 75.5, y: 0)
-        case .bottom, .inside:
-            pinOrigin = CGPoint(x: 75.5, y: 35)
-        }
         let pin = UIView(
-            frame: CGRect(x: pinOrigin.x, y: pinOrigin.y, width: 7, height: 7)
+            frame: CGRect(
+                x: annotation.pinCenter.x - 3.5,
+                y: annotation.pinCenter.y - 3.5,
+                width: 7,
+                height: 7
+            )
         )
         pin.backgroundColor = routeColor
         pin.layer.cornerRadius = 3.5
@@ -1035,6 +1222,66 @@ private final class DestinationAnnotationView: MKAnnotationView {
         addSubview(pin)
 
         accessibilityLabel = "\(annotation.journey.route.fullDisplayName) to \(annotation.journey.destinationName), \(annotation.journey.totalMinutes) minutes total"
+    }
+}
+
+private final class RouteStopAnnotationView: MKAnnotationView {
+    private var colors: [UIColor] = []
+
+    override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
+        super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
+        frame = CGRect(x: 0, y: 0, width: 9, height: 9)
+        centerOffset = .zero
+        collisionMode = .none
+        displayPriority = .required
+        backgroundColor = .clear
+        isUserInteractionEnabled = false
+        isAccessibilityElement = false
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(with annotation: RouteStopMapAnnotation) {
+        colors = annotation.colors
+        alpha = annotation.isDimmed ? 0.18 : 0.92
+        setNeedsDisplay()
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext() else { return }
+        let outerCircle = rect.insetBy(dx: 0.5, dy: 0.5)
+        context.setFillColor(
+            UIColor(red: 0.965, green: 0.945, blue: 0.89, alpha: 1).cgColor
+        )
+        context.fillEllipse(in: outerCircle)
+
+        let markerCircle = rect.insetBy(dx: 2, dy: 2)
+        let visibleColors = colors.isEmpty
+            ? [UIColor.systemGray] : Array(colors.prefix(6))
+        if visibleColors.count == 1 {
+            context.setFillColor(visibleColors[0].cgColor)
+            context.fillEllipse(in: markerCircle)
+        } else {
+            let center = CGPoint(x: markerCircle.midX, y: markerCircle.midY)
+            let radius = markerCircle.width / 2
+            let arc = CGFloat.pi * 2 / CGFloat(visibleColors.count)
+            for (index, color) in visibleColors.enumerated() {
+                context.beginPath()
+                context.move(to: center)
+                context.addArc(
+                    center: center,
+                    radius: radius,
+                    startAngle: -CGFloat.pi / 2 + CGFloat(index) * arc,
+                    endAngle: -CGFloat.pi / 2 + CGFloat(index + 1) * arc,
+                    clockwise: false
+                )
+                context.closePath()
+                context.setFillColor(color.cgColor)
+                context.fillPath()
+            }
+        }
     }
 }
 
