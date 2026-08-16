@@ -101,7 +101,7 @@ struct ContentView: View {
                             .font(.headline)
                         if let route = selectedRoute {
                             Text(
-                                "\(route.shortName) · \(selectedRouteStopCount) nearby stops · \(route.agencyName)"
+                                "\(route.fullDisplayName) · \(selectedRouteStopCount) nearby stops · \(route.agencyName)"
                             )
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -287,13 +287,19 @@ struct RouteRow: View {
                 .fill(route.color)
                 .frame(width: 36, height: 36)
                 .overlay {
-                    Text(route.shortName.prefix(3))
-                        .font(.caption2.bold())
-                        .foregroundColor(.white)
-                        .minimumScaleFactor(0.5)
+                    if let routeNumber = route.routeNumber {
+                        Text(routeNumber.prefix(4))
+                            .font(.caption2.bold())
+                            .foregroundColor(.white)
+                            .minimumScaleFactor(0.5)
+                    } else {
+                        Image(systemName: "bus.fill")
+                            .font(.caption)
+                            .foregroundStyle(.white)
+                    }
                 }
             VStack(alignment: .leading, spacing: 2) {
-                Text(route.longName)
+                Text(route.displayName)
                     .font(.subheadline)
                     .lineLimit(1)
                 Text(route.agencyName)
@@ -347,12 +353,36 @@ struct StopRow: View {
     }
 }
 
+private struct OperatorRouteGroup: Identifiable {
+    let name: String
+    let routes: [TransitRoute]
+
+    var id: String { name }
+}
+
 struct StopDetailCard: View {
     let stop: TransitStop
     let routes: [TransitRoute]
     let selectedRouteID: Int?
     let onSelectRoute: (Int) -> Void
     let onDismiss: () -> Void
+
+    private var operatorGroups: [OperatorRouteGroup] {
+        Dictionary(grouping: routes, by: \.agencyName)
+            .map { agencyName, routes in
+                OperatorRouteGroup(
+                    name: agencyName,
+                    routes: routes.sorted {
+                        $0.fullDisplayName.localizedStandardCompare(
+                            $1.fullDisplayName
+                        ) == .orderedAscending
+                    }
+                )
+            }
+            .sorted {
+                $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -370,40 +400,43 @@ struct StopDetailCard: View {
                 .accessibilityLabel("Close stop details")
             }
 
-            if !stop.agencyNames.isEmpty {
-                Label {
-                    Text(
-                        (stop.agencyNames.count == 1 ? "Operator: " : "Operators: ")
-                            + stop.agencyNames.joined(separator: " · ")
-                    )
-                } icon: {
-                    Image(systemName: "building.2.fill")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-
-            if !routes.isEmpty {
-                Text("Serving routes")
+            if !operatorGroups.isEmpty {
+                Text("Service by operator")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(routes) { route in
-                            Button {
-                                onSelectRoute(route.transitlandID)
-                            } label: {
-                                StopRouteBadge(
-                                    route: route,
-                                    isSelected: selectedRouteID == route.transitlandID
-                                )
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(operatorGroups) { group in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Label(group.name, systemImage: "building.2.fill")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityAddTraits(.isHeader)
+
+                                ForEach(group.routes) { route in
+                                    Button {
+                                        onSelectRoute(route.transitlandID)
+                                    } label: {
+                                        StopRouteBadge(
+                                            route: route,
+                                            isSelected: selectedRouteID
+                                                == route.transitlandID
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                }
                             }
-                            .buttonStyle(.plain)
                         }
                     }
                 }
+                .frame(maxHeight: 360)
             } else if !stop.routeNames.isEmpty {
+                if !stop.agencyNames.isEmpty {
+                    Text("Service from " + stop.agencyNames.joined(separator: " · "))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
                 Text("Routes: " + stop.routeNames.joined(separator: ", "))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -427,29 +460,38 @@ struct StopRouteBadge: View {
     let isSelected: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             RoundedRectangle(cornerRadius: 5)
                 .fill(route.color)
-                .frame(width: 34, height: 34)
+                .frame(width: 42, height: 34)
                 .overlay {
-                    Text(route.shortName.prefix(3))
-                        .font(.caption2.bold())
-                        .foregroundStyle(.white)
-                        .minimumScaleFactor(0.5)
+                    if let routeNumber = route.routeNumber {
+                        Text(routeNumber.prefix(4))
+                            .font(.caption2.bold())
+                            .foregroundStyle(.white)
+                            .minimumScaleFactor(0.45)
+                    } else {
+                        Image(systemName: "bus.fill")
+                            .font(.caption)
+                            .foregroundStyle(.white)
+                    }
                 }
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(route.longName)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                Text(route.agencyName)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            Text(route.displayName)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 4)
+
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(route.color)
+                    .accessibilityHidden(true)
             }
         }
-        .frame(width: 190, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
         .background(
             route.color.opacity(isSelected ? 0.18 : 0.06),
@@ -463,7 +505,7 @@ struct StopRouteBadge: View {
                 )
         }
         .accessibilityLabel(
-            "\(route.shortName), \(route.longName), operated by \(route.agencyName)"
+            "\(route.fullDisplayName), operated by \(route.agencyName)"
         )
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }

@@ -52,7 +52,13 @@ final class TransitViewModel: NSObject, ObservableObject {
     private let radiusMeters: Double = 804.672 // 0.5 mile
     private let routeDisplayRadiusMeters: Double = 1_207.008 // 0.75 mile
     private let duplicateStopDistanceMeters: Double = 1.524 // 5 feet
+    /// Cross-agency stop coordinates can differ slightly even when they mark the
+    /// same pole. Name matching keeps this deliberately small radius conservative.
+    private let samePlaceStopDistanceMeters: Double = 15
     private let maximumDisplayedStops = 30
+    /// Trip geometry is sampled per route so payloads stay bounded. Generated
+    /// stop-to-stop shapes are discarded rather than drawn as real alignments.
+    private let maximumTripGeometriesPerRoute = 12
     // Transitland's REST endpoint filters by radius but does not guarantee
     // distance ordering. Search outward in stages, then sort locally.
     private var stopSearchRadii: [Double] { [250, 500, radiusMeters] }
@@ -214,18 +220,11 @@ final class TransitViewModel: NSObject, ObservableObject {
                 latitude: apiStop.geometry.coordinates[1],
                 longitude: apiStop.geometry.coordinates[0]
             )
-            let routeNames = routeReferences.compactMap { route -> String? in
-                if let shortName = route.routeShortName?
-                    .trimmingCharacters(in: .whitespacesAndNewlines),
-                   !shortName.isEmpty {
-                    return shortName
-                }
-                if let longName = route.routeLongName?
-                    .trimmingCharacters(in: .whitespacesAndNewlines),
-                   !longName.isEmpty {
-                    return longName
-                }
-                return nil
+            let routeNames = routeReferences.map { route in
+                TransitRouteNaming.fullDisplayName(
+                    shortName: route.routeShortName,
+                    longName: route.routeLongName
+                )
             }
             let agencyNames = routeReferences.compactMap { route -> String? in
                 guard let rawAgencyName = route.agency?.agencyName else { return nil }
@@ -256,6 +255,9 @@ final class TransitViewModel: NSObject, ObservableObject {
             )
         }
         var parents = Array(stops.indices)
+        var clusterAgencyNames = stops.map { stop in
+            Set(stop.agencyNames.map(normalizedAgencyName))
+        }
 
         func root(of index: Int) -> Int {
             var current = index
@@ -265,19 +267,36 @@ final class TransitViewModel: NSObject, ObservableObject {
             return current
         }
 
-        // The candidate set is capped at 1,000, making this simple pairwise
-        // clustering inexpensive while keeping the five-foot rule exact.
+        // The candidate set is capped at 1,000, making this pairwise pass
+        // inexpensive. Exact coordinate duplicates use the strict five-foot
+        // rule. A second, conservative rule joins differently named agency
+        // records only when their normalized place names and directions agree.
         for first in stops.indices {
             for second in stops.indices where second > first {
-                guard locations[first].distance(from: locations[second])
-                        <= duplicateStopDistanceMeters
-                else { continue }
+                let distance = locations[first].distance(from: locations[second])
+                let isCoordinateDuplicate = distance <= duplicateStopDistanceMeters
+                let isSameNamedPlace = distance <= samePlaceStopDistanceMeters
+                    && representsSameNamedPlace(stops[first], stops[second])
+                guard isCoordinateDuplicate || isSameNamedPlace else { continue }
 
                 let firstRoot = root(of: first)
                 let secondRoot = root(of: second)
-                if firstRoot != secondRoot {
-                    parents[secondRoot] = firstRoot
+                guard firstRoot != secondRoot else { continue }
+
+                // A same-place cluster may contain only one record from a given
+                // operator. This prevents transitive merging of two directional
+                // platforms through a third agency's record.
+                if !isCoordinateDuplicate,
+                   !clusterAgencyNames[firstRoot].isDisjoint(
+                       with: clusterAgencyNames[secondRoot]
+                   ) {
+                    continue
                 }
+
+                parents[secondRoot] = firstRoot
+                clusterAgencyNames[firstRoot].formUnion(
+                    clusterAgencyNames[secondRoot]
+                )
             }
         }
 
@@ -286,6 +305,66 @@ final class TransitViewModel: NSObject, ObservableObject {
             grouped[root(of: index), default: []].append(stops[index])
         }
         return grouped.keys.sorted().compactMap { grouped[$0] }
+    }
+
+    private func representsSameNamedPlace(
+        _ first: TransitStop,
+        _ second: TransitStop
+    ) -> Bool {
+        let firstAgencies = Set(first.agencyNames.map(normalizedAgencyName))
+        let secondAgencies = Set(second.agencyNames.map(normalizedAgencyName))
+        guard !firstAgencies.isEmpty,
+              !secondAgencies.isEmpty,
+              firstAgencies.isDisjoint(with: secondAgencies)
+        else { return false }
+
+        let firstName = normalizedStopPlaceName(first.name)
+        let secondName = normalizedStopPlaceName(second.name)
+        return !firstName.isEmpty
+            && firstName == secondName
+            && stopDirectionTerms(in: first.name) == stopDirectionTerms(in: second.name)
+    }
+
+    private func normalizedStopPlaceName(_ name: String) -> String {
+        let landmarkFreeName = name.components(separatedBy: "(").first ?? name
+        let foldedName = landmarkFreeName.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        ).lowercased()
+        let connectorWords: Set<String> = ["at", "and", "near"]
+        return foldedName
+            .split { !$0.isLetter && !$0.isNumber }
+            .map(String.init)
+            .filter { !connectorWords.contains($0) }
+            .joined(separator: " ")
+    }
+
+    private func stopDirectionTerms(in name: String) -> Set<String> {
+        // Avoid ambiguous two-letter forms: "SB" often means Santa Barbara,
+        // as in the landmark qualifier "(SB Library)".
+        let directionWords: Set<String> = [
+            "northbound", "southbound", "eastbound", "westbound",
+            "inbound", "outbound",
+        ]
+        let foldedName = name.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        ).lowercased()
+        return Set(
+            foldedName
+                .split { !$0.isLetter && !$0.isNumber }
+                .map(String.init)
+                .filter { directionWords.contains($0) }
+        )
+    }
+
+    private func normalizedAgencyName(_ name: String) -> String {
+        name.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        .lowercased()
+        .filter { $0.isLetter || $0.isNumber }
     }
 
     private func mergeNearbyStopClusters(
@@ -323,10 +402,31 @@ final class TransitViewModel: NSObject, ObservableObject {
             guard let winner = ranked.first else { return first }
 
             // Keep the busiest stop's identity and coordinate, but preserve all
-            // route associations represented by physically duplicate records.
+            // route associations represented by records for the same place. The
+            // cleanest source name is selected independently for presentation.
+            let displayName = cluster.map(\.name).sorted { lhs, rhs in
+                let lhsHasQualifier = lhs.contains("(")
+                let rhsHasQualifier = rhs.contains("(")
+                if lhsHasQualifier != rhsHasQualifier {
+                    return !lhsHasQualifier
+                }
+                let lhsUsesWordAt = lhs.range(
+                    of: " at ",
+                    options: [.caseInsensitive, .diacriticInsensitive]
+                ) != nil
+                let rhsUsesWordAt = rhs.range(
+                    of: " at ",
+                    options: [.caseInsensitive, .diacriticInsensitive]
+                ) != nil
+                if lhsUsesWordAt != rhsUsesWordAt {
+                    return lhsUsesWordAt
+                }
+                return lhs.count < rhs.count
+            }.first ?? winner.name
+
             return TransitStop(
                 id: winner.id,
-                name: winner.name,
+                name: displayName,
                 coordinate: winner.coordinate,
                 routeNames: Array(Set(cluster.flatMap { $0.routeNames })).sorted(),
                 agencyNames: Array(Set(cluster.flatMap { $0.agencyNames })).sorted(),
@@ -400,8 +500,9 @@ final class TransitViewModel: NSObject, ObservableObject {
         return request
     }
 
-    /// Downloads geometry only for routes attached to the displayed stops.
-    /// Individual route requests avoid receiving dozens of unrelated geometries.
+    /// Downloads metadata and a bounded sample of trip geometry only for routes
+    /// attached to displayed stops. Aggregated route geometry can join variants
+    /// with artificial diagonals, so map lines come only from actual trip shapes.
     private func fetchRoutes(
         serving stops: [TransitStop],
         near origin: CLLocationCoordinate2D
@@ -410,31 +511,48 @@ final class TransitViewModel: NSObject, ObservableObject {
         guard !requestedIDs.isEmpty else { return [] }
 
         let missingIDs = requestedIDs.filter { routeCache[$0] == nil }
-        let requests = missingIDs.compactMap { routeRequest(for: $0) }
+        let requests = missingIDs.compactMap {
+            routeID -> (Int, URLRequest, URLRequest)? in
+            guard let routeRequest = routeRequest(for: routeID),
+                  let tripRequest = tripGeometryRequest(for: routeID)
+            else { return nil }
+            return (routeID, routeRequest, tripRequest)
+        }
 
-        let payloads = await withTaskGroup(of: Data?.self) { group in
-            for request in requests {
+        let payloads = await withTaskGroup(
+            of: (Int, Data?, Data?).self
+        ) { group in
+            for (routeID, routeRequest, tripRequest) in requests {
                 group.addTask {
-                    try? await transitData(for: request)
+                    let routePayload = try? await transitData(for: routeRequest)
+                    let tripPayload = try? await transitData(for: tripRequest)
+                    return (routeID, routePayload, tripPayload)
                 }
             }
 
-            var loaded: [Data] = []
+            var loaded: [(Int, Data?, Data?)] = []
             for await payload in group {
-                if let payload {
-                    loaded.append(payload)
-                }
+                loaded.append(payload)
             }
             return loaded
         }
 
-        for payload in payloads {
-            guard let response = try? JSONDecoder().decode(RoutesResponse.self, from: payload)
+        for (routeID, routePayload, tripPayload) in payloads {
+            guard let routePayload,
+                  let response = try? JSONDecoder().decode(
+                      RoutesResponse.self,
+                      from: routePayload
+                  ),
+                  let apiRoute = response.routes.first(where: { $0.id == routeID })
             else { continue }
 
-            for apiRoute in response.routes where requestedIDs.contains(apiRoute.id) {
-                routeCache[apiRoute.id] = makeTransitRoute(from: apiRoute)
-            }
+            let trustedPolylines = tripPayload.map {
+                trustedTripPolylines(from: $0)
+            } ?? []
+            routeCache[routeID] = makeTransitRoute(
+                from: apiRoute,
+                polylines: trustedPolylines
+            )
         }
 
         let matchingRoutes = requestedIDs.compactMap { routeCache[$0] }
@@ -445,7 +563,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         return matchingRoutes
             .map { makeDisplayRoute(from: $0, near: origin) }
             .sorted {
-                $0.shortName.localizedStandardCompare($1.shortName)
+                $0.fullDisplayName.localizedStandardCompare($1.fullDisplayName)
                     == .orderedAscending
             }
     }
@@ -455,13 +573,52 @@ final class TransitViewModel: NSObject, ObservableObject {
         components.queryItems = [
             URLQueryItem(name: "id", value: "\(routeID)"),
             URLQueryItem(name: "limit", value: "1"),
-            URLQueryItem(name: "include_geometry", value: "true"),
+            URLQueryItem(name: "include_geometry", value: "false"),
+            URLQueryItem(name: "include_alerts", value: "false"),
         ]
         guard let url = components.url else { return nil }
 
         var request = URLRequest(url: url)
         request.setValue(apiKey, forHTTPHeaderField: "apikey")
         return request
+    }
+
+    private func tripGeometryRequest(for routeID: Int) -> URLRequest? {
+        var components = URLComponents(
+            string: "https://transit.land/api/v2/rest/routes/\(routeID)/trips"
+        )!
+        components.queryItems = [
+            URLQueryItem(
+                name: "limit",
+                value: "\(maximumTripGeometriesPerRoute)"
+            ),
+            URLQueryItem(name: "include_geometry", value: "true"),
+            URLQueryItem(name: "include_alerts", value: "false"),
+        ]
+        guard let url = components.url else { return nil }
+
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "apikey")
+        return request
+    }
+
+    private func trustedTripPolylines(from data: Data) -> [[CLLocationCoordinate2D]] {
+        guard let response = try? JSONDecoder().decode(TripsResponse.self, from: data)
+        else { return [] }
+
+        var seenShapeIDs: Set<String> = []
+        var result: [[CLLocationCoordinate2D]] = []
+        for trip in response.trips {
+            guard let shape = trip.shape,
+                  shape.generated == false,
+                  let geometry = shape.geometry
+            else { continue }
+
+            let shapeKey = shape.shapeID ?? "trip:\(trip.id)"
+            guard seenShapeIDs.insert(shapeKey).inserted else { continue }
+            result.append(contentsOf: geometry.coordinateLines)
+        }
+        return result
     }
 
     private func makeDisplayRoute(
@@ -471,7 +628,11 @@ final class TransitViewModel: NSObject, ObservableObject {
         let maximumJump = maximumGeometryJump(for: route.routeType)
         let visiblePolylines: [[CLLocationCoordinate2D]] = route.polylines.flatMap {
             coordinates in
-            splitPolyline(coordinates, atJumpsLongerThan: maximumJump).flatMap {
+            let cleanedCoordinates = removingSinglePointSpikes(from: coordinates)
+            return splitPolyline(
+                cleanedCoordinates,
+                atJumpsLongerThan: maximumJump
+            ).flatMap {
                 clipPolyline($0, toRadius: routeDisplayRadiusMeters, around: origin)
             }
         }
@@ -499,6 +660,37 @@ final class TransitViewModel: NSObject, ObservableObject {
         default:
             return 50_000
         }
+    }
+
+    /// Removes only an unmistakable one-vertex out-and-back excursion. Broader
+    /// simplification could erase a legitimate route loop, so it is avoided.
+    private func removingSinglePointSpikes(
+        from coordinates: [CLLocationCoordinate2D]
+    ) -> [CLLocationCoordinate2D] {
+        guard coordinates.count >= 3 else { return coordinates }
+
+        var result = coordinates
+        var index = 1
+        while index < result.count - 1 {
+            let previous = MKMapPoint(result[index - 1])
+            let candidate = MKMapPoint(result[index])
+            let next = MKMapPoint(result[index + 1])
+            let incomingDistance = previous.distance(to: candidate)
+            let outgoingDistance = candidate.distance(to: next)
+            let bypassDistance = previous.distance(to: next)
+            let isSpike = incomingDistance > 300
+                && outgoingDistance > 300
+                && bypassDistance < 75
+                && bypassDistance * 8 < incomingDistance + outgoingDistance
+
+            if isSpike {
+                result.remove(at: index)
+                if index > 1 { index -= 1 }
+            } else {
+                index += 1
+            }
+        }
+        return result
     }
 
     private func splitPolyline(
@@ -646,7 +838,10 @@ final class TransitViewModel: NSObject, ObservableObject {
         )
     }
 
-    private func makeTransitRoute(from apiRoute: APIRoute) -> TransitRoute {
+    private func makeTransitRoute(
+        from apiRoute: APIRoute,
+        polylines: [[CLLocationCoordinate2D]]
+    ) -> TransitRoute {
         let color: Color = {
             if let hex = apiRoute.routeColor, !hex.isEmpty {
                 return Color(hex: hex)
@@ -662,7 +857,7 @@ final class TransitViewModel: NSObject, ObservableObject {
             agencyName: apiRoute.agency?.agencyName ?? "Unknown Agency",
             routeType: apiRoute.routeType ?? 3,
             color: color,
-            polylines: apiRoute.geometry?.coordinateLines ?? []
+            polylines: polylines
         )
     }
 }

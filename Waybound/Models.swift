@@ -30,11 +30,110 @@ struct TransitRoute: Identifiable, Equatable {
     let agencyName: String
     let routeType: Int
     let color: Color
-    /// One or more GeoJSON line strings that make up the route.
+    /// One or more non-generated trip shapes that make up the route.
     let polylines: [[CLLocationCoordinate2D]]
+
+    /// A short route code is useful as a badge only when it contains a number.
+    /// Descriptive GTFS values such as "Lompoc" and "Midday" belong in the title.
+    var routeNumber: String? {
+        TransitRouteNaming.routeNumber(shortName: shortName)
+    }
+
+    /// Public-facing title with split GTFS names recomposed into one phrase.
+    var displayName: String {
+        TransitRouteNaming.displayName(
+            shortName: shortName,
+            longName: longName
+        )
+    }
+
+    /// Includes a useful route number when one exists (for headings and VoiceOver).
+    var fullDisplayName: String {
+        TransitRouteNaming.fullDisplayName(
+            shortName: shortName,
+            longName: longName
+        )
+    }
 
     static func == (lhs: TransitRoute, rhs: TransitRoute) -> Bool {
         lhs.id == rhs.id
+    }
+}
+
+enum TransitRouteNaming {
+    static func routeNumber(shortName: String?) -> String? {
+        guard let shortName = cleaned(shortName),
+              shortName.unicodeScalars.contains(where: {
+                  CharacterSet.decimalDigits.contains($0)
+              })
+        else { return nil }
+        return shortName
+    }
+
+    static func displayName(shortName: String?, longName: String?) -> String {
+        let shortName = cleaned(shortName)
+        let longName = cleaned(longName)
+
+        if routeNumber(shortName: shortName) != nil {
+            guard let longName else { return shortName ?? "Unknown Route" }
+            if let shortName,
+               longName.compare(shortName, options: [.caseInsensitive, .diacriticInsensitive])
+                == .orderedSame {
+                return shortName
+            }
+            return normalizedDashes(in: longName)
+        }
+
+        switch (shortName, longName) {
+        case let (shortName?, longName?):
+            if longName.compare(
+                shortName,
+                options: [.caseInsensitive, .diacriticInsensitive]
+            ) == .orderedSame {
+                return normalizedDashes(in: longName)
+            }
+
+            let continuation = longName.trimmingCharacters(
+                in: CharacterSet(charactersIn: "-–— ")
+            )
+            let separator = longName.first.map { "-–—".contains($0) } == true
+                ? " – " : " "
+            return normalizedDashes(in: shortName + separator + continuation)
+
+        case let (shortName?, nil):
+            return normalizedDashes(in: shortName)
+        case let (nil, longName?):
+            return normalizedDashes(in: longName)
+        case (nil, nil):
+            return "Unknown Route"
+        }
+    }
+
+    static func fullDisplayName(shortName: String?, longName: String?) -> String {
+        let displayName = displayName(shortName: shortName, longName: longName)
+        guard let routeNumber = routeNumber(shortName: shortName),
+              displayName.compare(
+                routeNumber,
+                options: [.caseInsensitive, .diacriticInsensitive]
+              ) != .orderedSame
+        else { return displayName }
+        return "\(routeNumber) — \(displayName)"
+    }
+
+    private static func cleaned(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty,
+              cleaned != "?",
+              cleaned.caseInsensitiveCompare("Unknown Route") != .orderedSame
+        else { return nil }
+        return cleaned
+    }
+
+    private static func normalizedDashes(in value: String) -> String {
+        value
+            .replacingOccurrences(of: " - ", with: " – ")
+            .replacingOccurrences(of: " — ", with: " – ")
     }
 }
 
@@ -153,6 +252,34 @@ struct APIAgencyRef: Decodable {
 
 struct RoutesResponse: Decodable {
     let routes: [APIRoute]
+}
+
+struct TripsResponse: Decodable {
+    let trips: [APITrip]
+}
+
+struct APITrip: Decodable {
+    let id: Int
+    let directionID: Int?
+    let shape: APITripShape?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case directionID = "direction_id"
+        case shape
+    }
+}
+
+struct APITripShape: Decodable {
+    let shapeID: String?
+    let geometry: GeoJSONRouteGeometry?
+    let generated: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case shapeID = "shape_id"
+        case geometry
+        case generated
+    }
 }
 
 struct APIRoute: Decodable {
