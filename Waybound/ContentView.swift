@@ -73,7 +73,7 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Nearby Transit")
                             .font(.headline)
-                        Text("\(viewModel.stops.count) stops · \(viewModel.routes.count) routes within 1 mi")
+                        Text("\(viewModel.stops.count) stops · \(viewModel.routes.count) routes within 0.5 mi")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

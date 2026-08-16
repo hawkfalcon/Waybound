@@ -6,7 +6,7 @@ import MapKit
 // MARK: - Transit Stop
 
 struct TransitStop: Identifiable, Equatable {
-    let id: String
+    let id: Int
     let name: String
     let coordinate: CLLocationCoordinate2D
     let routeNames: [String]
@@ -39,6 +39,21 @@ struct TransitRoute: Identifiable, Equatable {
 
 struct StopsResponse: Decodable {
     let stops: [APIStop]
+}
+
+struct StopDeparturesResponse: Decodable {
+    let stops: [APIStopDepartures]
+}
+
+struct APIStopDepartures: Decodable {
+    let id: Int
+    let departures: [APIDeparture]
+}
+
+/// Only the number of departures is needed when choosing between duplicate
+/// stops, so individual departure payloads can be discarded while decoding.
+struct APIDeparture: Decodable {
+    init(from decoder: Decoder) throws {}
 }
 
 struct APIStop: Decodable {

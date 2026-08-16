@@ -45,13 +45,17 @@ final class TransitViewModel: NSObject, ObservableObject {
     private var hasFetchedOnce = false
     /// Full route geometry is cached so recentering does not download it again.
     private var routeCache: [Int: TransitRoute] = [:]
+    /// Counts are fetched only for stops that are close enough to be duplicates.
+    private var dailyDepartureCountCache: [Int: Int] = [:]
 
     private let apiKey = Config.transitLandAPIKey
-    private let radiusMeters: Double = 1609.34 // 1 mile
+    private let radiusMeters: Double = 804.672 // 0.5 mile
+    private let routeDisplayRadiusMeters: Double = 1_207.008 // 0.75 mile
+    private let duplicateStopDistanceMeters: Double = 1.524 // 5 feet
     private let maximumDisplayedStops = 30
     // Transitland's REST endpoint filters by radius but does not guarantee
     // distance ordering. Search outward in stages, then sort locally.
-    private var stopSearchRadii: [Double] { [400, 800, radiusMeters] }
+    private var stopSearchRadii: [Double] { [250, 500, radiusMeters] }
     private let stopCandidateLimit = 1_000
 
     // MARK: - Init
@@ -100,12 +104,15 @@ final class TransitViewModel: NSObject, ObservableObject {
 
             do {
                 // Routes depend on the final stop set, so load the filtered
-                // stops first instead of downloading every route in a mile.
+                // stops first instead of downloading every route in the area.
                 let fetchedStops = try await fetchStops(lat: lat, lon: lon)
                 self.stops = fetchedStops
 
                 do {
-                    self.routes = try await fetchRoutes(serving: fetchedStops)
+                    self.routes = try await fetchRoutes(
+                        serving: fetchedStops,
+                        near: CLLocationCoordinate2D(latitude: lat, longitude: lon)
+                    )
                 } catch {
                     errors.append("Routes: \(error.localizedDescription)")
                 }
@@ -125,33 +132,51 @@ final class TransitViewModel: NSObject, ObservableObject {
 
     private func fetchStops(lat: Double, lon: Double) async throws -> [TransitStop] {
         var candidates: [TransitStop] = []
+        var clusters: [[TransitStop]] = []
 
-        // Most places find 30 useful stops well before a mile. Starting with a
-        // small radius avoids downloading a full mile of stop records every time.
+        // Most places find 30 useful stops well before half a mile. Starting
+        // small avoids downloading the full search area every time.
         for searchRadius in stopSearchRadii {
             candidates = try await fetchStopCandidates(
                 lat: lat,
                 lon: lon,
                 radius: searchRadius
             )
-            if candidates.count >= maximumDisplayedStops {
+            clusters = clusterNearbyStops(candidates)
+            if clusters.count >= maximumDisplayedStops {
                 break
             }
         }
 
         let origin = CLLocation(latitude: lat, longitude: lon)
-        let stopsWithDistance = candidates.map { stop in
-            let location = CLLocation(
-                latitude: stop.coordinate.latitude,
-                longitude: stop.coordinate.longitude
-            )
-            return (stop: stop, distance: origin.distance(from: location))
-        }
-
-        return stopsWithDistance
+        let closestClusters = clusters
+            .map { cluster in
+                let distance = cluster.map { stop in
+                    origin.distance(from: CLLocation(
+                        latitude: stop.coordinate.latitude,
+                        longitude: stop.coordinate.longitude
+                    ))
+                }.min() ?? .greatestFiniteMagnitude
+                return (cluster: cluster, distance: distance)
+            }
             .sorted { $0.distance < $1.distance }
             .prefix(maximumDisplayedStops)
-            .map { $0.stop }
+            .map { $0.cluster }
+
+        // Departure queries are made only for duplicate groups that survived
+        // the closest-30 selection, rather than for every candidate stop.
+        let mergedStops = await mergeNearbyStopClusters(closestClusters)
+        return mergedStops.sorted {
+            let lhs = CLLocation(
+                latitude: $0.coordinate.latitude,
+                longitude: $0.coordinate.longitude
+            )
+            let rhs = CLLocation(
+                latitude: $1.coordinate.latitude,
+                longitude: $1.coordinate.longitude
+            )
+            return origin.distance(from: lhs) < origin.distance(from: rhs)
+        }
     }
 
     private func fetchStopCandidates(
@@ -204,7 +229,7 @@ final class TransitViewModel: NSObject, ObservableObject {
             }
 
             return TransitStop(
-                id: "\(apiStop.id)",
+                id: apiStop.id,
                 name: apiStop.stopName ?? "Unknown Stop",
                 coordinate: coordinate,
                 routeNames: Array(Set(routeNames)).sorted(),
@@ -213,9 +238,165 @@ final class TransitViewModel: NSObject, ObservableObject {
         }
     }
 
+    private func clusterNearbyStops(_ stops: [TransitStop]) -> [[TransitStop]] {
+        guard !stops.isEmpty else { return [] }
+
+        let locations = stops.map {
+            CLLocation(
+                latitude: $0.coordinate.latitude,
+                longitude: $0.coordinate.longitude
+            )
+        }
+        var parents = Array(stops.indices)
+
+        func root(of index: Int) -> Int {
+            var current = index
+            while parents[current] != current {
+                current = parents[current]
+            }
+            return current
+        }
+
+        // The candidate set is capped at 1,000, making this simple pairwise
+        // clustering inexpensive while keeping the five-foot rule exact.
+        for first in stops.indices {
+            for second in stops.indices where second > first {
+                guard locations[first].distance(from: locations[second])
+                        <= duplicateStopDistanceMeters
+                else { continue }
+
+                let firstRoot = root(of: first)
+                let secondRoot = root(of: second)
+                if firstRoot != secondRoot {
+                    parents[secondRoot] = firstRoot
+                }
+            }
+        }
+
+        var grouped: [Int: [TransitStop]] = [:]
+        for index in stops.indices {
+            grouped[root(of: index), default: []].append(stops[index])
+        }
+        return grouped.keys.sorted().compactMap { grouped[$0] }
+    }
+
+    private func mergeNearbyStopClusters(
+        _ clusters: [[TransitStop]]
+    ) async -> [TransitStop] {
+        let duplicateIDs = Set(
+            clusters
+                .filter { $0.count > 1 }
+                .flatMap { $0.map { stop in stop.id } }
+        )
+        let departureCounts = await fetchDailyDepartureCounts(for: duplicateIDs)
+
+        return clusters.compactMap { cluster in
+            guard let first = cluster.first else { return nil }
+            guard cluster.count > 1 else { return first }
+
+            // Departure counts are comparable only when every request in the
+            // cluster succeeded. Otherwise route count is the consistent fallback.
+            let hasCompleteDepartureData = cluster.allSatisfy {
+                departureCounts[$0.id] != nil
+            }
+            let ranked = cluster.sorted { lhs, rhs in
+                let lhsScore = hasCompleteDepartureData
+                    ? departureCounts[lhs.id]!
+                    : lhs.routeIDs.count
+                let rhsScore = hasCompleteDepartureData
+                    ? departureCounts[rhs.id]!
+                    : rhs.routeIDs.count
+                if lhsScore != rhsScore { return lhsScore > rhsScore }
+                if lhs.routeIDs.count != rhs.routeIDs.count {
+                    return lhs.routeIDs.count > rhs.routeIDs.count
+                }
+                return lhs.id < rhs.id
+            }
+            guard let winner = ranked.first else { return first }
+
+            // Keep the busiest stop's identity and coordinate, but preserve all
+            // route associations represented by physically duplicate records.
+            return TransitStop(
+                id: winner.id,
+                name: winner.name,
+                coordinate: winner.coordinate,
+                routeNames: Array(Set(cluster.flatMap { $0.routeNames })).sorted(),
+                routeIDs: Set(cluster.flatMap { $0.routeIDs })
+            )
+        }
+    }
+
+    private func fetchDailyDepartureCounts(
+        for stopIDs: Set<Int>
+    ) async -> [Int: Int] {
+        let missingIDs = stopIDs.filter { dailyDepartureCountCache[$0] == nil }
+        let requests = missingIDs.compactMap { stopID -> (Int, URLRequest)? in
+            guard let request = departureRequest(for: stopID) else { return nil }
+            return (stopID, request)
+        }
+
+        let loadedCounts = await withTaskGroup(of: (Int, Int?).self) { group in
+            for (stopID, request) in requests {
+                group.addTask {
+                    do {
+                        let data = try await transitData(for: request)
+                        let response = try JSONDecoder().decode(
+                            StopDeparturesResponse.self,
+                            from: data
+                        )
+                        let count = response.stops
+                            .first { $0.id == stopID }?
+                            .departures.count
+                        return (stopID, count)
+                    } catch {
+                        return (stopID, nil)
+                    }
+                }
+            }
+
+            var counts: [(Int, Int?)] = []
+            for await result in group {
+                counts.append(result)
+            }
+            return counts
+        }
+
+        for (stopID, count) in loadedCounts {
+            if let count {
+                dailyDepartureCountCache[stopID] = count
+            }
+        }
+
+        return stopIDs.reduce(into: [:]) { result, stopID in
+            if let count = dailyDepartureCountCache[stopID] {
+                result[stopID] = count
+            }
+        }
+    }
+
+    private func departureRequest(for stopID: Int) -> URLRequest? {
+        var components = URLComponents(
+            string: "https://transit.land/api/v2/rest/stops/\(stopID)/departures"
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "relative_date", value: "TODAY"),
+            URLQueryItem(name: "limit", value: "1000"),
+            URLQueryItem(name: "include_geometry", value: "false"),
+            URLQueryItem(name: "include_alerts", value: "false"),
+        ]
+        guard let url = components.url else { return nil }
+
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "apikey")
+        return request
+    }
+
     /// Downloads geometry only for routes attached to the displayed stops.
     /// Individual route requests avoid receiving dozens of unrelated geometries.
-    private func fetchRoutes(serving stops: [TransitStop]) async throws -> [TransitRoute] {
+    private func fetchRoutes(
+        serving stops: [TransitStop],
+        near origin: CLLocationCoordinate2D
+    ) async throws -> [TransitRoute] {
         let requestedIDs = Set(stops.flatMap { $0.routeIDs })
         guard !requestedIDs.isEmpty else { return [] }
 
@@ -252,9 +433,12 @@ final class TransitViewModel: NSObject, ObservableObject {
             throw URLError(.resourceUnavailable)
         }
 
-        return matchingRoutes.sorted {
-            $0.shortName.localizedStandardCompare($1.shortName) == .orderedAscending
-        }
+        return matchingRoutes
+            .map { makeDisplayRoute(from: $0, near: origin) }
+            .sorted {
+                $0.shortName.localizedStandardCompare($1.shortName)
+                    == .orderedAscending
+            }
     }
 
     private func routeRequest(for routeID: Int) -> URLRequest? {
@@ -269,6 +453,187 @@ final class TransitViewModel: NSObject, ObservableObject {
         var request = URLRequest(url: url)
         request.setValue(apiKey, forHTTPHeaderField: "apikey")
         return request
+    }
+
+    private func makeDisplayRoute(
+        from route: TransitRoute,
+        near origin: CLLocationCoordinate2D
+    ) -> TransitRoute {
+        let maximumJump = maximumGeometryJump(for: route.routeType)
+        let visiblePolylines: [[CLLocationCoordinate2D]] = route.polylines.flatMap {
+            coordinates in
+            splitPolyline(coordinates, atJumpsLongerThan: maximumJump).flatMap {
+                clipPolyline($0, toRadius: routeDisplayRadiusMeters, around: origin)
+            }
+        }
+
+        return TransitRoute(
+            id: route.id,
+            shortName: route.shortName,
+            longName: route.longName,
+            agencyName: route.agencyName,
+            routeType: route.routeType,
+            color: route.color,
+            polylines: visiblePolylines
+        )
+    }
+
+    /// Very large jumps are almost always malformed coordinates. These high
+    /// thresholds intentionally favor retaining legitimate intercity service.
+    private func maximumGeometryJump(for routeType: Int) -> CLLocationDistance {
+        switch routeType {
+        case 4: // ferry
+            return 200_000
+        case 2: // intercity or commuter rail
+            return 100_000
+        default:
+            return 50_000
+        }
+    }
+
+    private func splitPolyline(
+        _ coordinates: [CLLocationCoordinate2D],
+        atJumpsLongerThan maximumJump: CLLocationDistance
+    ) -> [[CLLocationCoordinate2D]] {
+        guard let first = coordinates.first else { return [] }
+
+        var result: [[CLLocationCoordinate2D]] = []
+        var current = [first]
+
+        for coordinate in coordinates.dropFirst() {
+            guard let previous = current.last else {
+                current = [coordinate]
+                continue
+            }
+            let distance = MKMapPoint(previous).distance(
+                to: MKMapPoint(coordinate)
+            )
+
+            if distance < 0.05 {
+                continue
+            } else if distance > maximumJump {
+                if current.count >= 2 {
+                    result.append(current)
+                }
+                current = [coordinate]
+            } else {
+                current.append(coordinate)
+            }
+        }
+
+        if current.count >= 2 {
+            result.append(current)
+        }
+        return result
+    }
+
+    private func clipPolyline(
+        _ coordinates: [CLLocationCoordinate2D],
+        toRadius radius: CLLocationDistance,
+        around origin: CLLocationCoordinate2D
+    ) -> [[CLLocationCoordinate2D]] {
+        guard coordinates.count >= 2 else { return [] }
+
+        var result: [[CLLocationCoordinate2D]] = []
+        var current: [CLLocationCoordinate2D] = []
+
+        func finishCurrentSegment() {
+            if current.count >= 2 {
+                result.append(current)
+            }
+            current = []
+        }
+
+        for index in 0..<(coordinates.count - 1) {
+            guard let clipped = clipLineSegment(
+                from: coordinates[index],
+                to: coordinates[index + 1],
+                toRadius: radius,
+                around: origin
+            ) else {
+                finishCurrentSegment()
+                continue
+            }
+
+            if let previous = current.last {
+                let gap = MKMapPoint(previous).distance(
+                    to: MKMapPoint(clipped.start)
+                )
+                if gap > 0.5 {
+                    finishCurrentSegment()
+                    current = [clipped.start, clipped.end]
+                } else {
+                    let segmentLength = MKMapPoint(previous).distance(
+                        to: MKMapPoint(clipped.end)
+                    )
+                    if segmentLength > 0.05 {
+                        current.append(clipped.end)
+                    }
+                }
+            } else {
+                current = [clipped.start, clipped.end]
+            }
+        }
+
+        finishCurrentSegment()
+        return result
+    }
+
+    private func clipLineSegment(
+        from start: CLLocationCoordinate2D,
+        to end: CLLocationCoordinate2D,
+        toRadius radius: CLLocationDistance,
+        around origin: CLLocationCoordinate2D
+    ) -> (start: CLLocationCoordinate2D, end: CLLocationCoordinate2D)? {
+        let earthRadius = 6_371_008.8
+        let radiansPerDegree = Double.pi / 180
+        let longitudeScale = cos(origin.latitude * radiansPerDegree)
+
+        func localPoint(for coordinate: CLLocationCoordinate2D) -> (x: Double, y: Double) {
+            var longitudeDelta = coordinate.longitude - origin.longitude
+            if longitudeDelta > 180 { longitudeDelta -= 360 }
+            if longitudeDelta < -180 { longitudeDelta += 360 }
+            return (
+                x: longitudeDelta * radiansPerDegree * earthRadius * longitudeScale,
+                y: (coordinate.latitude - origin.latitude)
+                    * radiansPerDegree * earthRadius
+            )
+        }
+
+        let localStart = localPoint(for: start)
+        let localEnd = localPoint(for: end)
+        let deltaX = localEnd.x - localStart.x
+        let deltaY = localEnd.y - localStart.y
+        let quadraticA = deltaX * deltaX + deltaY * deltaY
+        guard quadraticA > 0 else { return nil }
+
+        let quadraticB = 2 * (localStart.x * deltaX + localStart.y * deltaY)
+        let quadraticC = localStart.x * localStart.x
+            + localStart.y * localStart.y
+            - radius * radius
+        let discriminant = quadraticB * quadraticB - 4 * quadraticA * quadraticC
+        guard discriminant >= 0 else { return nil }
+
+        let squareRoot = sqrt(discriminant)
+        let firstRoot = (-quadraticB - squareRoot) / (2 * quadraticA)
+        let secondRoot = (-quadraticB + squareRoot) / (2 * quadraticA)
+        let lowerBound = max(0, min(firstRoot, secondRoot))
+        let upperBound = min(1, max(firstRoot, secondRoot))
+        guard upperBound - lowerBound > 0.000_000_001 else { return nil }
+
+        func coordinate(at progress: Double) -> CLLocationCoordinate2D {
+            CLLocationCoordinate2D(
+                latitude: start.latitude
+                    + (end.latitude - start.latitude) * progress,
+                longitude: start.longitude
+                    + (end.longitude - start.longitude) * progress
+            )
+        }
+
+        return (
+            start: coordinate(at: lowerBound),
+            end: coordinate(at: upperBound)
+        )
     }
 
     private func makeTransitRoute(from apiRoute: APIRoute) -> TransitRoute {
