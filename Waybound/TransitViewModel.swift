@@ -14,6 +14,20 @@ private func transitData(for request: URLRequest) async throws -> Data {
     return data
 }
 
+private struct JourneyBoardingOption {
+    let route: TransitRoute
+    let stop: TransitStop
+    let sourceStopID: Int
+    let walkMinutes: Int
+}
+
+private struct JourneyDepartureSelection {
+    let option: JourneyBoardingOption
+    let departure: APIDeparture
+    let departureDate: Date
+    let departureIsRealtime: Bool
+}
+
 @MainActor
 final class TransitViewModel: NSObject, ObservableObject {
 
@@ -34,7 +48,10 @@ final class TransitViewModel: NSObject, ObservableObject {
     @Published var targetRegion: MKCoordinateRegion?
     @Published var stops: [TransitStop] = []
     @Published var routes: [TransitRoute] = []
+    @Published var journeys: [RouteJourney] = []
+    @Published var userCoordinate: CLLocationCoordinate2D = TransitViewModel.defaultCoordinate
     @Published var isLoading = false
+    @Published var isLoadingJourneys = false
     @Published var showError = false
     @Published var errorMessage = ""
 
@@ -43,6 +60,8 @@ final class TransitViewModel: NSObject, ObservableObject {
     private let locationManager = CLLocationManager()
     private var lastLocation: CLLocation?
     private var hasFetchedOnce = false
+    /// Prevents a slower fallback request from overwriting a newer GPS fetch.
+    private var activeFetchID = UUID()
     /// Full route geometry is cached so recentering does not download it again.
     private var routeCache: [Int: TransitRoute] = [:]
     /// Counts are fetched only for stops that are close enough to be duplicates.
@@ -59,6 +78,9 @@ final class TransitViewModel: NSObject, ObservableObject {
     /// Trip geometry is sampled per route so payloads stay bounded. Generated
     /// stop-to-stop shapes are discarded rather than drawn as real alignments.
     private let maximumTripGeometriesPerRoute = 12
+    private let upcomingDepartureWindowSeconds = 43_200 // 12 hours
+    private let minimumBoardingBufferMinutes = 2
+    private let walkingMetersPerMinute: Double = 80
     // Transitland's REST endpoint filters by radius but does not guarantee
     // distance ordering. Search outward in stages, then sort locally.
     private var stopSearchRadii: [Double] { [250, 500, radiusMeters] }
@@ -90,6 +112,7 @@ final class TransitViewModel: NSObject, ObservableObject {
 
     func recenter() {
         let coordinate = lastLocation?.coordinate ?? Self.defaultCoordinate
+        userCoordinate = coordinate
         targetRegion = MKCoordinateRegion(
             center: coordinate,
             span: MKCoordinateSpan(latitudeDelta: 0.03, longitudeDelta: 0.03)
@@ -100,10 +123,16 @@ final class TransitViewModel: NSObject, ObservableObject {
     // MARK: - Fetch data
 
     func fetchTransitData(lat: Double, lon: Double) {
+        let fetchID = UUID()
+        activeFetchID = fetchID
+        let origin = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+        userCoordinate = origin
         isLoading = true
+        isLoadingJourneys = false
         showError = false
         stops = []
         routes = []
+        journeys = []
 
         Task {
             var errors: [String] = []
@@ -112,13 +141,25 @@ final class TransitViewModel: NSObject, ObservableObject {
                 // Routes depend on the final stop set, so load the filtered
                 // stops first instead of downloading every route in the area.
                 let fetchedStops = try await fetchStops(lat: lat, lon: lon)
+                guard self.activeFetchID == fetchID else { return }
                 self.stops = fetchedStops
 
                 do {
-                    self.routes = try await fetchRoutes(
+                    let fetchedRoutes = try await fetchRoutes(
                         serving: fetchedStops,
-                        near: CLLocationCoordinate2D(latitude: lat, longitude: lon)
+                        near: origin
                     )
+                    guard self.activeFetchID == fetchID else { return }
+                    self.routes = fetchedRoutes
+                    self.isLoadingJourneys = true
+                    let fetchedJourneys = await fetchJourneys(
+                        for: fetchedRoutes,
+                        boardingAt: fetchedStops,
+                        from: origin
+                    )
+                    guard self.activeFetchID == fetchID else { return }
+                    self.journeys = fetchedJourneys
+                    self.isLoadingJourneys = false
                 } catch {
                     errors.append("Routes: \(error.localizedDescription)")
                 }
@@ -126,10 +167,12 @@ final class TransitViewModel: NSObject, ObservableObject {
                 errors.append("Stops: \(error.localizedDescription)")
             }
 
+            guard self.activeFetchID == fetchID else { return }
             if !errors.isEmpty {
                 self.errorMessage = errors.joined(separator: "\n")
                 self.showError = true
             }
+            self.isLoadingJourneys = false
             self.isLoading = false
         }
     }
@@ -240,7 +283,13 @@ final class TransitViewModel: NSObject, ObservableObject {
                 coordinate: coordinate,
                 routeNames: Array(Set(routeNames)).sorted(),
                 agencyNames: Array(Set(agencyNames)).sorted(),
-                routeIDs: routeIDs
+                routeIDs: routeIDs,
+                sourceStopIDs: [apiStop.id],
+                sourceStopIDsByRoute: routeIDs.reduce(
+                    into: [Int: Set<Int>]()
+                ) { result, routeID in
+                    result[routeID] = [apiStop.id]
+                }
             )
         }
     }
@@ -424,13 +473,22 @@ final class TransitViewModel: NSObject, ObservableObject {
                 return lhs.count < rhs.count
             }.first ?? winner.name
 
+            let sourceStopIDsByRoute = cluster.reduce(into: [Int: Set<Int>]()) {
+                result, stop in
+                for (routeID, sourceStopIDs) in stop.sourceStopIDsByRoute {
+                    result[routeID, default: []].formUnion(sourceStopIDs)
+                }
+            }
+
             return TransitStop(
                 id: winner.id,
                 name: displayName,
                 coordinate: winner.coordinate,
                 routeNames: Array(Set(cluster.flatMap { $0.routeNames })).sorted(),
                 agencyNames: Array(Set(cluster.flatMap { $0.agencyNames })).sorted(),
-                routeIDs: Set(cluster.flatMap { $0.routeIDs })
+                routeIDs: Set(cluster.flatMap { $0.routeIDs }),
+                sourceStopIDs: Set(cluster.flatMap { $0.sourceStopIDs }),
+                sourceStopIDsByRoute: sourceStopIDsByRoute
             )
         }
     }
@@ -560,12 +618,544 @@ final class TransitViewModel: NSObject, ObservableObject {
             throw URLError(.resourceUnavailable)
         }
 
-        return matchingRoutes
+        let sortedRoutes = matchingRoutes
             .map { makeDisplayRoute(from: $0, near: origin) }
             .sorted {
                 $0.fullDisplayName.localizedStandardCompare($1.fullDisplayName)
                     == .orderedAscending
             }
+
+        // The product palette is assigned after sorting so a route keeps one
+        // identity color across its line, stop badge, pin, and sheet row.
+        return sortedRoutes.enumerated().map { index, route in
+            TransitRoute(
+                id: route.id,
+                transitlandID: route.transitlandID,
+                shortName: route.shortName,
+                longName: route.longName,
+                agencyName: route.agencyName,
+                routeType: route.routeType,
+                color: WayboundPalette.routeColor(at: index),
+                polylines: route.polylines
+            )
+        }
+    }
+
+    // MARK: - Destination journeys
+
+    /// Builds one rider-relevant, real trip from the nearest viable boarding
+    /// stop for each route. Stops, schedules, headsigns, and shapes all come
+    /// from Transitland; no destination inventory is embedded in the app.
+    private func fetchJourneys(
+        for routes: [TransitRoute],
+        boardingAt stops: [TransitStop],
+        from origin: CLLocationCoordinate2D
+    ) async -> [RouteJourney] {
+        let originLocation = CLLocation(
+            latitude: origin.latitude,
+            longitude: origin.longitude
+        )
+        var optionsByRoute: [Int: [JourneyBoardingOption]] = [:]
+
+        for route in routes {
+            let nearestStops = stops
+                .filter { $0.routeIDs.contains(route.transitlandID) }
+                .sorted { lhs, rhs in
+                    let lhsDistance = originLocation.distance(from: CLLocation(
+                        latitude: lhs.coordinate.latitude,
+                        longitude: lhs.coordinate.longitude
+                    ))
+                    let rhsDistance = originLocation.distance(from: CLLocation(
+                        latitude: rhs.coordinate.latitude,
+                        longitude: rhs.coordinate.longitude
+                    ))
+                    return lhsDistance < rhsDistance
+                }
+                .prefix(3)
+
+            for stop in nearestStops {
+                let distance = originLocation.distance(from: CLLocation(
+                    latitude: stop.coordinate.latitude,
+                    longitude: stop.coordinate.longitude
+                ))
+                let walkMinutes = max(1, Int(ceil(distance / walkingMetersPerMinute)))
+                for sourceStopID in stop.sourceStopIDsByRoute[route.transitlandID] ?? [] {
+                    optionsByRoute[route.transitlandID, default: []].append(
+                        JourneyBoardingOption(
+                            route: route,
+                            stop: stop,
+                            sourceStopID: sourceStopID,
+                            walkMinutes: walkMinutes
+                        )
+                    )
+                }
+            }
+        }
+
+        let sourceStopIDs = Set(
+            optionsByRoute.values.flatMap { $0.map(\.sourceStopID) }
+        )
+        let departuresByStop = await fetchUpcomingDepartures(for: sourceStopIDs)
+        let now = Date()
+        var selections: [JourneyDepartureSelection] = []
+
+        for route in routes {
+            var candidates: [JourneyDepartureSelection] = []
+            for option in optionsByRoute[route.transitlandID] ?? [] {
+                let earliestBoardableDate = now.addingTimeInterval(
+                    Double(option.walkMinutes + minimumBoardingBufferMinutes) * 60
+                )
+                for departure in departuresByStop[option.sourceStopID] ?? [] {
+                    guard departure.trip?.route?.id == route.transitlandID,
+                          let event = departure.departure ?? departure.arrival,
+                          let departureDate = event.effectiveDate,
+                          departureDate >= earliestBoardableDate
+                    else { continue }
+
+                    candidates.append(
+                        JourneyDepartureSelection(
+                            option: option,
+                            departure: departure,
+                            departureDate: departureDate,
+                            departureIsRealtime: event.isRealtime
+                        )
+                    )
+                }
+            }
+
+            // A route can arrive at this stop in both directions. Inspect a few
+            // actual trips rather than accidentally choosing a bus one stop from
+            // its terminus and calling that the route's useful destination.
+            var seenPatterns: Set<String> = []
+            let representativeSelections = candidates
+                .sorted { $0.departureDate < $1.departureDate }
+                .filter { candidate in
+                    guard let trip = candidate.departure.trip else { return false }
+                    let pattern = "\(trip.directionID ?? -1)|\(trip.tripHeadsign ?? "")"
+                    return seenPatterns.insert(pattern).inserted
+                }
+                .prefix(3)
+            selections.append(contentsOf: representativeSelections)
+        }
+
+        let tripRequests = selections.compactMap {
+            selection -> (Int, URLRequest)? in
+            let routeID = selection.option.route.transitlandID
+            guard let tripID = selection.departure.trip?.id,
+                  let request = journeyTripRequest(
+                    routeID: routeID,
+                    tripID: tripID
+                  )
+            else { return nil }
+            return (tripID, request)
+        }
+
+        let loadedTrips = await withTaskGroup(of: (Int, Data?).self) { group in
+            for (tripID, request) in tripRequests {
+                group.addTask {
+                    (tripID, try? await transitData(for: request))
+                }
+            }
+
+            var result: [Int: Data] = [:]
+            for await (tripID, data) in group {
+                if let data { result[tripID] = data }
+            }
+            return result
+        }
+
+        let journeyCandidates = selections.compactMap {
+            selection -> RouteJourney? in
+            guard let tripID = selection.departure.trip?.id,
+                  let data = loadedTrips[tripID],
+                  let response = try? JSONDecoder().decode(TripsResponse.self, from: data),
+                  let trip = response.trips.first(where: { $0.id == tripID })
+            else { return nil }
+            return makeJourney(from: trip, selection: selection, now: now)
+        }
+        let candidatesByRoute = Dictionary(
+            grouping: journeyCandidates,
+            by: { $0.route.transitlandID }
+        )
+        var journeys = routes.compactMap { route -> RouteJourney? in
+            let candidates = candidatesByRoute[route.transitlandID] ?? []
+            let usefulCandidates = candidates.filter { $0.rideMinutes >= 8 }
+            let pool = usefulCandidates.isEmpty ? candidates : usefulCandidates
+            return pool.min {
+                if $0.departureDate != $1.departureDate {
+                    return $0.departureDate < $1.departureDate
+                }
+                return $0.totalMinutes < $1.totalMinutes
+            }
+        }
+        .sorted {
+            if $0.departureDate != $1.departureDate {
+                return $0.departureDate < $1.departureDate
+            }
+            return $0.route.fullDisplayName.localizedStandardCompare(
+                $1.route.fullDisplayName
+            ) == .orderedAscending
+        }
+
+        let midpoint = Double(max(0, journeys.count - 1)) / 2
+        journeys = journeys.enumerated().map { index, journey in
+            copy(journey: journey, laneOffsetPoints: (Double(index) - midpoint) * 3)
+        }
+        return journeys
+    }
+
+    private func fetchUpcomingDepartures(
+        for stopIDs: Set<Int>
+    ) async -> [Int: [APIDeparture]] {
+        let requests = stopIDs.compactMap { stopID -> (Int, URLRequest)? in
+            guard let request = upcomingDepartureRequest(for: stopID) else { return nil }
+            return (stopID, request)
+        }
+
+        let payloads = await withTaskGroup(of: (Int, Data?).self) { group in
+            for (stopID, request) in requests {
+                group.addTask {
+                    (stopID, try? await transitData(for: request))
+                }
+            }
+
+            var result: [Int: Data] = [:]
+            for await (stopID, data) in group {
+                if let data { result[stopID] = data }
+            }
+            return result
+        }
+
+        return payloads.reduce(into: [Int: [APIDeparture]]()) {
+            result, payload in
+            let (stopID, data) = payload
+            guard let response = try? JSONDecoder().decode(
+                StopDeparturesResponse.self,
+                from: data
+            ) else {
+                result[stopID] = []
+                return
+            }
+            result[stopID] = response.stops
+                .first(where: { $0.id == stopID })?
+                .departures ?? []
+        }
+    }
+
+    private func upcomingDepartureRequest(for stopID: Int) -> URLRequest? {
+        var components = URLComponents(
+            string: "https://transit.land/api/v2/rest/stops/\(stopID)/departures"
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "next", value: "\(upcomingDepartureWindowSeconds)"),
+            URLQueryItem(name: "limit", value: "200"),
+            URLQueryItem(name: "include_geometry", value: "false"),
+            URLQueryItem(name: "include_alerts", value: "false"),
+            URLQueryItem(name: "use_service_window", value: "false"),
+        ]
+        guard let url = components.url else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "apikey")
+        return request
+    }
+
+    private func journeyTripRequest(routeID: Int, tripID: Int) -> URLRequest? {
+        var components = URLComponents(
+            string: "https://transit.land/api/v2/rest/routes/\(routeID)/trips/\(tripID)"
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "include_geometry", value: "true"),
+            URLQueryItem(name: "include_alerts", value: "false"),
+        ]
+        guard let url = components.url else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "apikey")
+        return request
+    }
+
+    private func makeJourney(
+        from trip: APITrip,
+        selection: JourneyDepartureSelection,
+        now: Date
+    ) -> RouteJourney? {
+        guard let stopTimes = trip.stopTimes?.sorted(by: {
+                  $0.stopSequence < $1.stopSequence
+              }),
+              !stopTimes.isEmpty,
+              let shape = trip.shape,
+              shape.generated == false,
+              let geometry = shape.geometry
+        else { return nil }
+
+        let boardingIndex: Int? = {
+            if let departureSequence = selection.departure.stopSequence,
+               let exactIndex = stopTimes.firstIndex(where: {
+                   $0.stopSequence == departureSequence
+                       && $0.stop.id == selection.option.sourceStopID
+               }) {
+                return exactIndex
+            }
+            return stopTimes.firstIndex {
+                $0.stop.id == selection.option.sourceStopID
+            }
+        }()
+        guard let boardingIndex,
+              let boardingServiceMinutes = TransitTime.serviceMinutes(
+                from: stopTimes[boardingIndex].departureTime
+                    ?? stopTimes[boardingIndex].arrivalTime
+              )
+        else { return nil }
+
+        var downstream: [(stopTime: APITripStopTime, offset: Int)] = []
+        for stopTime in stopTimes[boardingIndex...] {
+            guard var serviceMinutes = TransitTime.serviceMinutes(
+                from: stopTime.arrivalTime ?? stopTime.departureTime
+            ) else { continue }
+            while serviceMinutes < boardingServiceMinutes {
+                serviceMinutes += 24 * 60
+            }
+            downstream.append((
+                stopTime: stopTime,
+                offset: max(0, serviceMinutes - boardingServiceMinutes)
+            ))
+        }
+        guard downstream.count >= 2 else { return nil }
+
+        let flagshipIndex = selectFlagshipIndex(
+            in: downstream,
+            headsign: trip.tripHeadsign
+        )
+        let flagship = downstream[flagshipIndex]
+        guard flagship.offset > 0,
+              let flagshipCoordinate = coordinate(for: flagship.stopTime.stop)
+        else { return nil }
+
+        let finalCoordinate = downstream.last.flatMap {
+            coordinate(for: $0.stopTime.stop)
+        } ?? flagshipCoordinate
+        guard let boardingCoordinate = coordinate(
+            for: downstream[0].stopTime.stop
+        ),
+              let path = tripPath(
+                in: geometry.coordinateLines,
+                from: boardingCoordinate,
+                through: flagshipCoordinate,
+                to: finalCoordinate
+              )
+        else { return nil }
+
+        let tripHeadsign = cleanedDestinationName(trip.tripHeadsign)
+        let isFinalStop = flagshipIndex == downstream.count - 1
+        let destinationName = isFinalStop
+            ? (tripHeadsign ?? flagship.stopTime.stop.stopName ?? "Route destination")
+            : (flagship.stopTime.stop.stopName ?? tripHeadsign ?? "Route destination")
+
+        let journeyStops = downstream.enumerated().compactMap {
+            index, item -> JourneyStop? in
+            guard let coordinate = coordinate(for: item.stopTime.stop) else { return nil }
+            return JourneyStop(
+                id: "\(trip.id)-\(item.stopTime.stopSequence)",
+                sequence: item.stopTime.stopSequence,
+                name: item.stopTime.stop.stopName ?? "Unnamed stop",
+                coordinate: coordinate,
+                minutesFromBoarding: item.offset,
+                isBoarding: index == 0,
+                isFlagship: index == flagshipIndex
+            )
+        }
+        guard journeyStops.contains(where: \.isFlagship) else { return nil }
+
+        let departureMinutesFromNow = max(
+            0,
+            Int(ceil(selection.departureDate.timeIntervalSince(now) / 60))
+        )
+        let waitMinutes = max(
+            0,
+            departureMinutesFromNow - selection.option.walkMinutes
+        )
+        let totalMinutes = selection.option.walkMinutes + waitMinutes + flagship.offset
+
+        return RouteJourney(
+            route: selection.option.route,
+            tripID: trip.id,
+            boardingStop: selection.option.stop,
+            sourceStopID: selection.option.sourceStopID,
+            destinationName: destinationName,
+            destinationCoordinate: flagshipCoordinate,
+            departureDate: selection.departureDate,
+            departureMinutesFromNow: departureMinutesFromNow,
+            walkMinutes: selection.option.walkMinutes,
+            waitMinutes: waitMinutes,
+            rideMinutes: flagship.offset,
+            totalMinutes: totalMinutes,
+            departureIsRealtime: selection.departureIsRealtime,
+            stops: journeyStops,
+            flagshipPolylines: path.flagship,
+            continuationPolylines: path.continuation,
+            laneOffsetPoints: 0
+        )
+    }
+
+    /// Prefers an official terminus/headsign, a named civic destination, or a
+    /// useful medium-length ride. This is semantic scoring, not a hardcoded list
+    /// of local places, so it works wherever Transitland has stop data.
+    private func selectFlagshipIndex(
+        in stops: [(stopTime: APITripStopTime, offset: Int)],
+        headsign: String?
+    ) -> Int {
+        let landmarkTerms = [
+            "airport", "beach", "campus", "center", "college", "courthouse",
+            "downtown", "harbor", "hospital", "library", "mall", "museum",
+            "park", "station", "terminal", "transit", "university",
+        ]
+        let headsignTerms = (headsign ?? "")
+            .folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            .lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .map(String.init)
+            .filter { $0.count >= 3 }
+        let finalIndex = stops.count - 1
+        let eligible = stops.indices.filter {
+            stops[$0].offset >= 8 && stops[$0].offset <= 180
+        }
+        return (eligible.isEmpty ? Array(stops.indices.dropFirst()) : eligible)
+            .max { lhs, rhs in
+                func score(_ index: Int) -> Int {
+                    let item = stops[index]
+                    let name = (item.stopTime.stop.stopName ?? "")
+                        .folding(
+                            options: [.caseInsensitive, .diacriticInsensitive],
+                            locale: Locale(identifier: "en_US_POSIX")
+                        )
+                        .lowercased()
+                    let matchedHeadsignTerms = headsignTerms.filter {
+                        name.contains($0)
+                    }.count
+                    let headsignBonus: Int
+                    if !headsignTerms.isEmpty
+                        && matchedHeadsignTerms == headsignTerms.count {
+                        headsignBonus = 90 + matchedHeadsignTerms * 15
+                    } else if matchedHeadsignTerms > 0 {
+                        headsignBonus = matchedHeadsignTerms * 45
+                    } else {
+                        headsignBonus = 0
+                    }
+                    let landmarkBonus = landmarkTerms.contains {
+                        name.contains($0)
+                    } ? 35 : 0
+                    let terminusBonus = index == finalIndex ? 45 : 0
+                    let usefulRideScore = max(0, 30 - abs(item.offset - 35))
+                    let progressScore = Int(
+                        (Double(index) / Double(max(1, finalIndex))) * 20
+                    )
+                    let veryLongPenalty = max(0, item.offset - 120) / 2
+                    return headsignBonus + landmarkBonus + terminusBonus
+                        + usefulRideScore + progressScore - veryLongPenalty
+                }
+                return score(lhs) < score(rhs)
+            } ?? finalIndex
+    }
+
+    private func coordinate(for stop: APITripStop) -> CLLocationCoordinate2D? {
+        guard stop.geometry.coordinates.count >= 2 else { return nil }
+        return CLLocationCoordinate2D(
+            latitude: stop.geometry.coordinates[1],
+            longitude: stop.geometry.coordinates[0]
+        )
+    }
+
+    private func cleanedDestinationName(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let generic = ["inbound", "outbound", "northbound", "southbound"]
+        guard !cleaned.isEmpty,
+              !generic.contains(cleaned.lowercased())
+        else { return nil }
+        return cleaned
+    }
+
+    private func tripPath(
+        in coordinateLines: [[CLLocationCoordinate2D]],
+        from boarding: CLLocationCoordinate2D,
+        through flagship: CLLocationCoordinate2D,
+        to finalStop: CLLocationCoordinate2D
+    ) -> (flagship: [[CLLocationCoordinate2D]], continuation: [[CLLocationCoordinate2D]])? {
+        var best: (line: [CLLocationCoordinate2D], score: Double)?
+        for rawLine in coordinateLines {
+            let line = removingSinglePointSpikes(from: rawLine)
+            guard line.count >= 2 else { continue }
+            let score = nearestIndex(to: boarding, in: line).distance
+                + nearestIndex(to: flagship, in: line).distance
+                + nearestIndex(to: finalStop, in: line).distance
+            if best.map({ score < $0.score }) ?? true {
+                best = (line, score)
+            }
+        }
+        guard var line = best?.line else { return nil }
+
+        var boardingIndex = nearestIndex(to: boarding, in: line).index
+        var flagshipIndex = nearestIndex(to: flagship, in: line).index
+        if flagshipIndex < boardingIndex {
+            line.reverse()
+            boardingIndex = nearestIndex(to: boarding, in: line).index
+            flagshipIndex = nearestIndex(to: flagship, in: line).index
+        }
+        guard flagshipIndex > boardingIndex else { return nil }
+
+        var finalIndex = nearestIndex(to: finalStop, in: line).index
+        if finalIndex < flagshipIndex { finalIndex = flagshipIndex }
+        let flagshipLine = Array(line[boardingIndex...flagshipIndex])
+        let continuationLine = finalIndex > flagshipIndex
+            ? Array(line[flagshipIndex...finalIndex]) : []
+        let maximumJump = maximumGeometryJump(for: 3)
+        let flagshipSegments = splitPolyline(
+            flagshipLine,
+            atJumpsLongerThan: maximumJump
+        )
+        let continuationSegments = continuationLine.count >= 2
+            ? splitPolyline(continuationLine, atJumpsLongerThan: maximumJump) : []
+        guard !flagshipSegments.isEmpty else { return nil }
+        return (flagshipSegments, continuationSegments)
+    }
+
+    private func nearestIndex(
+        to coordinate: CLLocationCoordinate2D,
+        in line: [CLLocationCoordinate2D]
+    ) -> (index: Int, distance: Double) {
+        let point = MKMapPoint(coordinate)
+        return line.indices.reduce((0, Double.greatestFiniteMagnitude)) {
+            best, index in
+            let distance = point.distance(to: MKMapPoint(line[index]))
+            return distance < best.1 ? (index, distance) : best
+        }
+    }
+
+    private func copy(
+        journey: RouteJourney,
+        laneOffsetPoints: Double
+    ) -> RouteJourney {
+        RouteJourney(
+            route: journey.route,
+            tripID: journey.tripID,
+            boardingStop: journey.boardingStop,
+            sourceStopID: journey.sourceStopID,
+            destinationName: journey.destinationName,
+            destinationCoordinate: journey.destinationCoordinate,
+            departureDate: journey.departureDate,
+            departureMinutesFromNow: journey.departureMinutesFromNow,
+            walkMinutes: journey.walkMinutes,
+            waitMinutes: journey.waitMinutes,
+            rideMinutes: journey.rideMinutes,
+            totalMinutes: journey.totalMinutes,
+            departureIsRealtime: journey.departureIsRealtime,
+            stops: journey.stops,
+            flagshipPolylines: journey.flagshipPolylines,
+            continuationPolylines: journey.continuationPolylines,
+            laneOffsetPoints: laneOffsetPoints
+        )
     }
 
     private func routeRequest(for routeID: Int) -> URLRequest? {
@@ -877,6 +1467,7 @@ extension TransitViewModel: CLLocationManagerDelegate {
 
             // On first real GPS fix, pan the map and fetch data
             if isFirstFix {
+                userCoordinate = location.coordinate
                 targetRegion = MKCoordinateRegion(
                     center: location.coordinate,
                     span: MKCoordinateSpan(latitudeDelta: 0.03, longitudeDelta: 0.03)

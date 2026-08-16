@@ -13,6 +13,11 @@ struct TransitStop: Identifiable, Equatable {
     let agencyNames: [String]
     /// Transitland's internal IDs for routes that actually serve this stop.
     let routeIDs: Set<Int>
+    /// A logical stop may combine several operator-specific platform records.
+    let sourceStopIDs: Set<Int>
+    /// Preserves the physical Transitland stop record used by each route so
+    /// departure lookups do not accidentally query only the cluster winner.
+    let sourceStopIDsByRoute: [Int: Set<Int>]
 
     static func == (lhs: TransitStop, rhs: TransitStop) -> Bool {
         lhs.id == rhs.id
@@ -57,6 +62,72 @@ struct TransitRoute: Identifiable, Equatable {
 
     static func == (lhs: TransitRoute, rhs: TransitRoute) -> Bool {
         lhs.id == rhs.id
+    }
+}
+
+// MARK: - Destination journeys
+
+struct RouteJourney: Identifiable, Equatable {
+    let route: TransitRoute
+    let tripID: Int
+    let boardingStop: TransitStop
+    let sourceStopID: Int
+    let destinationName: String
+    let destinationCoordinate: CLLocationCoordinate2D
+    let departureDate: Date
+    let departureMinutesFromNow: Int
+    let walkMinutes: Int
+    let waitMinutes: Int
+    let rideMinutes: Int
+    let totalMinutes: Int
+    let departureIsRealtime: Bool
+    let stops: [JourneyStop]
+    /// The default map answer: actual trip shape from boarding to flagship.
+    let flagshipPolylines: [[CLLocationCoordinate2D]]
+    /// Any downstream shape after the flagship, used only by map-ladder mode.
+    let continuationPolylines: [[CLLocationCoordinate2D]]
+    /// Applied by the custom renderer in screen points, not geographic meters.
+    let laneOffsetPoints: Double
+
+    var id: Int { route.transitlandID }
+
+    var flagshipStop: JourneyStop? {
+        stops.first(where: \.isFlagship)
+    }
+
+    static func == (lhs: RouteJourney, rhs: RouteJourney) -> Bool {
+        lhs.id == rhs.id && lhs.tripID == rhs.tripID
+    }
+}
+
+struct JourneyStop: Identifiable, Equatable {
+    let id: String
+    let sequence: Int
+    let name: String
+    let coordinate: CLLocationCoordinate2D
+    let minutesFromBoarding: Int
+    let isBoarding: Bool
+    let isFlagship: Bool
+
+    static func == (lhs: JourneyStop, rhs: JourneyStop) -> Bool {
+        lhs.id == rhs.id
+            && lhs.minutesFromBoarding == rhs.minutesFromBoarding
+            && lhs.isFlagship == rhs.isFlagship
+    }
+}
+
+enum WayboundPalette {
+    static let cream = Color(hex: "F4F1E7")
+    static let ink = Color(hex: "24312D")
+    static let routeColors: [Color] = [
+        Color(hex: "C97A1E"),
+        Color(hex: "1E8E77"),
+        Color(hex: "D5502E"),
+        Color(hex: "6E5FC4"),
+    ]
+
+    static func routeColor(at index: Int) -> Color {
+        routeColors[index % routeColors.count]
     }
 }
 
@@ -152,10 +223,48 @@ struct APIStopDepartures: Decodable {
     let departures: [APIDeparture]
 }
 
-/// Only the number of departures is needed when choosing between duplicate
-/// stops, so individual departure payloads can be discarded while decoding.
 struct APIDeparture: Decodable {
-    init(from decoder: Decoder) throws {}
+    let stopSequence: Int?
+    let serviceDate: String?
+    let arrivalTime: String?
+    let departureTime: String?
+    let arrival: APIStopTimeEvent?
+    let departure: APIStopTimeEvent?
+    let trip: APITrip?
+
+    enum CodingKeys: String, CodingKey {
+        case stopSequence = "stop_sequence"
+        case serviceDate = "service_date"
+        case arrivalTime = "arrival_time"
+        case departureTime = "departure_time"
+        case arrival
+        case departure
+        case trip
+    }
+}
+
+struct APIStopTimeEvent: Decodable {
+    let scheduledUTC: String?
+    let estimatedUTC: String?
+    let scheduledLocal: String?
+    let estimatedLocal: String?
+    let estimatedDelay: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case scheduledUTC = "scheduled_utc"
+        case estimatedUTC = "estimated_utc"
+        case scheduledLocal = "scheduled_local"
+        case estimatedLocal = "estimated_local"
+        case estimatedDelay = "estimated_delay"
+    }
+
+    var effectiveDate: Date? {
+        TransitTime.date(from: estimatedUTC ?? scheduledUTC)
+    }
+
+    var isRealtime: Bool {
+        estimatedUTC != nil || estimatedDelay != nil
+    }
 }
 
 struct APIStop: Decodable {
@@ -260,13 +369,47 @@ struct TripsResponse: Decodable {
 
 struct APITrip: Decodable {
     let id: Int
+    let tripHeadsign: String?
     let directionID: Int?
+    let route: APIRouteRef?
     let shape: APITripShape?
+    let stopTimes: [APITripStopTime]?
 
     enum CodingKeys: String, CodingKey {
         case id
+        case tripHeadsign = "trip_headsign"
         case directionID = "direction_id"
+        case route
         case shape
+        case stopTimes = "stop_times"
+    }
+}
+
+struct APITripStopTime: Decodable {
+    let arrivalTime: String?
+    let departureTime: String?
+    let stopSequence: Int
+    let stopHeadsign: String?
+    let stop: APITripStop
+
+    enum CodingKeys: String, CodingKey {
+        case arrivalTime = "arrival_time"
+        case departureTime = "departure_time"
+        case stopSequence = "stop_sequence"
+        case stopHeadsign = "stop_headsign"
+        case stop
+    }
+}
+
+struct APITripStop: Decodable {
+    let id: Int
+    let stopName: String?
+    let geometry: GeoJSONPoint
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case stopName = "stop_name"
+        case geometry
     }
 }
 
@@ -305,6 +448,31 @@ struct APIRoute: Decodable {
 }
 
 // MARK: - Helpers
+
+enum TransitTime {
+    private static let internetDateTime = ISO8601DateFormatter()
+    private static let fractionalInternetDateTime: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    static func date(from value: String?) -> Date? {
+        guard let value, !value.isEmpty else { return nil }
+        return fractionalInternetDateTime.date(from: value)
+            ?? internetDateTime.date(from: value)
+    }
+
+    /// Converts GTFS times, including after-midnight values such as 25:10:00,
+    /// into minutes from the service day's midnight.
+    static func serviceMinutes(from value: String?) -> Int? {
+        guard let value else { return nil }
+        let components = value.split(separator: ":").compactMap { Int($0) }
+        guard components.count >= 2 else { return nil }
+        return components[0] * 60 + components[1]
+            + (components.count > 2 && components[2] >= 30 ? 1 : 0)
+    }
+}
 
 extension Color {
     /// Create a Color from a hex string like "FF5500"

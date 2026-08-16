@@ -1,513 +1,747 @@
 import SwiftUI
 import MapKit
 
-struct ContentView: View {
-    @StateObject private var viewModel = TransitViewModel()
-    @State private var cameraPosition: MapCameraPosition = .region(TransitViewModel.defaultRegion)
-    @State private var showList = false
-    @State private var selectedStop: TransitStop?
-    /// Transitland's internal route ID connects route lines to served stops.
-    @State private var selectedRouteID: Int?
+private enum RouteExpansionPrototype: String, CaseIterable {
+    case sheet
+    case map
 
-    private var selectedRoute: TransitRoute? {
-        viewModel.routes.first { $0.transitlandID == selectedRouteID }
+    var title: String {
+        switch self {
+        case .sheet: "Stops in sheet"
+        case .map: "Stops on map"
+        }
     }
 
-    private var selectedRouteStopCount: Int {
-        guard let selectedRouteID else { return 0 }
-        return viewModel.stops.filter {
-            $0.routeIDs.contains(selectedRouteID)
-        }.count
+    var icon: String {
+        switch self {
+        case .sheet: "list.bullet"
+        case .map: "map"
+        }
+    }
+}
+
+struct ContentView: View {
+    @StateObject private var viewModel = TransitViewModel()
+    @State private var cameraRequest = WayboundCameraRequest(
+        region: TransitViewModel.defaultRegion
+    )
+    @State private var selectedJourneyID: Int?
+    @State private var selectedStopID: Int?
+    @State private var expansionPrototype: RouteExpansionPrototype = .sheet
+
+    private var selectedJourney: RouteJourney? {
+        viewModel.journeys.first { $0.id == selectedJourneyID }
+    }
+
+    private var selectedStop: TransitStop? {
+        viewModel.stops.first { $0.id == selectedStopID }
+    }
+
+    private var highlightedRouteIDs: Set<Int>? {
+        if let selectedJourneyID { return [selectedJourneyID] }
+        return selectedStop?.routeIDs
+    }
+
+    private var routesWithoutJourneys: [TransitRoute] {
+        let journeyRouteIDs = Set(viewModel.journeys.map(\.id))
+        return viewModel.routes.filter {
+            !journeyRouteIDs.contains($0.transitlandID)
+        }
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            // MARK: - Map (iOS 17+ MapContentBuilder API)
-            Map(position: $cameraPosition) {
-                // Route geometry is drawn first so stop pins stay visible above it.
-                ForEach(viewModel.routes) { route in
-                    ForEach(route.polylines.indices, id: \.self) { index in
-                        MapPolyline(coordinates: route.polylines[index])
-                            .stroke(
-                                route.color.opacity(
-                                    selectedRouteID == nil
-                                        || selectedRouteID == route.transitlandID
-                                        ? 0.7 : 0.12
-                                ),
-                                style: StrokeStyle(
-                                    lineWidth: selectedRouteID == route.transitlandID ? 6 : 3,
-                                    lineCap: .round,
-                                    lineJoin: .round
-                                )
-                            )
-                    }
-                }
-
-                // User location
-                UserAnnotation()
-
-                // Stop annotations
-                ForEach(viewModel.stops) { stop in
-                    Annotation(stop.name, coordinate: stop.coordinate) {
-                        StopAnnotationView(
-                            stop: stop,
-                            isSelected: selectedStop?.id == stop.id,
-                            isDimmed: selectedRouteID.map {
-                                !stop.routeIDs.contains($0)
-                            } ?? false
-                        )
-                        .onTapGesture {
-                            if let routeID = selectedRouteID,
-                               !stop.routeIDs.contains(routeID) {
-                                selectedRouteID = nil
-                            }
-                            selectedStop = stop
-                        }
-                    }
-                }
-            }
-            .mapControls {
-                MapCompass()
-                MapScaleView()
-            }
-            .ignoresSafeArea()
-            .overlay(alignment: .topTrailing) {
-                Button {
-                    viewModel.recenter()
-                } label: {
-                    Image(systemName: "location.fill")
-                        .font(.title3)
-                        .padding(12)
-                        .background(.ultraThinMaterial)
-                        .clipShape(Circle())
-                        .shadow(radius: 4)
-                }
-                .padding()
-            }
-
-            // MARK: - Bottom sheet
-            VStack(spacing: 0) {
-                // Handle bar
-                Capsule()
-                    .fill(Color.secondary.opacity(0.4))
-                    .frame(width: 40, height: 5)
-                    .padding(.top, 8)
-                    .padding(.bottom, 4)
-
-                // Status / title
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(selectedRoute == nil ? "Nearby Transit" : "Selected Route")
-                            .font(.headline)
-                        if let route = selectedRoute {
-                            Text(
-                                "\(route.fullDisplayName) · \(selectedRouteStopCount) nearby stops · \(route.agencyName)"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        } else {
-                            Text("\(viewModel.stops.count) stops · \(viewModel.routes.count) routes within 0.5 mi")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    Spacer()
-                    if viewModel.isLoading {
-                        ProgressView()
-                    } else if selectedRouteID != nil {
-                        Button {
-                            selectedRouteID = nil
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                                .font(.title3)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Show all routes")
-                    }
-                }
-                .padding(.horizontal)
-                .padding(.bottom, 8)
-
-                Divider()
-
-                // Scrollable list
-                if showList {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 0) {
-                            // Routes section
-                            if !viewModel.routes.isEmpty {
-                                SectionHeader(title: "Routes", icon: "tram.fill")
-                                ForEach(viewModel.routes) { route in
-                                    RouteRow(route: route)
-                                        .background(
-                                            selectedRouteID == route.transitlandID
-                                                ? route.color.opacity(0.14)
-                                                : Color.clear
-                                        )
-                                        .contentShape(Rectangle())
-                                        .onTapGesture {
-                                            selectedRouteID =
-                                                selectedRouteID == route.transitlandID
-                                                ? nil : route.transitlandID
-                                            selectedStop = nil
-                                            showList = false
-                                        }
-                                    Divider().padding(.leading)
-                                }
-                            }
-                            // Stops section
-                            if !viewModel.stops.isEmpty {
-                                SectionHeader(title: "Stops", icon: "mappin.circle.fill")
-                                ForEach(viewModel.stops) { stop in
-                                    StopRow(stop: stop)
-                                        .opacity(
-                                            selectedRouteID.map {
-                                                stop.routeIDs.contains($0) ? 1 : 0.3
-                                            } ?? 1
-                                        )
-                                        .onTapGesture {
-                                            if let routeID = selectedRouteID,
-                                               !stop.routeIDs.contains(routeID) {
-                                                selectedRouteID = nil
-                                            }
-                                            selectedStop = stop
-                                            withAnimation {
-                                                cameraPosition = .region(
-                                                    MKCoordinateRegion(
-                                                        center: stop.coordinate,
-                                                        span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
-                                                    )
-                                                )
-                                            }
-                                            showList = false
-                                        }
-                                    Divider().padding(.leading)
-                                }
-                            }
-                        }
-                    }
-                    .frame(maxHeight: 400)
-                }
-            }
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .shadow(color: .black.opacity(0.15), radius: 10, y: -5)
-            .padding(.horizontal, 8)
-            .padding(.bottom, 4)
-            .onTapGesture {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                    showList.toggle()
-                }
-            }
-
-            // MARK: - Selected stop detail
-            if let stop = selectedStop {
-                StopDetailCard(
-                    stop: stop,
-                    routes: viewModel.routes.filter {
-                        stop.routeIDs.contains($0.transitlandID)
-                    },
-                    selectedRouteID: selectedRouteID,
-                    onSelectRoute: { routeID in
-                        selectedRouteID = selectedRouteID == routeID ? nil : routeID
-                    },
-                    onDismiss: {
-                        selectedStop = nil
-                    }
+        GeometryReader { geometry in
+            ZStack(alignment: .bottom) {
+                WayboundMapView(
+                    routes: viewModel.routes,
+                    journeys: viewModel.journeys,
+                    stops: viewModel.stops,
+                    selectedJourneyID: selectedJourneyID,
+                    selectedStopID: selectedStopID,
+                    highlightedRouteIDs: highlightedRouteIDs,
+                    showsMapLadder: selectedJourney != nil
+                        && expansionPrototype == .map,
+                    cameraRequest: cameraRequest,
+                    onSelectJourney: selectJourney,
+                    onSelectStop: selectStop
                 )
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-                .zIndex(1)
+                .ignoresSafeArea()
+
+                mapChrome
+
+                destinationSheet
+                    .frame(
+                        maxHeight: sheetHeight(for: geometry.size.height),
+                        alignment: .bottom
+                    )
             }
         }
-        .animation(.easeInOut, value: selectedStop)
-        .onChange(of: viewModel.targetRegion) { _, newRegion in
-            guard let region = newRegion else { return }
-            selectedStop = nil
-            selectedRouteID = nil
-            withAnimation {
-                cameraPosition = .region(region)
-            }
+        .background(WayboundPalette.cream)
+        .onChange(of: viewModel.targetRegion) { _, region in
+            guard let region else { return }
+            selectedJourneyID = nil
+            selectedStopID = nil
+            cameraRequest = WayboundCameraRequest(region: region)
         }
-        .alert("Location Error", isPresented: $viewModel.showError) {
+        .onChange(of: viewModel.journeys) { oldJourneys, newJourneys in
+            guard oldJourneys.isEmpty, !newJourneys.isEmpty else { return }
+            cameraRequest = WayboundCameraRequest(
+                region: overviewRegion(for: newJourneys)
+            )
+        }
+        .onChange(of: expansionPrototype) { _, prototype in
+            guard prototype == .map, let selectedJourney else { return }
+            cameraRequest = WayboundCameraRequest(
+                region: expandedRegion(for: selectedJourney)
+            )
+        }
+        .alert("Transit data unavailable", isPresented: $viewModel.showError) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(viewModel.errorMessage)
         }
     }
-}
 
-// MARK: - Sub-views
-
-struct StopAnnotationView: View {
-    let stop: TransitStop
-    let isSelected: Bool
-    let isDimmed: Bool
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .fill(isSelected ? Color.blue : Color.orange)
-                .frame(width: isSelected ? 28 : 20, height: isSelected ? 28 : 20)
-                .shadow(radius: 3)
-            Image(systemName: "bus.fill")
-                .font(.system(size: isSelected ? 14 : 10))
-                .foregroundColor(.white)
-        }
-        .opacity(isDimmed ? 0.25 : 1)
-        .scaleEffect(isDimmed ? 0.8 : 1)
-        .animation(.spring(), value: isSelected)
-        .animation(.easeInOut(duration: 0.2), value: isDimmed)
-    }
-}
-
-struct SectionHeader: View {
-    let title: String
-    let icon: String
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .foregroundColor(.accentColor)
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 10)
-    }
-}
-
-struct RouteRow: View {
-    let route: TransitRoute
-
-    var body: some View {
-        HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 6)
-                .fill(route.color)
-                .frame(width: 36, height: 36)
-                .overlay {
-                    if let routeNumber = route.routeNumber {
-                        Text(routeNumber.prefix(4))
-                            .font(.caption2.bold())
-                            .foregroundColor(.white)
-                            .minimumScaleFactor(0.5)
-                    } else {
-                        Image(systemName: "bus.fill")
-                            .font(.caption)
-                            .foregroundStyle(.white)
-                    }
+    private var mapChrome: some View {
+        VStack {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("WAYBOUND")
+                        .font(
+                            .system(size: 21, weight: .black, design: .rounded)
+                            .width(.condensed)
+                        )
+                        .tracking(0.6)
+                    Text("Where transit takes you")
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(WayboundPalette.ink.opacity(0.68))
                 }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(route.displayName)
-                    .font(.subheadline)
-                    .lineLimit(1)
-                Text(route.agencyName)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            routeTypeIcon(route.routeType)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-    }
+                .foregroundStyle(WayboundPalette.ink)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(WayboundPalette.cream.opacity(0.96))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
 
-    @ViewBuilder
-    func routeTypeIcon(_ type: Int) -> some View {
-        switch type {
-        case 0: Image(systemName: "tram.fill")        // Tram
-        case 1: Image(systemName: "train.side.front.car") // Subway
-        case 2: Image(systemName: "train.side.front.car") // Rail
-        case 3: Image(systemName: "bus.fill")          // Bus
-        case 4: Image(systemName: "ferry.fill")        // Ferry
-        default: Image(systemName: "figure.walk")
-        }
-    }
-}
+                Spacer()
 
-struct StopRow: View {
-    let stop: TransitStop
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "mappin.circle.fill")
-                .font(.title2)
-                .foregroundColor(.orange)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(stop.name)
-                    .font(.subheadline)
-                    .lineLimit(1)
-                if !stop.routeNames.isEmpty {
-                    Text(stop.routeNames.joined(separator: ", "))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                Button {
+                    viewModel.recenter()
+                } label: {
+                    Image(systemName: "location.fill")
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundStyle(WayboundPalette.ink)
+                        .frame(width: 44, height: 44)
+                        .background(WayboundPalette.cream.opacity(0.96))
+                        .clipShape(Circle())
+                        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
                 }
+                .accessibilityLabel("Center on my location")
             }
+            .padding(.horizontal, 14)
+            .padding(.top, 8)
+
             Spacer()
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
     }
-}
 
-private struct OperatorRouteGroup: Identifiable {
-    let name: String
-    let routes: [TransitRoute]
+    private var destinationSheet: some View {
+        VStack(spacing: 0) {
+            Capsule()
+                .fill(WayboundPalette.ink.opacity(0.22))
+                .frame(width: 38, height: 5)
+                .padding(.top, 9)
+                .padding(.bottom, 8)
 
-    var id: String { name }
-}
-
-struct StopDetailCard: View {
-    let stop: TransitStop
-    let routes: [TransitRoute]
-    let selectedRouteID: Int?
-    let onSelectRoute: (Int) -> Void
-    let onDismiss: () -> Void
-
-    private var operatorGroups: [OperatorRouteGroup] {
-        Dictionary(grouping: routes, by: \.agencyName)
-            .map { agencyName, routes in
-                OperatorRouteGroup(
-                    name: agencyName,
-                    routes: routes.sorted {
-                        $0.fullDisplayName.localizedStandardCompare(
-                            $1.fullDisplayName
-                        ) == .orderedAscending
-                    }
+            if let selectedJourney {
+                JourneyDetailSheet(
+                    journey: selectedJourney,
+                    prototype: $expansionPrototype,
+                    onBack: clearSelection
+                )
+            } else {
+                JourneyOverviewSheet(
+                    journeys: viewModel.journeys,
+                    unavailableRoutes: routesWithoutJourneys,
+                    isLoading: viewModel.isLoading || viewModel.isLoadingJourneys,
+                    highlightedRouteIDs: highlightedRouteIDs,
+                    selectedStopName: selectedStop?.name,
+                    onSelect: selectJourney,
+                    onClearStop: clearStopSelection
                 )
             }
-            .sorted {
-                $0.name.localizedStandardCompare($1.name) == .orderedAscending
-            }
+        }
+        .background(WayboundPalette.cream.opacity(0.985))
+        .clipShape(
+            UnevenRoundedRectangle(
+                topLeadingRadius: 28,
+                bottomLeadingRadius: 0,
+                bottomTrailingRadius: 0,
+                topTrailingRadius: 28,
+                style: .continuous
+            )
+        )
+        .overlay(alignment: .top) {
+            UnevenRoundedRectangle(
+                topLeadingRadius: 28,
+                bottomLeadingRadius: 0,
+                bottomTrailingRadius: 0,
+                topTrailingRadius: 28,
+                style: .continuous
+            )
+            .stroke(WayboundPalette.ink.opacity(0.08), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.16), radius: 18, y: -5)
+        .ignoresSafeArea(edges: .bottom)
     }
 
+    private func sheetHeight(for screenHeight: CGFloat) -> CGFloat {
+        if selectedJourney != nil {
+            return expansionPrototype == .sheet
+                ? min(570, screenHeight * 0.62)
+                : min(285, screenHeight * 0.32)
+        }
+        return min(440, max(320, screenHeight * 0.42))
+    }
+
+    private func selectJourney(_ routeID: Int) {
+        guard let journey = viewModel.journeys.first(where: { $0.id == routeID })
+        else { return }
+        withAnimation(.snappy(duration: 0.3)) {
+            selectedStopID = nil
+            selectedJourneyID = routeID
+        }
+        if expansionPrototype == .map {
+            cameraRequest = WayboundCameraRequest(
+                region: expandedRegion(for: journey)
+            )
+        }
+    }
+
+    private func selectStop(_ stopID: Int) {
+        guard viewModel.stops.contains(where: { $0.id == stopID }) else { return }
+        withAnimation(.snappy(duration: 0.3)) {
+            selectedJourneyID = nil
+            selectedStopID = stopID
+        }
+    }
+
+    private func clearStopSelection() {
+        withAnimation(.snappy(duration: 0.3)) {
+            selectedStopID = nil
+        }
+    }
+
+    private func clearSelection() {
+        withAnimation(.snappy(duration: 0.3)) {
+            selectedJourneyID = nil
+        }
+        if !viewModel.journeys.isEmpty {
+            cameraRequest = WayboundCameraRequest(
+                region: overviewRegion(for: viewModel.journeys)
+            )
+        }
+    }
+
+    private func overviewRegion(for journeys: [RouteJourney]) -> MKCoordinateRegion {
+        let coordinates = [viewModel.userCoordinate]
+            + journeys.map(\.boardingStop.coordinate)
+            + journeys.map(\.destinationCoordinate)
+        return region(containing: coordinates, reservesBottomSheet: true)
+    }
+
+    private func expandedRegion(for journey: RouteJourney) -> MKCoordinateRegion {
+        region(
+            containing: [viewModel.userCoordinate]
+                + journey.stops.map(\.coordinate),
+            reservesBottomSheet: true
+        )
+    }
+
+    private func region(
+        containing coordinates: [CLLocationCoordinate2D],
+        reservesBottomSheet: Bool
+    ) -> MKCoordinateRegion {
+        guard let first = coordinates.first else {
+            return TransitViewModel.defaultRegion
+        }
+        var rect = MKMapRect(
+            x: MKMapPoint(first).x,
+            y: MKMapPoint(first).y,
+            width: 1,
+            height: 1
+        )
+        for coordinate in coordinates.dropFirst() {
+            let point = MKMapPoint(coordinate)
+            rect = rect.union(MKMapRect(x: point.x, y: point.y, width: 1, height: 1))
+        }
+
+        let minimumMapPoints = MKMapPointsPerMeterAtLatitude(first.latitude) * 1_200
+        let contentWidth = max(rect.size.width, minimumMapPoints)
+        let contentHeight = max(rect.size.height, minimumMapPoints)
+        let horizontalPadding = contentWidth * 0.20
+        let topPadding = contentHeight * 0.20
+        let bottomPadding = reservesBottomSheet
+            ? contentHeight * 0.95 : contentHeight * 0.20
+        let padded = MKMapRect(
+            x: rect.midX - contentWidth / 2 - horizontalPadding,
+            y: rect.midY - contentHeight / 2 - topPadding,
+            width: contentWidth + horizontalPadding * 2,
+            height: contentHeight + topPadding + bottomPadding
+        )
+        return MKCoordinateRegion(padded)
+    }
+}
+
+// MARK: - Overview
+
+private struct JourneyOverviewSheet: View {
+    let journeys: [RouteJourney]
+    let unavailableRoutes: [TransitRoute]
+    let isLoading: Bool
+    let highlightedRouteIDs: Set<Int>?
+    let selectedStopName: String?
+    let onSelect: (Int) -> Void
+    let onClearStop: () -> Void
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "mappin.circle.fill")
-                    .foregroundColor(.orange)
-                Text(stop.name)
-                    .font(.headline)
-                Spacer()
-                Button(action: onDismiss) {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Where these routes go")
+                        .font(
+                            .system(size: 23, weight: .black, design: .rounded)
+                            .width(.condensed)
+                        )
+                        .foregroundStyle(WayboundPalette.ink)
+                    Text(
+                        selectedStopName.map { "Routes serving \($0)" }
+                            ?? "One useful destination per boardable route"
+                    )
+                    .font(.system(size: 12, weight: .regular, design: .rounded))
+                    .foregroundStyle(WayboundPalette.ink.opacity(0.62))
+                    .lineLimit(1)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close stop details")
+                Spacer()
+                if selectedStopName != nil {
+                    Button(action: onClearStop) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(WayboundPalette.ink)
+                            .frame(width: 30, height: 30)
+                            .background(.white.opacity(0.66))
+                            .clipShape(Circle())
+                    }
+                    .accessibilityLabel("Show all routes")
+                } else if isLoading {
+                    ProgressView()
+                        .tint(WayboundPalette.ink)
+                }
             }
+            .padding(.horizontal, 18)
+            .padding(.bottom, 10)
 
-            if !operatorGroups.isEmpty {
-                Text("Service by operator")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+            if journeys.isEmpty && !isLoading {
+                ContentUnavailableView {
+                    Label("No boardable trips", systemImage: "bus")
+                } description: {
+                    Text("No real trip with a trusted street shape departs in the next 12 hours.")
+                }
+                .fontDesign(.rounded)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(journeys) { journey in
+                            Button {
+                                onSelect(journey.id)
+                            } label: {
+                                JourneyRow(journey: journey)
+                            }
+                            .buttonStyle(.plain)
+                            .opacity(
+                                highlightedRouteIDs.map {
+                                    $0.contains(journey.id) ? 1 : 0.28
+                                } ?? 1
+                            )
+                        }
 
-                ScrollView(.vertical, showsIndicators: true) {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(operatorGroups) { group in
-                            VStack(alignment: .leading, spacing: 6) {
-                                Label(group.name, systemImage: "building.2.fill")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                    .accessibilityAddTraits(.isHeader)
+                        if !unavailableRoutes.isEmpty && !isLoading {
+                            HStack {
+                                Text("No boardable trip in the next 12 hours")
+                                    .font(
+                                        .system(
+                                            size: 13,
+                                            weight: .bold,
+                                            design: .rounded
+                                        ).width(.condensed)
+                                    )
+                                    .textCase(nil)
+                                Spacer()
+                                Text("\(unavailableRoutes.count) routes")
+                                    .font(.system(size: 11, design: .monospaced))
+                            }
+                            .foregroundStyle(WayboundPalette.ink.opacity(0.55))
+                            .padding(.top, 5)
 
-                                ForEach(group.routes) { route in
-                                    Button {
-                                        onSelectRoute(route.transitlandID)
-                                    } label: {
-                                        StopRouteBadge(
-                                            route: route,
-                                            isSelected: selectedRouteID
-                                                == route.transitlandID
-                                        )
-                                    }
-                                    .buttonStyle(.plain)
-                                }
+                            ForEach(unavailableRoutes) { route in
+                                UnavailableRouteRow(route: route)
+                                    .opacity(
+                                        highlightedRouteIDs.map {
+                                            $0.contains(route.transitlandID) ? 1 : 0.28
+                                        } ?? 1
+                                    )
                             }
                         }
                     }
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 28)
                 }
-                .frame(maxHeight: 360)
-            } else if !stop.routeNames.isEmpty {
-                if !stop.agencyNames.isEmpty {
-                    Text("Service from " + stop.agencyNames.joined(separator: " · "))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-                Text("Routes: " + stop.routeNames.joined(separator: ", "))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .scrollIndicators(.hidden)
             }
-
-            Text("Lat: \(stop.coordinate.latitude, specifier: "%.5f")  Lon: \(stop.coordinate.longitude, specifier: "%.5f")")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
         }
-        .padding()
-        .background(.ultraThickMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .shadow(radius: 8)
-        .padding()
-        .padding(.bottom, 120)
     }
 }
 
-struct StopRouteBadge: View {
+private struct JourneyRow: View {
+    let journey: RouteJourney
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            RouteBadge(route: journey.route, size: 42)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(journey.destinationName)
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .foregroundStyle(WayboundPalette.ink)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text("\(journey.totalMinutes) min")
+                        .font(.system(size: 15, weight: .bold, design: .monospaced))
+                        .foregroundStyle(journey.route.color)
+                }
+
+                HStack(spacing: 6) {
+                    Text(journey.route.fullDisplayName)
+                        .lineLimit(1)
+                    Text("·")
+                    Text("bus in \(journey.departureMinutesFromNow) min")
+                        .fontWeight(.semibold)
+                }
+                .font(.system(size: 11.5, design: .rounded))
+                .foregroundStyle(WayboundPalette.ink.opacity(0.68))
+
+                HStack(spacing: 6) {
+                    TimingChip(icon: "figure.walk", label: "walk", minutes: journey.walkMinutes)
+                    TimingChip(icon: "hourglass", label: "wait", minutes: journey.waitMinutes)
+                    TimingChip(icon: "bus.fill", label: "ride", minutes: journey.rideMinutes)
+                    Spacer(minLength: 0)
+                    if journey.departureIsRealtime {
+                        LiveBadge()
+                    } else {
+                        Text("Schedule")
+                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                            .foregroundStyle(WayboundPalette.ink.opacity(0.5))
+                    }
+                }
+            }
+
+            Image(systemName: "chevron.right")
+                .font(.caption.bold())
+                .foregroundStyle(WayboundPalette.ink.opacity(0.34))
+                .padding(.top, 17)
+        }
+        .padding(12)
+        .background(.white.opacity(0.72))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(journey.route.color.opacity(0.28), lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(journey.route.fullDisplayName) to \(journey.destinationName). Bus in \(journey.departureMinutesFromNow) minutes. Walk \(journey.walkMinutes), wait \(journey.waitMinutes), ride \(journey.rideMinutes), \(journey.totalMinutes) minutes total."
+        )
+    }
+}
+
+private struct UnavailableRouteRow: View {
     let route: TransitRoute
-    let isSelected: Bool
 
     var body: some View {
         HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 5)
-                .fill(route.color)
-                .frame(width: 42, height: 34)
-                .overlay {
-                    if let routeNumber = route.routeNumber {
-                        Text(routeNumber.prefix(4))
-                            .font(.caption2.bold())
-                            .foregroundStyle(.white)
-                            .minimumScaleFactor(0.45)
-                    } else {
-                        Image(systemName: "bus.fill")
-                            .font(.caption)
+            RouteBadge(route: route, size: 32)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(route.fullDisplayName)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                Text(route.agencyName)
+                    .font(.system(size: 10.5, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text("Later")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+        .foregroundStyle(WayboundPalette.ink.opacity(0.72))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.white.opacity(0.36))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+// MARK: - Expanded route prototypes
+
+private struct JourneyDetailSheet: View {
+    let journey: RouteJourney
+    @Binding var prototype: RouteExpansionPrototype
+    let onBack: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Button(action: onBack) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(WayboundPalette.ink)
+                        .frame(width: 34, height: 34)
+                        .background(.white.opacity(0.65))
+                        .clipShape(Circle())
+                }
+                .accessibilityLabel("Back to all destinations")
+
+                RouteBadge(route: journey.route, size: 38)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(journey.destinationName)
+                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                        .foregroundStyle(WayboundPalette.ink)
+                        .lineLimit(1)
+                    Text("\(journey.totalMinutes) min total · bus in \(journey.departureMinutesFromNow) min")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(journey.route.color)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+
+            HStack(spacing: 8) {
+                ForEach(RouteExpansionPrototype.allCases, id: \.self) { option in
+                    Button {
+                        withAnimation(.snappy(duration: 0.25)) {
+                            prototype = option
+                        }
+                    } label: {
+                        Label(option.title, systemImage: option.icon)
+                            .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                            .foregroundStyle(
+                                prototype == option ? Color.white : WayboundPalette.ink
+                            )
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(
+                                prototype == option
+                                    ? journey.route.color
+                                    : Color.white.opacity(0.58)
+                            )
+                            .clipShape(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(prototype == option ? .isSelected : [])
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+
+            HStack(spacing: 6) {
+                TimingChip(icon: "figure.walk", label: "walk", minutes: journey.walkMinutes)
+                TimingChip(icon: "hourglass", label: "wait", minutes: journey.waitMinutes)
+                TimingChip(icon: "bus.fill", label: "ride", minutes: journey.rideMinutes)
+                Spacer()
+                if journey.departureIsRealtime {
+                    LiveBadge()
+                    Text("departure · scheduled ride")
+                        .font(.system(size: 9, design: .rounded))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Scheduled departure and ride")
+                        .font(.system(size: 9, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+
+            if prototype == .sheet {
+                Divider().opacity(0.45)
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(journey.stops) { stop in
+                            StopLadderRow(
+                                stop: stop,
+                                routeColor: journey.route.color
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 30)
+                }
+                .scrollIndicators(.hidden)
+            } else {
+                HStack(spacing: 10) {
+                    Image(systemName: "map.fill")
+                        .foregroundStyle(journey.route.color)
+                    Text("All \(max(0, journey.stops.count - 1)) downstream stops are now labeled on the map. Other routes step aside; the flagship stays pinned.")
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(WayboundPalette.ink.opacity(0.72))
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 20)
+            }
+        }
+    }
+}
+
+private struct StopLadderRow: View {
+    let stop: JourneyStop
+    let routeColor: Color
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            VStack(spacing: 0) {
+                Rectangle()
+                    .fill(stop.isBoarding ? Color.clear : routeColor.opacity(0.34))
+                    .frame(width: 2, height: 8)
+                ZStack {
+                    Circle()
+                        .fill(stop.isFlagship ? routeColor : WayboundPalette.cream)
+                        .frame(
+                            width: stop.isFlagship ? 18 : 12,
+                            height: stop.isFlagship ? 18 : 12
+                        )
+                    Circle()
+                        .stroke(routeColor, lineWidth: 2)
+                        .frame(
+                            width: stop.isFlagship ? 18 : 12,
+                            height: stop.isFlagship ? 18 : 12
+                        )
+                    if stop.isFlagship {
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 7))
                             .foregroundStyle(.white)
                     }
                 }
-
-            Text(route.displayName)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
-
-            Spacer(minLength: 4)
-
-            if isSelected {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(route.color)
-                    .accessibilityHidden(true)
+                Rectangle()
+                    .fill(routeColor.opacity(0.34))
+                    .frame(width: 2, height: 26)
             }
+            .frame(width: 20)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(stop.name)
+                    .font(
+                        .system(
+                            size: 13,
+                            weight: stop.isFlagship ? .bold : .medium,
+                            design: .rounded
+                        )
+                    )
+                    .foregroundStyle(WayboundPalette.ink)
+                    .lineLimit(2)
+                if stop.isBoarding {
+                    Text("Board here")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(routeColor)
+                } else if stop.isFlagship {
+                    Text("Flagship destination")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(routeColor)
+                }
+            }
+            Spacer()
+            Text(stop.isBoarding ? "now" : "+\(stop.minutesFromBoarding) min")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(stop.isFlagship ? routeColor : WayboundPalette.ink.opacity(0.58))
+                .padding(.top, 1)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(8)
+        .frame(minHeight: 48)
         .background(
-            route.color.opacity(isSelected ? 0.18 : 0.06),
+            stop.isFlagship ? routeColor.opacity(0.08) : Color.clear,
             in: RoundedRectangle(cornerRadius: 10, style: .continuous)
         )
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(
-                    route.color.opacity(isSelected ? 1 : 0.4),
-                    lineWidth: isSelected ? 2 : 1
-                )
+        .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - Reusable visual language
+
+private struct RouteBadge: View {
+    let route: TransitRoute
+    let size: CGFloat
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
+            .fill(route.color)
+            .frame(width: size, height: size)
+            .overlay {
+                if let number = route.routeNumber {
+                    Text(String(number.prefix(4)))
+                        .font(
+                            .system(
+                                size: size * 0.31,
+                                weight: .black,
+                                design: .rounded
+                            ).width(.condensed)
+                        )
+                        .foregroundStyle(.white)
+                        .minimumScaleFactor(0.55)
+                        .padding(2)
+                } else {
+                    Image(systemName: "bus.fill")
+                        .font(.system(size: size * 0.34, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .shadow(color: route.color.opacity(0.22), radius: 4, y: 2)
+    }
+}
+
+private struct TimingChip: View {
+    let icon: String
+    let label: String
+    let minutes: Int
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.system(size: 8.5, weight: .semibold))
+            Text("\(label) \(minutes)")
+                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
         }
-        .accessibilityLabel(
-            "\(route.fullDisplayName), operated by \(route.agencyName)"
-        )
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .foregroundStyle(WayboundPalette.ink.opacity(0.68))
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(WayboundPalette.ink.opacity(0.055))
+        .clipShape(Capsule())
+        .accessibilityLabel("\(label) \(minutes) minutes")
+    }
+}
+
+private struct LiveBadge: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Circle()
+                .fill(Color.green)
+                .frame(width: 5, height: 5)
+            Text("Live")
+                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+        }
+        .foregroundStyle(WayboundPalette.ink.opacity(0.72))
+        .accessibilityLabel("Live departure estimate")
     }
 }
 
