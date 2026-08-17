@@ -51,6 +51,9 @@ final class TransitViewModel: NSObject, ObservableObject {
     @Published var routes: [TransitRoute] = []
     @Published var journeys: [RouteJourney] = []
     @Published var userCoordinate: CLLocationCoordinate2D = TransitViewModel.defaultCoordinate
+    /// Nil means live departures from the current moment. A value switches every
+    /// schedule query and rider-facing duration to that future planning instant.
+    @Published private(set) var planningDate: Date?
     @Published var isLoading = false
     @Published var isLoadingJourneys = false
     @Published var showError = false
@@ -86,7 +89,7 @@ final class TransitViewModel: NSObject, ObservableObject {
     private let maximumTripGeometriesPerRoute = 12
     /// Keep eight distinct numbered public routes when they are genuinely
     /// boardable. Each retained route may contribute one trip per direction.
-    private let maximumVisiblePublicRoutes = 8
+    private let maximumVisiblePublicRoutes = 20
     private let upcomingDepartureWindowSeconds = 10_800 // 3 hours
     /// Frequency is deliberately local to the decision a rider is making now.
     /// A route earns a utility bonus only for catchable trips in the next 90 min.
@@ -138,6 +141,16 @@ final class TransitViewModel: NSObject, ObservableObject {
         fetchTransitData(lat: coordinate.latitude, lon: coordinate.longitude)
     }
 
+    /// Changes only the schedule reference time. The current map position remains
+    /// untouched while transit is reloaded for the same geographic origin.
+    func setPlanningDate(_ date: Date?) {
+        planningDate = date
+        fetchTransitData(
+            lat: userCoordinate.latitude,
+            lon: userCoordinate.longitude
+        )
+    }
+
     // MARK: - Fetch data
 
     func fetchTransitData(lat: Double, lon: Double) {
@@ -151,6 +164,10 @@ final class TransitViewModel: NSObject, ObservableObject {
         stops = []
         routes = []
         journeys = []
+
+        let selectedPlanningDate = planningDate
+        let scheduleReferenceDate = selectedPlanningDate ?? Date()
+        let isLiveSearch = selectedPlanningDate == nil
 
         Task {
             var errors: [String] = []
@@ -172,7 +189,9 @@ final class TransitViewModel: NSObject, ObservableObject {
                     let fetchedJourneys = await fetchJourneys(
                         for: fetchedRoutes,
                         boardingAt: fetchedStops,
-                        from: origin
+                        from: origin,
+                        scheduleReferenceDate: scheduleReferenceDate,
+                        isLiveSearch: isLiveSearch
                     )
                     guard self.activeFetchID == fetchID else { return }
 
@@ -739,7 +758,9 @@ final class TransitViewModel: NSObject, ObservableObject {
     private func fetchJourneys(
         for routes: [TransitRoute],
         boardingAt stops: [TransitStop],
-        from origin: CLLocationCoordinate2D
+        from origin: CLLocationCoordinate2D,
+        scheduleReferenceDate: Date,
+        isLiveSearch: Bool
     ) async -> [RouteJourney] {
         let originLocation = CLLocation(
             latitude: origin.latitude,
@@ -795,12 +816,15 @@ final class TransitViewModel: NSObject, ObservableObject {
         let sourceStopIDs = Set(
             optionsByRoute.values.flatMap { $0.map(\.sourceStopID) }
         )
-        let departuresByStop = await fetchUpcomingDepartures(for: sourceStopIDs)
-        let now = Date()
-        let latestUsefulDeparture = now.addingTimeInterval(
+        let departuresByStop = await fetchUpcomingDepartures(
+            for: sourceStopIDs,
+            scheduleReferenceDate: scheduleReferenceDate,
+            isLiveSearch: isLiveSearch
+        )
+        let latestUsefulDeparture = scheduleReferenceDate.addingTimeInterval(
             Double(upcomingDepartureWindowSeconds)
         )
-        let frequencyObservationEnd = now.addingTimeInterval(
+        let frequencyObservationEnd = scheduleReferenceDate.addingTimeInterval(
             Double(frequencyObservationWindowSeconds)
         )
         var selections: [JourneyDepartureSelection] = []
@@ -810,7 +834,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         for route in routes {
             var candidates: [JourneyDepartureSelection] = []
             for option in optionsByRoute[route.transitlandID] ?? [] {
-                let earliestBoardableDate = now.addingTimeInterval(
+                let earliestBoardableDate = scheduleReferenceDate.addingTimeInterval(
                     Double(option.walkMinutes + minimumBoardingBufferMinutes) * 60
                 )
                 for departure in departuresByStop[option.sourceStopID] ?? [] {
@@ -835,7 +859,7 @@ final class TransitViewModel: NSObject, ObservableObject {
                             option: option,
                             departure: departure,
                             departureDate: departureDate,
-                            departureIsRealtime: event.isRealtime
+                            departureIsRealtime: isLiveSearch && event.isRealtime
                         )
                     )
                 }
@@ -947,7 +971,11 @@ final class TransitViewModel: NSObject, ObservableObject {
                   let response = try? JSONDecoder().decode(TripsResponse.self, from: data),
                   let trip = response.trips.first(where: { $0.id == tripID })
             else { return nil }
-            return makeJourney(from: trip, selection: selection, now: now)
+            return makeJourney(
+                from: trip,
+                selection: selection,
+                scheduleReferenceDate: scheduleReferenceDate
+            )
         }
         let observedDepartureCountByTripID = patternKeyByTripID.reduce(
             into: [Int: Int]()
@@ -1145,10 +1173,16 @@ final class TransitViewModel: NSObject, ObservableObject {
     }
 
     private func fetchUpcomingDepartures(
-        for stopIDs: Set<Int>
+        for stopIDs: Set<Int>,
+        scheduleReferenceDate: Date,
+        isLiveSearch: Bool
     ) async -> [Int: [APIDeparture]] {
         let requests = stopIDs.compactMap { stopID -> (Int, URLRequest)? in
-            guard let request = upcomingDepartureRequest(for: stopID) else { return nil }
+            guard let request = upcomingDepartureRequest(
+                for: stopID,
+                scheduleReferenceDate: scheduleReferenceDate,
+                isLiveSearch: isLiveSearch
+            ) else { return nil }
             return (stopID, request)
         }
 
@@ -1182,17 +1216,72 @@ final class TransitViewModel: NSObject, ObservableObject {
         }
     }
 
-    private func upcomingDepartureRequest(for stopID: Int) -> URLRequest? {
+    private func upcomingDepartureRequest(
+        for stopID: Int,
+        scheduleReferenceDate: Date,
+        isLiveSearch: Bool
+    ) -> URLRequest? {
         var components = URLComponents(
             string: "https://transit.land/api/v2/rest/stops/\(stopID)/departures"
         )!
-        components.queryItems = [
-            URLQueryItem(name: "next", value: "\(upcomingDepartureWindowSeconds)"),
+        var queryItems = [
             URLQueryItem(name: "limit", value: "200"),
             URLQueryItem(name: "include_geometry", value: "false"),
             URLQueryItem(name: "include_alerts", value: "false"),
             URLQueryItem(name: "use_service_window", value: "false"),
         ]
+
+        if isLiveSearch {
+            queryItems.insert(
+                URLQueryItem(
+                    name: "next",
+                    value: "\(upcomingDepartureWindowSeconds)"
+                ),
+                at: 0
+            )
+        } else {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = .autoupdatingCurrent
+            let requestedEnd = scheduleReferenceDate.addingTimeInterval(
+                Double(upcomingDepartureWindowSeconds)
+            )
+            let nextDay = calendar.date(
+                byAdding: .day,
+                value: 1,
+                to: calendar.startOfDay(for: scheduleReferenceDate)
+            ) ?? requestedEnd
+            let endOfServiceDate = nextDay.addingTimeInterval(-1)
+            let scheduleEndDate = min(requestedEnd, endOfServiceDate)
+
+            let dateFormatter = DateFormatter()
+            dateFormatter.calendar = calendar
+            dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+            dateFormatter.timeZone = calendar.timeZone
+            dateFormatter.dateFormat = "yyyy-MM-dd"
+
+            let timeFormatter = DateFormatter()
+            timeFormatter.calendar = calendar
+            timeFormatter.locale = Locale(identifier: "en_US_POSIX")
+            timeFormatter.timeZone = calendar.timeZone
+            timeFormatter.dateFormat = "HH:mm:ss"
+
+            queryItems.insert(contentsOf: [
+                URLQueryItem(
+                    name: "date",
+                    value: dateFormatter.string(from: scheduleReferenceDate)
+                ),
+                URLQueryItem(
+                    name: "start_time",
+                    value: timeFormatter.string(from: scheduleReferenceDate)
+                ),
+                URLQueryItem(
+                    name: "end_time",
+                    value: timeFormatter.string(from: scheduleEndDate)
+                ),
+            ], at: 0)
+        }
+
+        components.queryItems = queryItems
         guard let url = components.url else { return nil }
         var request = URLRequest(url: url)
         request.setValue(apiKey, forHTTPHeaderField: "apikey")
@@ -1216,7 +1305,7 @@ final class TransitViewModel: NSObject, ObservableObject {
     private func makeJourney(
         from trip: APITrip,
         selection: JourneyDepartureSelection,
-        now: Date
+        scheduleReferenceDate: Date
     ) -> RouteJourney? {
         guard let stopTimes = trip.stopTimes?.sorted(by: {
                   $0.stopSequence < $1.stopSequence
@@ -1305,7 +1394,9 @@ final class TransitViewModel: NSObject, ObservableObject {
 
         let departureMinutesFromNow = max(
             0,
-            Int(ceil(selection.departureDate.timeIntervalSince(now) / 60))
+            Int(ceil(
+                selection.departureDate.timeIntervalSince(scheduleReferenceDate) / 60
+            ))
         )
         let waitMinutes = max(
             0,

@@ -30,6 +30,7 @@ struct ContentView: View {
     @State private var selectedStopRouteIDs: Set<Int>?
     @State private var selectedStopJourneyIDs: Set<Int>?
     @State private var expansionPrototype: RouteExpansionPrototype = .sheet
+    @State private var isShowingPlanningSettings = false
 
     private var selectedJourney: RouteJourney? {
         viewModel.journeys.first { $0.id == selectedJourneyID }
@@ -114,6 +115,15 @@ struct ContentView: View {
         } message: {
             Text(viewModel.errorMessage)
         }
+        .sheet(isPresented: $isShowingPlanningSettings) {
+            PlanningSettingsSheet(
+                planningDate: viewModel.planningDate,
+                onApply: applyPlanningDate
+            )
+            .presentationDetents([.height(370)])
+            .presentationDragIndicator(.visible)
+            .presentationCornerRadius(28)
+        }
     }
 
     private var destinationSheet: some View {
@@ -128,7 +138,9 @@ struct ContentView: View {
                 JourneyDetailSheet(
                     journey: selectedJourney,
                     prototype: $expansionPrototype,
+                    planningDate: viewModel.planningDate,
                     onBack: clearSelection,
+                    onSettings: { isShowingPlanningSettings = true },
                     onRecenter: recenterMap
                 )
             } else {
@@ -138,8 +150,10 @@ struct ContentView: View {
                     isLoading: viewModel.isLoading || viewModel.isLoadingJourneys,
                     highlightedJourneyIDs: highlightedJourneyIDs,
                     selectedStopName: selectedStop?.name,
+                    planningDate: viewModel.planningDate,
                     onSelect: selectJourney,
                     onClearStop: clearStopSelection,
+                    onSettings: { isShowingPlanningSettings = true },
                     onRecenter: recenterMap
                 )
             }
@@ -224,6 +238,18 @@ struct ContentView: View {
         }
     }
 
+    private func applyPlanningDate(_ date: Date?) {
+        // Journey and stop identities belong to the previous schedule result.
+        // Clear them without changing the camera before reloading in place.
+        withAnimation(.snappy(duration: 0.2)) {
+            selectedJourneyID = nil
+            selectedStopID = nil
+            selectedStopRouteIDs = nil
+            selectedStopJourneyIDs = nil
+        }
+        viewModel.setPlanningDate(date)
+    }
+
     private func recenterMap() {
         viewModel.recenter()
         if let region = viewModel.targetRegion {
@@ -274,6 +300,149 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Transit planning
+
+private struct PlanningSettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let planningDate: Date?
+    let onApply: (Date?) -> Void
+    @State private var draftDate: Date
+
+    init(planningDate: Date?, onApply: @escaping (Date?) -> Void) {
+        self.planningDate = planningDate
+        self.onApply = onApply
+        let initialDate = planningDate.map { max($0, Date()) }
+            ?? Self.tomorrowMorning()
+        _draftDate = State(initialValue: initialDate)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Transit time")
+                    .font(.system(size: 22, weight: .black, design: .rounded))
+                    .foregroundStyle(WayboundPalette.ink)
+                Text("Preview real scheduled departures from a different time.")
+                    .font(.system(size: 12, weight: .regular, design: .rounded))
+                    .foregroundStyle(WayboundPalette.ink.opacity(0.62))
+            }
+
+            HStack(spacing: 10) {
+                quickChoice(
+                    title: "Now",
+                    detail: "Live service",
+                    systemImage: "location.north.circle.fill",
+                    isSelected: planningDate == nil
+                ) {
+                    onApply(nil)
+                    dismiss()
+                }
+
+                let tomorrow = Self.tomorrowMorning()
+                quickChoice(
+                    title: "Tomorrow morning",
+                    detail: tomorrow.formatted(date: .omitted, time: .shortened),
+                    systemImage: "sunrise.fill",
+                    isSelected: planningDate.map {
+                        Calendar.autoupdatingCurrent.isDate(
+                            $0,
+                            equalTo: tomorrow,
+                            toGranularity: .minute
+                        )
+                    } ?? false
+                ) {
+                    onApply(tomorrow)
+                    dismiss()
+                }
+            }
+
+            VStack(spacing: 8) {
+                DatePicker(
+                    "Date",
+                    selection: $draftDate,
+                    in: Date()...,
+                    displayedComponents: .date
+                )
+                DatePicker(
+                    "Departure time",
+                    selection: $draftDate,
+                    in: Date()...,
+                    displayedComponents: .hourAndMinute
+                )
+            }
+            .font(.system(size: 14, weight: .semibold, design: .rounded))
+            .foregroundStyle(WayboundPalette.ink)
+
+            Button {
+                onApply(draftDate)
+                dismiss()
+            } label: {
+                Text("Preview this time")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(WayboundPalette.ink)
+                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 8)
+        .padding(.bottom, 18)
+        .background(WayboundPalette.cream)
+    }
+
+    private func quickChoice(
+        title: String,
+        detail: String,
+        systemImage: String,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 16, weight: .bold))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    Text(detail)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .opacity(0.72)
+                }
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(isSelected ? Color.white : WayboundPalette.ink)
+            .padding(.horizontal, 11)
+            .frame(maxWidth: .infinity, minHeight: 54)
+            .background(
+                isSelected ? WayboundPalette.ink : Color.white.opacity(0.58)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(WayboundPalette.ink.opacity(0.09), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private static func tomorrowMorning(from date: Date = Date()) -> Date {
+        var calendar = Calendar.autoupdatingCurrent
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: date) ?? date
+        return calendar.date(
+            bySettingHour: 8,
+            minute: 0,
+            second: 0,
+            of: tomorrow
+        ) ?? tomorrow
+    }
+}
+
 // MARK: - Overview
 
 private struct JourneyOverviewSheet: View {
@@ -282,9 +451,18 @@ private struct JourneyOverviewSheet: View {
     let isLoading: Bool
     let highlightedJourneyIDs: Set<Int>?
     let selectedStopName: String?
+    let planningDate: Date?
     let onSelect: (Int) -> Void
     let onClearStop: () -> Void
+    let onSettings: () -> Void
     let onRecenter: () -> Void
+
+    private var contextDescription: String {
+        let routeScope = selectedStopName.map { "Trips serving \($0)" }
+            ?? "Up to eight numbered routes · both useful directions"
+        guard let planningDate else { return routeScope }
+        return "\(planningDate.formatted(date: .abbreviated, time: .shortened)) · \(routeScope)"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -296,10 +474,7 @@ private struct JourneyOverviewSheet: View {
                             .width(.condensed)
                         )
                         .foregroundStyle(WayboundPalette.ink)
-                    Text(
-                        selectedStopName.map { "Trips serving \($0)" }
-                            ?? "Up to eight numbered routes · both useful directions"
-                    )
+                    Text(contextDescription)
                     .font(.system(size: 10.5, weight: .regular, design: .rounded))
                     .foregroundStyle(WayboundPalette.ink.opacity(0.62))
                     .lineLimit(1)
@@ -319,6 +494,29 @@ private struct JourneyOverviewSheet: View {
                     ProgressView()
                         .tint(WayboundPalette.ink)
                 }
+
+                Button(action: onSettings) {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(WayboundPalette.ink)
+                            .frame(width: 29, height: 29)
+                            .background(.white.opacity(0.72))
+                            .clipShape(Circle())
+                        if planningDate != nil {
+                            Circle()
+                                .fill(Color.orange)
+                                .frame(width: 7, height: 7)
+                                .overlay(Circle().stroke(WayboundPalette.cream, lineWidth: 1.5))
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    planningDate == nil
+                        ? "Transit time settings, showing now"
+                        : "Transit time settings, future preview active"
+                )
 
                 Button(action: onRecenter) {
                     Image(systemName: "location.fill")
@@ -473,8 +671,19 @@ private struct UnavailableRouteRow: View {
 private struct JourneyDetailSheet: View {
     let journey: RouteJourney
     @Binding var prototype: RouteExpansionPrototype
+    let planningDate: Date?
     let onBack: () -> Void
+    let onSettings: () -> Void
     let onRecenter: () -> Void
+
+    private var timingDescription: String {
+        let relativeTiming = "\(journey.totalMinutes) min total · bus in \(journey.departureMinutesFromNow) min"
+        guard let planningDate else { return relativeTiming }
+        let previewTime = planningDate.formatted(
+            .dateTime.weekday(.abbreviated).hour().minute()
+        )
+        return "\(relativeTiming) · \(previewTime)"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -495,11 +704,34 @@ private struct JourneyDetailSheet: View {
                         .font(.system(size: 18, weight: .bold, design: .rounded))
                         .foregroundStyle(WayboundPalette.ink)
                         .lineLimit(1)
-                    Text("\(journey.totalMinutes) min total · bus in \(journey.departureMinutesFromNow) min")
+                    Text(timingDescription)
                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .foregroundStyle(journey.route.color)
                 }
                 Spacer()
+                Button(action: onSettings) {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(WayboundPalette.ink)
+                            .frame(width: 29, height: 29)
+                            .background(.white.opacity(0.72))
+                            .clipShape(Circle())
+                        if planningDate != nil {
+                            Circle()
+                                .fill(Color.orange)
+                                .frame(width: 7, height: 7)
+                                .overlay(Circle().stroke(WayboundPalette.cream, lineWidth: 1.5))
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    planningDate == nil
+                        ? "Transit time settings, showing now"
+                        : "Transit time settings, future preview active"
+                )
+
                 Button(action: onRecenter) {
                     Image(systemName: "location.fill")
                         .font(.system(size: 12, weight: .bold))
