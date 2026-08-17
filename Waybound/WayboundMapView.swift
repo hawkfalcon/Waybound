@@ -17,12 +17,12 @@ struct WayboundMapView: UIViewRepresentable {
     let stops: [TransitStop]
     let selectedJourneyID: Int?
     let selectedStopID: Int?
-    let highlightedRouteIDs: Set<Int>?
+    let highlightedJourneyIDs: Set<Int>?
     let showsMapLadder: Bool
     let viewportBottomInset: CGFloat
     let cameraRequest: WayboundCameraRequest
     let onSelectJourney: (Int) -> Void
-    let onSelectStop: (Int, Set<Int>) -> Void
+    let onSelectStop: (Int, Set<Int>, Set<Int>) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -65,7 +65,7 @@ struct WayboundMapView: UIViewRepresentable {
         var parent: WayboundMapView
         var lastCameraRequestID: UUID?
         private var routeOverlays: [RouteLaneOverlay] = []
-        private var corridorSegmentsByRouteID: [Int: [MapRouteSegment]] = [:]
+        private var corridorGeometryByJourneyID: [Int: CorridorJourneyGeometry] = [:]
         private var viewportRefreshWorkItem: DispatchWorkItem?
 
         init(parent: WayboundMapView) {
@@ -118,30 +118,55 @@ struct WayboundMapView: UIViewRepresentable {
                   let tagViewport = destinationTagViewportMapRect(in: mapView)
             else { return }
             let selectedID = parent.selectedJourneyID
-            let highlightedRouteIDs = parent.highlightedRouteIDs
-            corridorSegmentsByRouteID = Dictionary(
-                uniqueKeysWithValues: parent.journeys.map { journey in
-                    (
+            let highlightedJourneyIDs = parent.highlightedJourneyIDs
+            corridorGeometryByJourneyID = Dictionary(
+                uniqueKeysWithValues: parent.journeys.enumerated().map {
+                    index, journey in
+                    let completeTrip = journey.approachPolylines
+                        + journey.flagshipPolylines
+                        + journey.continuationPolylines
+                    return (
                         journey.id,
-                        routeSegments(for: journey.flagshipPolylines)
+                        CorridorJourneyGeometry(
+                            stackOrder: index,
+                            segments: routeSegments(for: completeTrip)
+                        )
                     )
                 }
             )
 
+            // Draw the already-travelled portion underneath every active route.
+            // It answers "where is this bus coming from?" without competing with
+            // the path the rider can still take from the boarding stop.
+            for journey in parent.journeys {
+                let isHighlighted = highlightedJourneyIDs?.contains(journey.id) ?? true
+                addOverlays(
+                    for: clippedPolylines(
+                        journey.approachPolylines,
+                        to: routeViewport
+                    ),
+                    journeyID: journey.id,
+                    color: UIColor(journey.route.color),
+                    opacity: isHighlighted ? 0.22 : 0.05,
+                    lineWidth: 3,
+                    dashed: false,
+                    to: mapView
+                )
+            }
+
             for journey in parent.journeys {
                 let isSelected = selectedID == journey.id
-                let isHighlighted = highlightedRouteIDs?.contains(journey.id) ?? true
-                let opacity = isHighlighted ? 0.92 : 0.12
+                let isHighlighted = highlightedJourneyIDs?.contains(journey.id) ?? true
+                let opacity = isHighlighted ? 0.94 : 0.12
                 addOverlays(
                     for: clippedPolylines(
                         journey.flagshipPolylines,
                         to: routeViewport
                     ),
-                    routeID: journey.id,
+                    journeyID: journey.id,
                     color: UIColor(journey.route.color),
                     opacity: opacity,
                     lineWidth: isSelected ? 4.5 : (isHighlighted ? 3 : 2.5),
-                    laneOffset: journey.laneOffsetPoints,
                     dashed: false,
                     to: mapView
                 )
@@ -152,11 +177,10 @@ struct WayboundMapView: UIViewRepresentable {
                             journey.continuationPolylines,
                             to: routeViewport
                         ),
-                        routeID: journey.id,
+                        journeyID: journey.id,
                         color: UIColor(journey.route.color),
                         opacity: 0.58,
                         lineWidth: 3,
-                        laneOffset: journey.laneOffsetPoints,
                         dashed: true,
                         to: mapView
                     )
@@ -201,7 +225,7 @@ struct WayboundMapView: UIViewRepresentable {
                         edge: anchor.edge,
                         rank: rank,
                         isSelected: journey.id == selectedID,
-                        isDimmed: highlightedRouteIDs.map {
+                        isDimmed: highlightedJourneyIDs.map {
                             !$0.contains(journey.id)
                         } ?? false,
                         viewCenterOffset: layout.centerOffset,
@@ -559,18 +583,19 @@ struct WayboundMapView: UIViewRepresentable {
                         $1.route.fullDisplayName
                     ) == .orderedAscending
                 }
-                var seenRouteIDs: Set<Int> = []
+                var seenRouteNumbers: Set<String> = []
                 let uniqueJourneys = sortedJourneys.filter {
-                    seenRouteIDs.insert($0.id).inserted
+                    seenRouteNumbers.insert($0.route.routeNumber ?? $0.route.shortName)
+                        .inserted
                 }
-                let routeIDs = Set(uniqueJourneys.map(\.id))
-                let isDimmed = parent.highlightedRouteIDs.map {
-                    routeIDs.isDisjoint(with: $0)
+                let journeyIDs = Set(sortedJourneys.map(\.id))
+                let isDimmed = parent.highlightedJourneyIDs.map {
+                    journeyIDs.isDisjoint(with: $0)
                 } ?? false
                 return RouteStopMapAnnotation(
                     coordinate: coordinate,
                     name: first.stop.name,
-                    routeIDs: routeIDs,
+                    routeIDs: journeyIDs,
                     colors: uniqueJourneys.map { UIColor($0.route.color) },
                     isDimmed: isDimmed
                 )
@@ -614,16 +639,20 @@ struct WayboundMapView: UIViewRepresentable {
                         $1.route.fullDisplayName
                     ) == .orderedAscending
                 }
-                let routeIDs = Set(sortedJourneys.map(\.id))
+                let journeyIDs = Set(sortedJourneys.map(\.id))
+                let routeIDs = Set(
+                    sortedJourneys.map { $0.route.transitlandID }
+                )
                 let colors = sortedJourneys.map { UIColor($0.route.color) }
-                let isDimmed = parent.highlightedRouteIDs.map {
-                    routeIDs.isDisjoint(with: $0)
+                let isDimmed = parent.highlightedJourneyIDs.map {
+                    journeyIDs.isDisjoint(with: $0)
                 } ?? false
                 return StopClusterMapAnnotation(
                     stop: representative.boardingStop,
                     sourceStopIDs: Set(group.map { $0.boardingStop.id }),
                     routeIDs: routeIDs,
-                    routeNumbers: sortedJourneys.map { $0.route.shortName },
+                    journeyIDs: journeyIDs,
+                    routeNumbers: sortedJourneys.compactMap { $0.route.routeNumber },
                     colors: colors,
                     isDimmed: isDimmed,
                     isSelected: group.contains {
@@ -635,27 +664,25 @@ struct WayboundMapView: UIViewRepresentable {
 
         private func addOverlays(
             for polylines: [[CLLocationCoordinate2D]],
-            routeID: Int,
+            journeyID: Int,
             color: UIColor,
             opacity: Double,
             lineWidth: Double,
-            laneOffset: Double,
             dashed: Bool,
             to mapView: MKMapView
         ) {
             for coordinates in polylines where coordinates.count >= 2 {
-                let offsetFactors = sharedCorridorOffsetFactors(
+                let laneOffsets = sharedCorridorLaneOffsets(
                     for: coordinates,
-                    excluding: routeID
+                    journeyID: journeyID
                 )
                 let overlay = RouteLaneOverlay(
                     coordinates: coordinates,
-                    routeID: routeID,
+                    journeyID: journeyID,
                     color: color,
                     opacity: opacity,
                     lineWidth: lineWidth,
-                    laneOffsetPoints: laneOffset,
-                    laneOffsetFactors: offsetFactors,
+                    laneOffsetPoints: laneOffsets,
                     dashed: dashed
                 )
                 routeOverlays.append(overlay)
@@ -677,87 +704,135 @@ struct WayboundMapView: UIViewRepresentable {
             }
         }
 
-        /// A route stays on its authoritative GTFS centerline by default. Its
-        /// rank-based lane offset fades in only where another displayed route
-        /// follows the same, parallel street corridor. This avoids shifting an
-        /// isolated route (such as route 2 on Anapamu) off its actual street.
-        private func sharedCorridorOffsetFactors(
+        /// Isolated geometry remains on the authoritative GTFS centerline. On a
+        /// shared road, only the journeys actually present on that local corridor
+        /// receive consecutive three-point lanes. Because each lane is three
+        /// points wide, neighboring route colors touch instead of floating apart.
+        private func sharedCorridorLaneOffsets(
             for coordinates: [CLLocationCoordinate2D],
-            excluding routeID: Int
+            journeyID: Int
         ) -> [Double] {
             guard coordinates.count >= 2 else {
                 return Array(repeating: 0, count: coordinates.count)
             }
 
-            let otherSegments = corridorSegmentsByRouteID.flatMap {
-                entry -> [MapRouteSegment] in
-                entry.key == routeID ? [] : entry.value
-            }
-            guard !otherSegments.isEmpty else {
-                return Array(repeating: 0, count: coordinates.count)
-            }
-
             let points = coordinates.map { MKMapPoint($0) }
-            var sharedSegments = Array(
-                repeating: false,
-                count: points.count - 1
-            )
-            for index in sharedSegments.indices {
+            var offsetSums = Array(repeating: 0.0, count: points.count)
+            var offsetCounts = Array(repeating: 0, count: points.count)
+
+            for index in 0..<(points.count - 1) {
                 guard let segment = MapRouteSegment(
                     start: points[index],
                     end: points[index + 1]
-                ) else { continue }
-                let midpoint = MKMapPoint(
-                    x: (segment.start.x + segment.end.x) / 2,
-                    y: (segment.start.y + segment.end.y) / 2
-                )
+                ),
+                      let offset = sharedCorridorLaneOffset(
+                        for: segment,
+                        journeyID: journeyID
+                      )
+                else { continue }
 
-                // Requiring proximity at the midpoint and one endpoint rejects
-                // incidental line crossings while tolerating different GTFS
-                // sampling intervals along a truly shared street.
+                offsetSums[index] += offset
+                offsetSums[index + 1] += offset
+                offsetCounts[index] += 1
+                offsetCounts[index + 1] += 1
+            }
+
+            var offsets = offsetSums.indices.map { index in
+                guard offsetCounts[index] > 0 else { return 0.0 }
+                return offsetSums[index] / Double(offsetCounts[index])
+            }
+            let explicitlyStacked = offsetCounts.map { $0 > 0 }
+
+            // Fade a lane back to zero over a short geographic distance. Signed
+            // propagation preserves the chosen side of the road and prevents a
+            // sudden diagonal jog at the beginning or end of a shared corridor.
+            let taperDistance: CLLocationDistance = 42
+            if offsets.count > 1 {
+                for index in 1..<offsets.count where !explicitlyStacked[index] {
+                    let distance = points[index - 1].distance(to: points[index])
+                    let candidate = offsets[index - 1] * max(
+                        0,
+                        1 - distance / taperDistance
+                    )
+                    if abs(candidate) > abs(offsets[index]) {
+                        offsets[index] = candidate
+                    }
+                }
+                for index in stride(from: offsets.count - 2, through: 0, by: -1)
+                where !explicitlyStacked[index] {
+                    let distance = points[index].distance(to: points[index + 1])
+                    let candidate = offsets[index + 1] * max(
+                        0,
+                        1 - distance / taperDistance
+                    )
+                    if abs(candidate) > abs(offsets[index]) {
+                        offsets[index] = candidate
+                    }
+                }
+            }
+            return offsets
+        }
+
+        private func sharedCorridorLaneOffset(
+            for segment: MapRouteSegment,
+            journeyID: Int
+        ) -> Double? {
+            let midpoint = MKMapPoint(
+                x: (segment.start.x + segment.end.x) / 2,
+                y: (segment.start.y + segment.end.y) / 2
+            )
+            var memberIDs = [journeyID]
+
+            for (candidateID, geometry) in corridorGeometryByJourneyID
+            where candidateID != journeyID {
+                // Midpoint plus endpoint matching rejects crossings while still
+                // tolerating different GTFS sampling intervals on the same road.
                 let midpointIsShared = hasParallelCorridor(
                     near: midpoint,
                     direction: segment,
-                    among: otherSegments
+                    among: geometry.segments
                 )
                 let endpointIsShared = hasParallelCorridor(
                     near: segment.start,
                     direction: segment,
-                    among: otherSegments
+                    among: geometry.segments
                 ) || hasParallelCorridor(
                     near: segment.end,
                     direction: segment,
-                    among: otherSegments
+                    among: geometry.segments
                 )
-                sharedSegments[index] = midpointIsShared && endpointIsShared
-            }
-
-            var factors = Array(repeating: 0.0, count: points.count)
-            for index in sharedSegments.indices where sharedSegments[index] {
-                factors[index] = 1
-                factors[index + 1] = 1
-            }
-
-            // A short geographic taper prevents a visible sideways jog where
-            // parallel lanes merge back onto the street centerline.
-            let taperDistance: CLLocationDistance = 42
-            if factors.count > 1 {
-                for index in 1..<factors.count {
-                    let distance = points[index - 1].distance(to: points[index])
-                    factors[index] = max(
-                        factors[index],
-                        factors[index - 1] - distance / taperDistance
-                    )
-                }
-                for index in stride(from: factors.count - 2, through: 0, by: -1) {
-                    let distance = points[index].distance(to: points[index + 1])
-                    factors[index] = max(
-                        factors[index],
-                        factors[index + 1] - distance / taperDistance
-                    )
+                if midpointIsShared && endpointIsShared {
+                    memberIDs.append(candidateID)
                 }
             }
-            return factors.map { max(0, min(1, $0)) }
+
+            guard memberIDs.count > 1 else { return nil }
+            memberIDs.sort {
+                let firstOrder = corridorGeometryByJourneyID[$0]?.stackOrder ?? .max
+                let secondOrder = corridorGeometryByJourneyID[$1]?.stackOrder ?? .max
+                if firstOrder != secondOrder { return firstOrder < secondOrder }
+                return $0 < $1
+            }
+            guard let laneIndex = memberIDs.firstIndex(of: journeyID) else { return nil }
+
+            let midpointIndex = Double(memberIDs.count - 1) / 2
+            let worldSideOffset = (Double(laneIndex) - midpointIndex) * 3
+
+            // The first local member supplies a canonical corridor orientation.
+            // Reverse trips have an opposing normal, so invert their local scalar
+            // to keep every lane index on the same physical side of the road.
+            let referenceID = memberIDs[0]
+            guard referenceID != journeyID,
+                  let referenceGeometry = corridorGeometryByJourneyID[referenceID],
+                  let referenceSegment = parallelCorridorSegment(
+                    near: midpoint,
+                    direction: segment,
+                    among: referenceGeometry.segments
+                  )
+            else { return worldSideOffset }
+            let directionDot = segment.unitX * referenceSegment.unitX
+                + segment.unitY * referenceSegment.unitY
+            return worldSideOffset * (directionDot >= 0 ? 1 : -1)
         }
 
         private func hasParallelCorridor(
@@ -765,16 +840,35 @@ struct WayboundMapView: UIViewRepresentable {
             direction: MapRouteSegment,
             among candidates: [MapRouteSegment]
         ) -> Bool {
+            parallelCorridorSegment(
+                near: point,
+                direction: direction,
+                among: candidates
+            ) != nil
+        }
+
+        private func parallelCorridorSegment(
+            near point: MKMapPoint,
+            direction: MapRouteSegment,
+            among candidates: [MapRouteSegment]
+        ) -> MapRouteSegment? {
             let maximumSeparation: CLLocationDistance = 20
             let minimumParallelDot = 0.93
-            return candidates.contains { candidate in
-                abs(direction.unitX * candidate.unitX
-                    + direction.unitY * candidate.unitY) >= minimumParallelDot
-                    && mapDistance(
+            return candidates
+                .filter { candidate in
+                    abs(direction.unitX * candidate.unitX
+                        + direction.unitY * candidate.unitY) >= minimumParallelDot
+                        && mapDistance(
+                            from: point,
+                            to: candidate
+                        ) <= maximumSeparation
+                }
+                .min {
+                    mapDistance(from: point, to: $0) < mapDistance(
                         from: point,
-                        to: candidate
-                    ) <= maximumSeparation
-            }
+                        to: $1
+                    )
+                }
         }
 
         private func mapDistance(
@@ -800,6 +894,11 @@ struct WayboundMapView: UIViewRepresentable {
                 y: segment.start.y + progress * deltaY
             )
             return point.distance(to: projection)
+        }
+
+        private struct CorridorJourneyGeometry {
+            let stackOrder: Int
+            let segments: [MapRouteSegment]
         }
 
         private struct MapRouteSegment {
@@ -913,7 +1012,11 @@ struct WayboundMapView: UIViewRepresentable {
                 parent.onSelectJourney(destination.journey.id)
                 mapView.deselectAnnotation(destination, animated: false)
             } else if let cluster = view.annotation as? StopClusterMapAnnotation {
-                parent.onSelectStop(cluster.stop.id, cluster.routeIDs)
+                parent.onSelectStop(
+                    cluster.stop.id,
+                    cluster.routeIDs,
+                    cluster.journeyIDs
+                )
                 mapView.deselectAnnotation(cluster, animated: false)
             }
         }
@@ -923,7 +1026,7 @@ struct WayboundMapView: UIViewRepresentable {
                   let mapView = recognizer.view as? MKMapView
             else { return }
             let tapPoint = recognizer.location(in: mapView)
-            var best: (routeID: Int, distance: CGFloat)?
+            var best: (journeyID: Int, distance: CGFloat)?
 
             for overlay in routeOverlays {
                 let rawPoints = overlay.coordinates.map {
@@ -933,15 +1036,14 @@ struct WayboundMapView: UIViewRepresentable {
                     rawPoints,
                     tolerance: 0.7
                 )
-                let factors = simplifiedRouteValues(
+                let laneOffsets = simplifiedRouteValues(
                     for: basePoints,
                     originalPoints: rawPoints,
-                    originalValues: overlay.laneOffsetFactors.map { CGFloat($0) }
+                    originalValues: overlay.laneOffsetPoints.map { CGFloat($0) }
                 )
                 let lanePoints = stableRouteOffsetPoints(
                     basePoints,
-                    offset: CGFloat(overlay.laneOffsetPoints),
-                    factors: factors
+                    offsets: laneOffsets
                 )
                 guard lanePoints.count >= 2 else { continue }
 
@@ -952,14 +1054,14 @@ struct WayboundMapView: UIViewRepresentable {
                         to: lanePoints[index + 1]
                     )
                     if best.map({ distance < $0.distance }) ?? true {
-                        best = (overlay.routeID, distance)
+                        best = (overlay.journeyID, distance)
                     }
                 }
             }
 
             if let best, best.distance <= 14,
-               parent.journeys.contains(where: { $0.id == best.routeID }) {
-                parent.onSelectJourney(best.routeID)
+               parent.journeys.contains(where: { $0.id == best.journeyID }) {
+                parent.onSelectJourney(best.journeyID)
             }
         }
 
@@ -1004,12 +1106,11 @@ struct WayboundMapView: UIViewRepresentable {
 
 private final class RouteLaneOverlay: NSObject, MKOverlay {
     let coordinates: [CLLocationCoordinate2D]
-    let routeID: Int
+    let journeyID: Int
     let color: UIColor
     let opacity: Double
     let lineWidth: Double
-    let laneOffsetPoints: Double
-    let laneOffsetFactors: [Double]
+    let laneOffsetPoints: [Double]
     let dashed: Bool
     private let polyline: MKPolyline
 
@@ -1020,21 +1121,19 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
 
     init(
         coordinates: [CLLocationCoordinate2D],
-        routeID: Int,
+        journeyID: Int,
         color: UIColor,
         opacity: Double,
         lineWidth: Double,
-        laneOffsetPoints: Double,
-        laneOffsetFactors: [Double],
+        laneOffsetPoints: [Double],
         dashed: Bool
     ) {
         self.coordinates = coordinates
-        self.routeID = routeID
+        self.journeyID = journeyID
         self.color = color
         self.opacity = opacity
         self.lineWidth = lineWidth
         self.laneOffsetPoints = laneOffsetPoints
-        self.laneOffsetFactors = laneOffsetFactors
         self.dashed = dashed
         self.polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
         super.init()
@@ -1057,16 +1156,16 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
             tolerance: 0.7 / zoomScale
         )
         guard basePoints.count >= 2 else { return }
-        let offset = CGFloat(routeOverlay.laneOffsetPoints) / zoomScale
-        let factors = simplifiedRouteValues(
+        let laneOffsets = simplifiedRouteValues(
             for: basePoints,
             originalPoints: rawPoints,
-            originalValues: routeOverlay.laneOffsetFactors.map { CGFloat($0) }
+            originalValues: routeOverlay.laneOffsetPoints.map {
+                CGFloat($0) / zoomScale
+            }
         )
         let offsetPoints = stableRouteOffsetPoints(
             basePoints,
-            offset: offset,
-            factors: factors
+            offsets: laneOffsets
         )
 
         let path = CGMutablePath()
@@ -1084,18 +1183,6 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
                 lengths: [8 / zoomScale, 7 / zoomScale]
             )
         }
-
-        // A narrow cream casing keeps adjacent route colors discrete even when
-        // several trips share exactly the same source shape.
-        context.addPath(path)
-        context.setStrokeColor(
-            UIColor(red: 0.965, green: 0.945, blue: 0.89, alpha: routeOverlay.opacity)
-                .cgColor
-        )
-        context.setLineWidth(
-            CGFloat(routeOverlay.lineWidth + 2) / zoomScale
-        )
-        context.strokePath()
 
         context.addPath(path)
         context.setStrokeColor(
@@ -1186,10 +1273,12 @@ private func simplifiedRouteValues(
 
 private func stableRouteOffsetPoints(
     _ points: [CGPoint],
-    offset: CGFloat,
-    factors: [CGFloat]? = nil
+    offsets: [CGFloat]
 ) -> [CGPoint] {
-    guard points.count >= 2, abs(offset) > 0.0001 else { return points }
+    guard points.count >= 2,
+          offsets.count == points.count,
+          offsets.contains(where: { abs($0) > 0.0001 })
+    else { return points }
     var directions: [CGPoint] = []
     var previousDirection: CGPoint?
 
@@ -1226,10 +1315,7 @@ private func stableRouteOffsetPoints(
         let sumY = previousNormal.y + nextNormal.y
         let sumLength = hypot(sumX, sumY)
 
-        let factor = factors.flatMap { values in
-            values.indices.contains(index) ? values[index] : nil
-        } ?? 1
-        let localOffset = offset * max(0, min(1, factor))
+        let localOffset = offsets[index]
         var normal = nextNormal
         var scale = localOffset
         if sumLength > 0.001 {
@@ -1340,6 +1426,7 @@ private final class StopClusterMapAnnotation: NSObject, MKAnnotation {
     let stop: TransitStop
     let sourceStopIDs: Set<Int>
     let routeIDs: Set<Int>
+    let journeyIDs: Set<Int>
     let routeNumbers: [String]
     let colors: [UIColor]
     let isDimmed: Bool
@@ -1352,6 +1439,7 @@ private final class StopClusterMapAnnotation: NSObject, MKAnnotation {
         stop: TransitStop,
         sourceStopIDs: Set<Int>,
         routeIDs: Set<Int>,
+        journeyIDs: Set<Int>,
         routeNumbers: [String],
         colors: [UIColor],
         isDimmed: Bool,
@@ -1360,6 +1448,7 @@ private final class StopClusterMapAnnotation: NSObject, MKAnnotation {
         self.stop = stop
         self.sourceStopIDs = sourceStopIDs
         self.routeIDs = routeIDs
+        self.journeyIDs = journeyIDs
         self.routeNumbers = routeNumbers
         self.colors = colors
         self.isDimmed = isDimmed

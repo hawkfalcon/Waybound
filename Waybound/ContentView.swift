@@ -28,6 +28,7 @@ struct ContentView: View {
     @State private var selectedJourneyID: Int?
     @State private var selectedStopID: Int?
     @State private var selectedStopRouteIDs: Set<Int>?
+    @State private var selectedStopJourneyIDs: Set<Int>?
     @State private var expansionPrototype: RouteExpansionPrototype = .sheet
 
     private var selectedJourney: RouteJourney? {
@@ -39,19 +40,21 @@ struct ContentView: View {
     }
 
     private var displayedJourneys: [RouteJourney] {
-        guard let selectedStopRouteIDs else { return viewModel.journeys }
+        guard let selectedStopJourneyIDs else { return viewModel.journeys }
         return viewModel.journeys.filter {
-            selectedStopRouteIDs.contains($0.id)
+            selectedStopJourneyIDs.contains($0.id)
         }
     }
 
-    private var highlightedRouteIDs: Set<Int>? {
+    private var highlightedJourneyIDs: Set<Int>? {
         if let selectedJourneyID { return [selectedJourneyID] }
-        return selectedStopRouteIDs
+        return selectedStopJourneyIDs
     }
 
     private var routesWithoutJourneys: [TransitRoute] {
-        let journeyRouteIDs = Set(viewModel.journeys.map(\.id))
+        let journeyRouteIDs = Set(
+            viewModel.journeys.map { $0.route.transitlandID }
+        )
         return viewModel.routes.filter {
             !journeyRouteIDs.contains($0.transitlandID)
                 && (selectedStopRouteIDs?.contains($0.transitlandID) ?? true)
@@ -68,14 +71,18 @@ struct ContentView: View {
                     stops: viewModel.stops,
                     selectedJourneyID: selectedJourneyID,
                     selectedStopID: selectedStopID,
-                    highlightedRouteIDs: highlightedRouteIDs,
+                    highlightedJourneyIDs: highlightedJourneyIDs,
                     showsMapLadder: selectedJourney != nil
                         && expansionPrototype == .map,
                     viewportBottomInset: bottomSheetHeight,
                     cameraRequest: cameraRequest,
                     onSelectJourney: selectJourney,
-                    onSelectStop: { stopID, routeIDs in
-                        selectStop(stopID, routeIDs: routeIDs)
+                    onSelectStop: { stopID, routeIDs, journeyIDs in
+                        selectStop(
+                            stopID,
+                            routeIDs: routeIDs,
+                            journeyIDs: journeyIDs
+                        )
                     }
                 )
                 .ignoresSafeArea()
@@ -93,6 +100,7 @@ struct ContentView: View {
             selectedJourneyID = nil
             selectedStopID = nil
             selectedStopRouteIDs = nil
+            selectedStopJourneyIDs = nil
             cameraRequest = WayboundCameraRequest(region: region)
         }
         .onChange(of: expansionPrototype) { _, prototype in
@@ -128,7 +136,7 @@ struct ContentView: View {
                     journeys: displayedJourneys,
                     unavailableRoutes: routesWithoutJourneys,
                     isLoading: viewModel.isLoading || viewModel.isLoadingJourneys,
-                    highlightedRouteIDs: highlightedRouteIDs,
+                    highlightedJourneyIDs: highlightedJourneyIDs,
                     selectedStopName: selectedStop?.name,
                     onSelect: selectJourney,
                     onClearStop: clearStopSelection,
@@ -186,12 +194,17 @@ struct ContentView: View {
         }
     }
 
-    private func selectStop(_ stopID: Int, routeIDs: Set<Int>) {
+    private func selectStop(
+        _ stopID: Int,
+        routeIDs: Set<Int>,
+        journeyIDs: Set<Int>
+    ) {
         guard viewModel.stops.contains(where: { $0.id == stopID }) else { return }
         withAnimation(.snappy(duration: 0.3)) {
             selectedJourneyID = nil
             selectedStopID = stopID
             selectedStopRouteIDs = routeIDs
+            selectedStopJourneyIDs = journeyIDs
         }
     }
 
@@ -199,6 +212,7 @@ struct ContentView: View {
         withAnimation(.snappy(duration: 0.3)) {
             selectedStopID = nil
             selectedStopRouteIDs = nil
+            selectedStopJourneyIDs = nil
         }
     }
 
@@ -266,7 +280,7 @@ private struct JourneyOverviewSheet: View {
     let journeys: [RouteJourney]
     let unavailableRoutes: [TransitRoute]
     let isLoading: Bool
-    let highlightedRouteIDs: Set<Int>?
+    let highlightedJourneyIDs: Set<Int>?
     let selectedStopName: String?
     let onSelect: (Int) -> Void
     let onClearStop: () -> Void
@@ -283,8 +297,8 @@ private struct JourneyOverviewSheet: View {
                         )
                         .foregroundStyle(WayboundPalette.ink)
                     Text(
-                        selectedStopName.map { "Routes serving \($0)" }
-                            ?? "Up to six nearest boardable routes · one destination each"
+                        selectedStopName.map { "Trips serving \($0)" }
+                            ?? "Up to eight numbered routes · both useful directions"
                     )
                     .font(.system(size: 10.5, weight: .regular, design: .rounded))
                     .foregroundStyle(WayboundPalette.ink.opacity(0.62))
@@ -338,7 +352,7 @@ private struct JourneyOverviewSheet: View {
                             }
                             .buttonStyle(.plain)
                             .opacity(
-                                highlightedRouteIDs.map {
+                                highlightedJourneyIDs.map {
                                     $0.contains(journey.id) ? 1 : 0.28
                                 } ?? 1
                             )
@@ -364,11 +378,6 @@ private struct JourneyOverviewSheet: View {
 
                             ForEach(unavailableRoutes) { route in
                                 UnavailableRouteRow(route: route)
-                                    .opacity(
-                                        highlightedRouteIDs.map {
-                                            $0.contains(route.transitlandID) ? 1 : 0.28
-                                        } ?? 1
-                                    )
                             }
                         }
                     }

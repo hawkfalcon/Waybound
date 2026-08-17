@@ -75,29 +75,33 @@ final class TransitViewModel: NSObject, ObservableObject {
     /// Cross-agency stop coordinates can differ slightly even when they mark the
     /// same pole. Name matching keeps this deliberately small radius conservative.
     private let samePlaceStopDistanceMeters: Double = 15
-    private let maximumDisplayedStops = 30
+    /// Thirty clusters are normally enough for the UI, but route discovery also
+    /// retains the three nearest boarding candidates for every numbered route.
+    /// This prevents dense downtown records from hiding an opposite-direction
+    /// platform just outside a nearest-30 prefix.
+    private let minimumRetainedStopClusters = 30
+    private let boardingClustersReservedPerRoute = 3
     /// Trip geometry is sampled per route so payloads stay bounded. Generated
     /// stop-to-stop shapes are discarded rather than drawn as real alignments.
     private let maximumTripGeometriesPerRoute = 12
-    /// Keep the map to a glanceable set of routes a rider can actually reach.
-    private let maximumVisibleJourneys = 12
+    /// Keep eight distinct numbered public routes when they are genuinely
+    /// boardable. Each retained route may contribute one trip per direction.
+    private let maximumVisiblePublicRoutes = 8
     private let upcomingDepartureWindowSeconds = 10_800 // 3 hours
     /// Frequency is deliberately local to the decision a rider is making now.
     /// A route earns a utility bonus only for catchable trips in the next 90 min.
     private let frequencyObservationWindowSeconds = 5_400
     private let maximumFrequencyBonusMinutes = 18
     private let maximumFlagshipRideMinutes = 180
-    private let routeLaneSpacingPoints: Double = 5.5
     private let minimumBoardingBufferMinutes = 2
     private let walkingMetersPerMinute: Double = 80
     private let duplicateJourneyBoardingDistanceMeters: Double = 200
-    private let duplicateJourneyDestinationDistanceMeters: Double = 1_000
+    private let duplicateJourneyDestinationDistanceMeters: Double = 2_000
     private let maximumShapeStopDistanceMeters: Double = 250
     private let maximumShapeStopRMSMeters: Double = 100
     private let maximumBoardingShapeDistanceMeters: Double = 120
     // Transitland's REST endpoint filters by radius but does not guarantee
-    // distance ordering. Search outward in stages, then sort locally.
-    private var stopSearchRadii: [Double] { [250, 500, radiusMeters] }
+    // distance ordering, so the complete half-mile result is sorted locally.
     private let stopCandidateLimit = 1_000
 
     // MARK: - Init
@@ -198,25 +202,17 @@ final class TransitViewModel: NSObject, ObservableObject {
     // MARK: - API Calls
 
     private func fetchStops(lat: Double, lon: Double) async throws -> [TransitStop] {
-        var candidates: [TransitStop] = []
-        var clusters: [[TransitStop]] = []
-
-        // Most places find 30 useful stops well before half a mile. Starting
-        // small avoids downloading the full search area every time.
-        for searchRadius in stopSearchRadii {
-            candidates = try await fetchStopCandidates(
-                lat: lat,
-                lon: lon,
-                radius: searchRadius
-            )
-            clusters = clusterNearbyStops(candidates)
-            if clusters.count >= maximumDisplayedStops {
-                break
-            }
-        }
-
+        // Always inspect the promised half-mile boundary. Stopping after the first
+        // dense 250-meter result can find an inbound route near its terminus while
+        // omitting that route's useful outbound platform only one block farther on.
+        let candidates = try await fetchStopCandidates(
+            lat: lat,
+            lon: lon,
+            radius: radiusMeters
+        )
+        let clusters = clusterNearbyStops(candidates)
         let origin = CLLocation(latitude: lat, longitude: lon)
-        let closestClusters = clusters
+        let rankedClusters = clusters
             .map { cluster in
                 let distance = cluster.map { stop in
                     origin.distance(from: CLLocation(
@@ -227,12 +223,36 @@ final class TransitViewModel: NSObject, ObservableObject {
                 return (cluster: cluster, distance: distance)
             }
             .sorted { $0.distance < $1.distance }
-            .prefix(maximumDisplayedStops)
-            .map { $0.cluster }
 
-        // Departure queries are made only for duplicate groups that survived
-        // the closest-30 selection, rather than for every candidate stop.
-        let mergedStops = await mergeNearbyStopClusters(closestClusters)
+        // Preserve up to three physical boarding candidates for every numbered
+        // source route before filling the ordinary nearest-30 floor. For route 11
+        // downtown, this retains Transit Center as the useful UCSB-bound platform
+        // even when many closer records describe only the final inbound blocks.
+        var retainedIndices: Set<Int> = []
+        var retainedCountByRouteID: [Int: Int] = [:]
+        for (index, rankedCluster) in rankedClusters.enumerated() {
+            let routeIDs = Set(
+                rankedCluster.cluster.flatMap { $0.routeIDs }
+            )
+            for routeID in routeIDs
+            where retainedCountByRouteID[routeID, default: 0]
+                < boardingClustersReservedPerRoute {
+                retainedIndices.insert(index)
+                retainedCountByRouteID[routeID, default: 0] += 1
+            }
+        }
+        for index in rankedClusters.indices
+        where retainedIndices.count < minimumRetainedStopClusters {
+            retainedIndices.insert(index)
+        }
+        let retainedClusters = rankedClusters.enumerated().compactMap {
+            index, rankedCluster in
+            retainedIndices.contains(index) ? rankedCluster.cluster : nil
+        }
+
+        // Departure-count lookups remain limited to duplicate groups that survive
+        // the nearest/route-diversity selection rather than every half-mile record.
+        let mergedStops = await mergeNearbyStopClusters(retainedClusters)
         return mergedStops.sorted {
             let lhs = CLLocation(
                 latitude: $0.coordinate.latitude,
@@ -272,9 +292,13 @@ final class TransitViewModel: NSObject, ObservableObject {
         return response.stops.compactMap { apiStop -> TransitStop? in
             guard apiStop.geometry.coordinates.count >= 2 else { return nil }
 
-            let routeReferences = apiStop.routeStops?.compactMap { $0.route } ?? []
+            let routeReferences = (apiStop.routeStops?.compactMap { $0.route } ?? [])
+                .filter {
+                    TransitRouteNaming.routeNumber(shortName: $0.routeShortName) != nil
+                }
             let routeIDs = Set(routeReferences.compactMap { $0.id })
-            // A platform with no route association is not useful to a rider.
+            // Unnumbered records are not actionable route choices and often
+            // represent feed artifacts, shuttles, or descriptive variants.
             guard !routeIDs.isEmpty else { return nil }
 
             let coordinate = CLLocationCoordinate2D(
@@ -439,21 +463,15 @@ final class TransitViewModel: NSObject, ObservableObject {
         .filter { $0.isLetter || $0.isNumber }
     }
 
-    private func normalizedPublicRouteIdentity(_ route: TransitRoute) -> String {
-        let routeNumber = normalizedIdentityText(route.routeNumber ?? "")
-        var routeName = normalizedIdentityText(route.displayName)
-        if !routeNumber.isEmpty, routeName.hasPrefix(routeNumber) {
-            routeName.removeFirst(routeNumber.count)
-        }
-        return [
+    private func publicRouteKey(for route: TransitRoute) -> String {
+        [
             normalizedAgencyName(route.agencyName),
-            routeNumber,
-            routeName,
+            normalizedIdentityText(route.routeNumber ?? ""),
         ].joined(separator: "|")
     }
 
     private func stableRouteColor(for route: TransitRoute) -> Color {
-        let publicIdentity = normalizedPublicRouteIdentity(route)
+        let publicIdentity = publicRouteKey(for: route)
         var hash: UInt64 = 1_469_598_103_934_665_603
         for scalar in publicIdentity.unicodeScalars {
             hash ^= UInt64(scalar.value)
@@ -669,6 +687,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         }
 
         let matchingRoutes = requestedIDs.compactMap { routeCache[$0] }
+            .filter { $0.routeNumber != nil }
         if matchingRoutes.isEmpty {
             throw URLError(.resourceUnavailable)
         }
@@ -680,18 +699,33 @@ final class TransitViewModel: NSObject, ObservableObject {
                     == .orderedAscending
             }
 
-        // Color derives from the public route identity rather than Transitland's
-        // source ID or the nearby-route ordering. Duplicate feed records for the
-        // same public line therefore cannot acquire conflicting colors.
+        // Preserve GTFS identity colors whenever the operator publishes one.
+        // Duplicate source records for the same public route share the first
+        // authoritative color by stable Transitland ID; only a genuinely
+        // colorless public route uses the deterministic fallback palette.
+        let officialColorsByPublicRoute = Dictionary(
+            grouping: sortedRoutes,
+            by: { publicRouteKey(for: $0) }
+        ).compactMapValues { matchingRoutes in
+            matchingRoutes
+                .filter { $0.officialColorHex != nil }
+                .min { $0.transitlandID < $1.transitlandID }?
+                .officialColorHex
+        }
         return sortedRoutes.map { route in
-            TransitRoute(
+            let officialColorHex = officialColorsByPublicRoute[
+                publicRouteKey(for: route)
+            ]
+            return TransitRoute(
                 id: route.id,
                 transitlandID: route.transitlandID,
                 shortName: route.shortName,
                 longName: route.longName,
                 agencyName: route.agencyName,
                 routeType: route.routeType,
-                color: stableRouteColor(for: route),
+                officialColorHex: officialColorHex,
+                color: officialColorHex.map { Color(hex: $0) }
+                    ?? stableRouteColor(for: route),
                 polylines: route.polylines
             )
         }
@@ -821,7 +855,7 @@ final class TransitViewModel: NSObject, ObservableObject {
                     )
                 }
             )
-            let representativeSelections = candidatesByPattern.values
+            let patternRepresentatives = candidatesByPattern.values
                 .compactMap { patternCandidates in
                     patternCandidates.min { lhs, rhs in
                         let lhsDistance = originLocation.distance(from: CLLocation(
@@ -844,8 +878,39 @@ final class TransitViewModel: NSObject, ObservableObject {
                         return lhs.option.sourceStopID < rhs.option.sourceStopID
                     }
                 }
+
+            // Reserve one trip-detail request for every observed direction before
+            // using the third request as a fallback. A simple earliest-three prefix
+            // can spend all requests on outbound headsign variants and make the
+            // inbound half of routes such as 6 or 11 disappear.
+            let representativesByDirection = Dictionary(
+                grouping: patternRepresentatives,
+                by: { representative in
+                    guard let trip = representative.departure.trip else {
+                        return "unknown"
+                    }
+                    return trip.directionID.map { "direction:\($0)" }
+                        ?? "destination:\(normalizedIdentityText(trip.tripHeadsign ?? ""))"
+                }
+            )
+            var representativeSelections = representativesByDirection.values
+                .compactMap { $0.min(by: { $0.departureDate < $1.departureDate }) }
                 .sorted { $0.departureDate < $1.departureDate }
                 .prefix(3)
+                .map { $0 }
+            let selectedTripIDs = Set(
+                representativeSelections.compactMap { $0.departure.trip?.id }
+            )
+            let fallbackSelections = patternRepresentatives
+                .filter { representative in
+                    guard let tripID = representative.departure.trip?.id else {
+                        return false
+                    }
+                    return !selectedTripIDs.contains(tripID)
+                }
+                .sorted { $0.departureDate < $1.departureDate }
+                .prefix(max(0, 3 - representativeSelections.count))
+            representativeSelections.append(contentsOf: fallbackSelections)
             selections.append(contentsOf: representativeSelections)
         }
 
@@ -889,12 +954,19 @@ final class TransitViewModel: NSObject, ObservableObject {
         ) { result, item in
             result[item.key] = catchableTripIDsByPattern[item.value]?.count ?? 0
         }
-        let candidatesByRoute = Dictionary(
+        // Keep one useful trip for each direction of each source route. Collapsing
+        // here by route ID alone hid the return direction of ordinary two-way
+        // service and made numbered routes such as 6 and 11 less discoverable.
+        let candidatesByDirection = Dictionary(
             grouping: journeyCandidates,
-            by: { $0.route.transitlandID }
+            by: { journey in
+                let direction = journey.directionID.map { "direction:\($0)" }
+                    ?? "destination:\(normalizedIdentityText(journey.destinationName))"
+                return "\(journey.route.transitlandID)|\(direction)"
+            }
         )
-        let allJourneys = routes.compactMap { route -> RouteJourney? in
-            let candidates = candidatesByRoute[route.transitlandID] ?? []
+        let directionalJourneys = candidatesByDirection.values.compactMap {
+            candidates -> RouteJourney? in
             let usefulCandidates = candidates.filter { $0.rideMinutes >= 8 }
             let pool = usefulCandidates.isEmpty ? candidates : usefulCandidates
             return pool.min {
@@ -907,10 +979,10 @@ final class TransitViewModel: NSObject, ObservableObject {
             }
         }
 
-        // Transitland may expose the same public line through more than one feed
-        // or route record. Rank first, then retain only the most useful departure
-        // for a matching public route, destination, and physical journey.
-        let utilityOrderedJourneys = allJourneys.sorted {
+        // Rank before deduplication so duplicate feeds keep the more useful live
+        // departure. Physical direction and endpoints, not Transitland source IDs,
+        // define whether two records are the same rider-facing journey.
+        let utilityOrderedJourneys = directionalJourneys.sorted {
             journeyRanksAhead(
                 $0,
                 of: $1,
@@ -925,16 +997,34 @@ final class TransitViewModel: NSObject, ObservableObject {
             }) else { continue }
             logicalJourneys.append(candidate)
         }
-        var journeys = Array(logicalJourneys.prefix(maximumVisibleJourneys))
 
-        let midpoint = Double(max(0, journeys.count - 1)) / 2
-        journeys = journeys.enumerated().map { index, journey in
-            copy(
-                journey: journey,
-                laneOffsetPoints: (Double(index) - midpoint) * routeLaneSpacingPoints
-            )
+        // The map budget counts numbered public routes, not directions. Operator
+        // identity keeps unrelated services with the same badge separate. Retain
+        // up to two directional answers for each of the eight best routes and keep
+        // both directions adjacent in the compact sheet.
+        var retainedRouteKeys: [String] = []
+        var journeysByRouteKey: [String: [RouteJourney]] = [:]
+        var directionKeysByRouteKey: [String: Set<String>] = [:]
+        for candidate in logicalJourneys {
+            guard candidate.route.routeNumber != nil else { continue }
+            let routeKey = publicRouteKey(for: candidate.route)
+            guard !routeKey.isEmpty else { continue }
+            let directionKey = candidate.directionID.map { "direction:\($0)" }
+                ?? "destination:\(normalizedIdentityText(candidate.destinationName))"
+
+            if journeysByRouteKey[routeKey] == nil {
+                guard retainedRouteKeys.count < maximumVisiblePublicRoutes else {
+                    continue
+                }
+                retainedRouteKeys.append(routeKey)
+            }
+            guard journeysByRouteKey[routeKey, default: []].count < 2,
+                  directionKeysByRouteKey[routeKey, default: []]
+                    .insert(directionKey).inserted
+            else { continue }
+            journeysByRouteKey[routeKey, default: []].append(candidate)
         }
-        return journeys
+        return retainedRouteKeys.flatMap { journeysByRouteKey[$0] ?? [] }
     }
 
     private func journeyPatternKey(routeID: Int, trip: APITrip) -> String {
@@ -1002,9 +1092,28 @@ final class TransitViewModel: NSObject, ObservableObject {
         _ first: RouteJourney,
         _ second: RouteJourney
     ) -> Bool {
-        guard normalizedPublicRouteIdentity(first.route)
-                == normalizedPublicRouteIdentity(second.route)
+        guard let firstNumber = first.route.routeNumber,
+              let secondNumber = second.route.routeNumber,
+              normalizedIdentityText(firstNumber)
+                == normalizedIdentityText(secondNumber),
+              normalizedAgencyName(first.route.agencyName)
+                == normalizedAgencyName(second.route.agencyName)
         else { return false }
+
+        // Opposite directions of one authoritative route are intentionally two
+        // answers, even when their platforms and flagship stops are close.
+        if first.route.transitlandID == second.route.transitlandID,
+           let firstDirection = first.directionID,
+           let secondDirection = second.directionID,
+           firstDirection != secondDirection {
+            return false
+        }
+
+        if let firstVector = initialTravelVector(for: first),
+           let secondVector = initialTravelVector(for: second),
+           firstVector.x * secondVector.x + firstVector.y * secondVector.y < 0.72 {
+            return false
+        }
 
         let boardingDistance = MKMapPoint(first.boardingStop.coordinate).distance(
             to: MKMapPoint(second.boardingStop.coordinate)
@@ -1014,6 +1123,25 @@ final class TransitViewModel: NSObject, ObservableObject {
         )
         return boardingDistance <= duplicateJourneyBoardingDistanceMeters
             && destinationDistance <= duplicateJourneyDestinationDistanceMeters
+    }
+
+    private func initialTravelVector(
+        for journey: RouteJourney
+    ) -> (x: Double, y: Double)? {
+        for polyline in journey.flagshipPolylines {
+            guard let firstCoordinate = polyline.first else { continue }
+            let first = MKMapPoint(firstCoordinate)
+            for coordinate in polyline.dropFirst() {
+                let next = MKMapPoint(coordinate)
+                let deltaX = next.x - first.x
+                let deltaY = next.y - first.y
+                let length = hypot(deltaX, deltaY)
+                if length > 2 {
+                    return (deltaX / length, deltaY / length)
+                }
+            }
+        }
+        return nil
     }
 
     private func fetchUpcomingDepartures(
@@ -1202,6 +1330,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         return RouteJourney(
             route: selection.option.route,
             tripID: trip.id,
+            directionID: trip.directionID,
             boardingStop: routeBoardingStop,
             sourceStopID: selection.option.sourceStopID,
             destinationName: destinationName,
@@ -1214,9 +1343,9 @@ final class TransitViewModel: NSObject, ObservableObject {
             totalMinutes: totalMinutes,
             departureIsRealtime: selection.departureIsRealtime,
             stops: journeyStops,
+            approachPolylines: path.approach,
             flagshipPolylines: path.flagship,
-            continuationPolylines: path.continuation,
-            laneOffsetPoints: 0
+            continuationPolylines: path.continuation
         )
     }
 
@@ -1310,7 +1439,11 @@ final class TransitViewModel: NSObject, ObservableObject {
         in coordinateLines: [[CLLocationCoordinate2D]],
         alignedTo orderedStops: [CLLocationCoordinate2D],
         flagshipStopIndex: Int
-    ) -> (flagship: [[CLLocationCoordinate2D]], continuation: [[CLLocationCoordinate2D]])? {
+    ) -> (
+        approach: [[CLLocationCoordinate2D]],
+        flagship: [[CLLocationCoordinate2D]],
+        continuation: [[CLLocationCoordinate2D]]
+    )? {
         guard orderedStops.count >= 2,
               flagshipStopIndex > 0,
               flagshipStopIndex < orderedStops.count
@@ -1362,10 +1495,14 @@ final class TransitViewModel: NSObject, ObservableObject {
               finalIndex >= flagshipIndex
         else { return nil }
 
+        let approachLine = boardingIndex > 0
+            ? Array(best.line[...boardingIndex]) : []
         let flagshipLine = Array(best.line[boardingIndex...flagshipIndex])
         let continuationLine = finalIndex > flagshipIndex
             ? Array(best.line[flagshipIndex...finalIndex]) : []
         let maximumJump = maximumGeometryJump(for: 3)
+        let approachSegments = approachLine.count >= 2
+            ? splitPolyline(approachLine, atJumpsLongerThan: maximumJump) : []
         let flagshipSegments = splitPolyline(
             flagshipLine,
             atJumpsLongerThan: maximumJump
@@ -1373,7 +1510,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         let continuationSegments = continuationLine.count >= 2
             ? splitPolyline(continuationLine, atJumpsLongerThan: maximumJump) : []
         guard !flagshipSegments.isEmpty else { return nil }
-        return (flagshipSegments, continuationSegments)
+        return (approachSegments, flagshipSegments, continuationSegments)
     }
 
     /// Dynamic programming finds the lowest-error stop-to-shape assignment while
@@ -1470,31 +1607,6 @@ final class TransitViewModel: NSObject, ObservableObject {
         )
     }
 
-    private func copy(
-        journey: RouteJourney,
-        laneOffsetPoints: Double
-    ) -> RouteJourney {
-        RouteJourney(
-            route: journey.route,
-            tripID: journey.tripID,
-            boardingStop: journey.boardingStop,
-            sourceStopID: journey.sourceStopID,
-            destinationName: journey.destinationName,
-            destinationCoordinate: journey.destinationCoordinate,
-            departureDate: journey.departureDate,
-            departureMinutesFromNow: journey.departureMinutesFromNow,
-            walkMinutes: journey.walkMinutes,
-            waitMinutes: journey.waitMinutes,
-            rideMinutes: journey.rideMinutes,
-            totalMinutes: journey.totalMinutes,
-            departureIsRealtime: journey.departureIsRealtime,
-            stops: journey.stops,
-            flagshipPolylines: journey.flagshipPolylines,
-            continuationPolylines: journey.continuationPolylines,
-            laneOffsetPoints: laneOffsetPoints
-        )
-    }
-
     private func routeRequest(for routeID: Int) -> URLRequest? {
         var components = URLComponents(string: "https://transit.land/api/v2/rest/routes")!
         components.queryItems = [
@@ -1571,6 +1683,7 @@ final class TransitViewModel: NSObject, ObservableObject {
             longName: route.longName,
             agencyName: route.agencyName,
             routeType: route.routeType,
+            officialColorHex: route.officialColorHex,
             color: route.color,
             polylines: visiblePolylines
         )
@@ -1779,11 +1892,13 @@ final class TransitViewModel: NSObject, ObservableObject {
         from apiRoute: APIRoute,
         polylines: [[CLLocationCoordinate2D]]
     ) -> TransitRoute {
-        let color: Color = {
-            if let hex = apiRoute.routeColor, !hex.isEmpty {
-                return Color(hex: hex)
-            }
-            return .blue
+        let officialColorHex: String? = {
+            guard let raw = apiRoute.routeColor else { return nil }
+            let cleaned = raw.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+            guard cleaned.count == 6,
+                  UInt64(cleaned, radix: 16) != nil
+            else { return nil }
+            return cleaned.uppercased()
         }()
 
         return TransitRoute(
@@ -1793,7 +1908,8 @@ final class TransitViewModel: NSObject, ObservableObject {
             longName: apiRoute.routeLongName ?? "Unknown Route",
             agencyName: apiRoute.agency?.agencyName ?? "Unknown Agency",
             routeType: apiRoute.routeType ?? 3,
-            color: color,
+            officialColorHex: officialColorHex,
+            color: officialColorHex.map { Color(hex: $0) } ?? .blue,
             polylines: polylines
         )
     }

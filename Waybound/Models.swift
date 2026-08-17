@@ -38,6 +38,9 @@ struct TransitRoute: Identifiable, Equatable {
     let longName: String
     let agencyName: String
     let routeType: Int
+    /// GTFS `route_color`, retained separately so fallback colors never replace
+    /// an operator-provided identity color during later route normalization.
+    let officialColorHex: String?
     let color: Color
     /// One or more non-generated trip shapes that make up the route.
     let polylines: [[CLLocationCoordinate2D]]
@@ -74,6 +77,9 @@ struct TransitRoute: Identifiable, Equatable {
 struct RouteJourney: Identifiable, Equatable {
     let route: TransitRoute
     let tripID: Int
+    /// GTFS direction distinguishes the two useful answers for one numbered
+    /// route without treating duplicate records of the same trip as directions.
+    let directionID: Int?
     let boardingStop: TransitStop
     let sourceStopID: Int
     let destinationName: String
@@ -86,14 +92,17 @@ struct RouteJourney: Identifiable, Equatable {
     let totalMinutes: Int
     let departureIsRealtime: Bool
     let stops: [JourneyStop]
+    /// The same real trip before the rider's boarding stop. It is rendered only
+    /// as faint context, making the direction of travel spatially obvious.
+    let approachPolylines: [[CLLocationCoordinate2D]]
     /// The default map answer: actual trip shape from boarding to flagship.
     let flagshipPolylines: [[CLLocationCoordinate2D]]
     /// Any downstream shape after the flagship, used only by map-ladder mode.
     let continuationPolylines: [[CLLocationCoordinate2D]]
-    /// Applied by the custom renderer in screen points, not geographic meters.
-    let laneOffsetPoints: Double
 
-    var id: Int { route.transitlandID }
+    /// A route may produce two simultaneous direction-specific answers. Trip IDs
+    /// are Transitland-global and keep those journeys independently selectable.
+    var id: Int { tripID }
 
     var flagshipStop: JourneyStop? {
         stops.first(where: \.isFlagship)
