@@ -65,6 +65,7 @@ struct WayboundMapView: UIViewRepresentable {
         var parent: WayboundMapView
         var lastCameraRequestID: UUID?
         private var routeOverlays: [RouteLaneOverlay] = []
+        private var corridorSegmentsByRouteID: [Int: [MapRouteSegment]] = [:]
         private var viewportRefreshWorkItem: DispatchWorkItem?
 
         init(parent: WayboundMapView) {
@@ -118,6 +119,14 @@ struct WayboundMapView: UIViewRepresentable {
             else { return }
             let selectedID = parent.selectedJourneyID
             let highlightedRouteIDs = parent.highlightedRouteIDs
+            corridorSegmentsByRouteID = Dictionary(
+                uniqueKeysWithValues: parent.journeys.map { journey in
+                    (
+                        journey.id,
+                        routeSegments(for: journey.flagshipPolylines)
+                    )
+                }
+            )
 
             for journey in parent.journeys {
                 let isSelected = selectedID == journey.id
@@ -614,6 +623,7 @@ struct WayboundMapView: UIViewRepresentable {
                     stop: representative.boardingStop,
                     sourceStopIDs: Set(group.map { $0.boardingStop.id }),
                     routeIDs: routeIDs,
+                    routeNumbers: sortedJourneys.map { $0.route.shortName },
                     colors: colors,
                     isDimmed: isDimmed,
                     isSelected: group.contains {
@@ -634,6 +644,10 @@ struct WayboundMapView: UIViewRepresentable {
             to mapView: MKMapView
         ) {
             for coordinates in polylines where coordinates.count >= 2 {
+                let offsetFactors = sharedCorridorOffsetFactors(
+                    for: coordinates,
+                    excluding: routeID
+                )
                 let overlay = RouteLaneOverlay(
                     coordinates: coordinates,
                     routeID: routeID,
@@ -641,10 +655,168 @@ struct WayboundMapView: UIViewRepresentable {
                     opacity: opacity,
                     lineWidth: lineWidth,
                     laneOffsetPoints: laneOffset,
+                    laneOffsetFactors: offsetFactors,
                     dashed: dashed
                 )
                 routeOverlays.append(overlay)
                 mapView.addOverlay(overlay, level: .aboveRoads)
+            }
+        }
+
+        private func routeSegments(
+            for polylines: [[CLLocationCoordinate2D]]
+        ) -> [MapRouteSegment] {
+            polylines.flatMap { polyline -> [MapRouteSegment] in
+                guard polyline.count >= 2 else { return [] }
+                return (0..<(polyline.count - 1)).compactMap { index in
+                    MapRouteSegment(
+                        start: MKMapPoint(polyline[index]),
+                        end: MKMapPoint(polyline[index + 1])
+                    )
+                }
+            }
+        }
+
+        /// A route stays on its authoritative GTFS centerline by default. Its
+        /// rank-based lane offset fades in only where another displayed route
+        /// follows the same, parallel street corridor. This avoids shifting an
+        /// isolated route (such as route 2 on Anapamu) off its actual street.
+        private func sharedCorridorOffsetFactors(
+            for coordinates: [CLLocationCoordinate2D],
+            excluding routeID: Int
+        ) -> [Double] {
+            guard coordinates.count >= 2 else {
+                return Array(repeating: 0, count: coordinates.count)
+            }
+
+            let otherSegments = corridorSegmentsByRouteID.flatMap {
+                entry -> [MapRouteSegment] in
+                entry.key == routeID ? [] : entry.value
+            }
+            guard !otherSegments.isEmpty else {
+                return Array(repeating: 0, count: coordinates.count)
+            }
+
+            let points = coordinates.map { MKMapPoint($0) }
+            var sharedSegments = Array(
+                repeating: false,
+                count: points.count - 1
+            )
+            for index in sharedSegments.indices {
+                guard let segment = MapRouteSegment(
+                    start: points[index],
+                    end: points[index + 1]
+                ) else { continue }
+                let midpoint = MKMapPoint(
+                    x: (segment.start.x + segment.end.x) / 2,
+                    y: (segment.start.y + segment.end.y) / 2
+                )
+
+                // Requiring proximity at the midpoint and one endpoint rejects
+                // incidental line crossings while tolerating different GTFS
+                // sampling intervals along a truly shared street.
+                let midpointIsShared = hasParallelCorridor(
+                    near: midpoint,
+                    direction: segment,
+                    among: otherSegments
+                )
+                let endpointIsShared = hasParallelCorridor(
+                    near: segment.start,
+                    direction: segment,
+                    among: otherSegments
+                ) || hasParallelCorridor(
+                    near: segment.end,
+                    direction: segment,
+                    among: otherSegments
+                )
+                sharedSegments[index] = midpointIsShared && endpointIsShared
+            }
+
+            var factors = Array(repeating: 0.0, count: points.count)
+            for index in sharedSegments.indices where sharedSegments[index] {
+                factors[index] = 1
+                factors[index + 1] = 1
+            }
+
+            // A short geographic taper prevents a visible sideways jog where
+            // parallel lanes merge back onto the street centerline.
+            let taperDistance: CLLocationDistance = 42
+            if factors.count > 1 {
+                for index in 1..<factors.count {
+                    let distance = points[index - 1].distance(to: points[index])
+                    factors[index] = max(
+                        factors[index],
+                        factors[index - 1] - distance / taperDistance
+                    )
+                }
+                for index in stride(from: factors.count - 2, through: 0, by: -1) {
+                    let distance = points[index].distance(to: points[index + 1])
+                    factors[index] = max(
+                        factors[index],
+                        factors[index + 1] - distance / taperDistance
+                    )
+                }
+            }
+            return factors.map { max(0, min(1, $0)) }
+        }
+
+        private func hasParallelCorridor(
+            near point: MKMapPoint,
+            direction: MapRouteSegment,
+            among candidates: [MapRouteSegment]
+        ) -> Bool {
+            let maximumSeparation: CLLocationDistance = 20
+            let minimumParallelDot = 0.93
+            return candidates.contains { candidate in
+                abs(direction.unitX * candidate.unitX
+                    + direction.unitY * candidate.unitY) >= minimumParallelDot
+                    && mapDistance(
+                        from: point,
+                        to: candidate
+                    ) <= maximumSeparation
+            }
+        }
+
+        private func mapDistance(
+            from point: MKMapPoint,
+            to segment: MapRouteSegment
+        ) -> CLLocationDistance {
+            let deltaX = segment.end.x - segment.start.x
+            let deltaY = segment.end.y - segment.start.y
+            let lengthSquared = deltaX * deltaX + deltaY * deltaY
+            guard lengthSquared > 0 else {
+                return point.distance(to: segment.start)
+            }
+            let progress = max(
+                0,
+                min(
+                    1,
+                    ((point.x - segment.start.x) * deltaX
+                        + (point.y - segment.start.y) * deltaY) / lengthSquared
+                )
+            )
+            let projection = MKMapPoint(
+                x: segment.start.x + progress * deltaX,
+                y: segment.start.y + progress * deltaY
+            )
+            return point.distance(to: projection)
+        }
+
+        private struct MapRouteSegment {
+            let start: MKMapPoint
+            let end: MKMapPoint
+            let unitX: Double
+            let unitY: Double
+
+            init?(start: MKMapPoint, end: MKMapPoint) {
+                let deltaX = end.x - start.x
+                let deltaY = end.y - start.y
+                let length = hypot(deltaX, deltaY)
+                guard length > 0.000_001 else { return nil }
+                self.start = start
+                self.end = end
+                self.unitX = deltaX / length
+                self.unitY = deltaY / length
             }
         }
 
@@ -761,9 +933,15 @@ struct WayboundMapView: UIViewRepresentable {
                     rawPoints,
                     tolerance: 0.7
                 )
+                let factors = simplifiedRouteValues(
+                    for: basePoints,
+                    originalPoints: rawPoints,
+                    originalValues: overlay.laneOffsetFactors.map { CGFloat($0) }
+                )
                 let lanePoints = stableRouteOffsetPoints(
                     basePoints,
-                    offset: CGFloat(overlay.laneOffsetPoints)
+                    offset: CGFloat(overlay.laneOffsetPoints),
+                    factors: factors
                 )
                 guard lanePoints.count >= 2 else { continue }
 
@@ -831,6 +1009,7 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
     let opacity: Double
     let lineWidth: Double
     let laneOffsetPoints: Double
+    let laneOffsetFactors: [Double]
     let dashed: Bool
     private let polyline: MKPolyline
 
@@ -846,6 +1025,7 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
         opacity: Double,
         lineWidth: Double,
         laneOffsetPoints: Double,
+        laneOffsetFactors: [Double],
         dashed: Bool
     ) {
         self.coordinates = coordinates
@@ -854,6 +1034,7 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
         self.opacity = opacity
         self.lineWidth = lineWidth
         self.laneOffsetPoints = laneOffsetPoints
+        self.laneOffsetFactors = laneOffsetFactors
         self.dashed = dashed
         self.polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
         super.init()
@@ -877,7 +1058,16 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
         )
         guard basePoints.count >= 2 else { return }
         let offset = CGFloat(routeOverlay.laneOffsetPoints) / zoomScale
-        let offsetPoints = stableRouteOffsetPoints(basePoints, offset: offset)
+        let factors = simplifiedRouteValues(
+            for: basePoints,
+            originalPoints: rawPoints,
+            originalValues: routeOverlay.laneOffsetFactors.map { CGFloat($0) }
+        )
+        let offsetPoints = stableRouteOffsetPoints(
+            basePoints,
+            offset: offset,
+            factors: factors
+        )
 
         let path = CGMutablePath()
         path.move(to: offsetPoints[0])
@@ -962,9 +1152,42 @@ private func simplifiedRoutePoints(
     return simplifyRange(0, deduplicated.count - 1)
 }
 
+/// Ramer–Douglas–Peucker retains source points, so carry each retained point's
+/// corridor factor through the same ordered sequence. The nearest fallback is
+/// only for sub-pixel floating-point differences in MapKit conversion.
+private func simplifiedRouteValues(
+    for simplifiedPoints: [CGPoint],
+    originalPoints: [CGPoint],
+    originalValues: [CGFloat]
+) -> [CGFloat] {
+    guard originalPoints.count == originalValues.count,
+          !originalPoints.isEmpty
+    else { return Array(repeating: 0, count: simplifiedPoints.count) }
+
+    var cursor = 0
+    return simplifiedPoints.map { point in
+        if cursor < originalPoints.count,
+           let match = originalPoints[cursor...].firstIndex(of: point) {
+            cursor = match + 1
+            return originalValues[match]
+        }
+        let nearestIndex = originalPoints.indices.min { first, second in
+            hypot(
+                point.x - originalPoints[first].x,
+                point.y - originalPoints[first].y
+            ) < hypot(
+                point.x - originalPoints[second].x,
+                point.y - originalPoints[second].y
+            )
+        } ?? 0
+        return originalValues[nearestIndex]
+    }
+}
+
 private func stableRouteOffsetPoints(
     _ points: [CGPoint],
-    offset: CGFloat
+    offset: CGFloat,
+    factors: [CGFloat]? = nil
 ) -> [CGPoint] {
     guard points.count >= 2, abs(offset) > 0.0001 else { return points }
     var directions: [CGPoint] = []
@@ -1003,16 +1226,20 @@ private func stableRouteOffsetPoints(
         let sumY = previousNormal.y + nextNormal.y
         let sumLength = hypot(sumX, sumY)
 
+        let factor = factors.flatMap { values in
+            values.indices.contains(index) ? values[index] : nil
+        } ?? 1
+        let localOffset = offset * max(0, min(1, factor))
         var normal = nextNormal
-        var scale = offset
+        var scale = localOffset
         if sumLength > 0.001 {
             normal = CGPoint(x: sumX / sumLength, y: sumY / sumLength)
             let denominator = normal.x * nextNormal.x + normal.y * nextNormal.y
             if abs(denominator) > 0.25 {
-                scale = offset / denominator
+                scale = localOffset / denominator
             }
         }
-        let maximumMiter = abs(offset) * 1.75
+        let maximumMiter = abs(localOffset) * 1.75
         scale = max(-maximumMiter, min(maximumMiter, scale))
         return CGPoint(
             x: points[index].x + normal.x * scale,
@@ -1113,6 +1340,7 @@ private final class StopClusterMapAnnotation: NSObject, MKAnnotation {
     let stop: TransitStop
     let sourceStopIDs: Set<Int>
     let routeIDs: Set<Int>
+    let routeNumbers: [String]
     let colors: [UIColor]
     let isDimmed: Bool
     let isSelected: Bool
@@ -1124,6 +1352,7 @@ private final class StopClusterMapAnnotation: NSObject, MKAnnotation {
         stop: TransitStop,
         sourceStopIDs: Set<Int>,
         routeIDs: Set<Int>,
+        routeNumbers: [String],
         colors: [UIColor],
         isDimmed: Bool,
         isSelected: Bool
@@ -1131,6 +1360,7 @@ private final class StopClusterMapAnnotation: NSObject, MKAnnotation {
         self.stop = stop
         self.sourceStopIDs = sourceStopIDs
         self.routeIDs = routeIDs
+        self.routeNumbers = routeNumbers
         self.colors = colors
         self.isDimmed = isDimmed
         self.isSelected = isSelected
@@ -1286,66 +1516,88 @@ private final class RouteStopAnnotationView: MKAnnotationView {
 }
 
 private final class StopClusterAnnotationView: MKAnnotationView {
-    private var colors: [UIColor] = []
-    private var routeCount = 0
+    private let routeLabel = UILabel()
+    private let horizontalInset: CGFloat = 6
+    private let verticalInset: CGFloat = 4
 
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
-        frame = CGRect(x: 0, y: 0, width: 34, height: 34)
-        centerOffset = CGPoint(x: 0, y: 0)
-        collisionMode = .circle
+        centerOffset = .zero
+        collisionMode = .rectangle
         displayPriority = .defaultHigh
-        backgroundColor = .clear
+        canShowCallout = false
+
+        backgroundColor = UIColor.white.withAlphaComponent(0.97)
+        layer.borderColor = UIColor(WayboundPalette.ink).withAlphaComponent(0.16).cgColor
+        layer.borderWidth = 0.75
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOpacity = 0.18
+        layer.shadowRadius = 3
+        layer.shadowOffset = CGSize(width: 0, height: 1.5)
+
+        routeLabel.textAlignment = .center
+        routeLabel.numberOfLines = 1
+        addSubview(routeLabel)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func configure(with annotation: StopClusterMapAnnotation) {
-        colors = annotation.colors
-        routeCount = annotation.routeCount
-        alpha = annotation.isDimmed ? 0.22 : 1
-        transform = annotation.isSelected
-            ? CGAffineTransform(scaleX: 1.22, y: 1.22)
-            : .identity
-        accessibilityLabel = "\(annotation.stop.name), \(routeCount) routes"
-        accessibilityValue = annotation.isSelected ? "Selected" : nil
-        setNeedsDisplay()
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        layer.cornerRadius = bounds.height / 2
+        routeLabel.frame = bounds.insetBy(dx: horizontalInset, dy: verticalInset)
     }
 
-    override func draw(_ rect: CGRect) {
-        guard let context = UIGraphicsGetCurrentContext() else { return }
-        let circleRect = rect.insetBy(dx: 4, dy: 4)
-        context.setFillColor(UIColor(red: 0.965, green: 0.945, blue: 0.89, alpha: 1).cgColor)
-        context.fillEllipse(in: circleRect)
+    // Keep the marker compact while preserving a forgiving touch target.
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        bounds.insetBy(dx: -10, dy: -10).contains(point)
+    }
 
-        let visibleColors = colors.isEmpty
-            ? [UIColor.systemGray] : Array(colors.prefix(6))
-        let arc = CGFloat.pi * 2 / CGFloat(visibleColors.count)
-        context.setLineWidth(4)
-        for (index, color) in visibleColors.enumerated() {
-            context.setStrokeColor(color.cgColor)
-            context.addArc(
-                center: CGPoint(x: rect.midX, y: rect.midY),
-                radius: 12,
-                startAngle: -CGFloat.pi / 2 + CGFloat(index) * arc,
-                endAngle: -CGFloat.pi / 2 + CGFloat(index + 1) * arc,
-                clockwise: false
+    func configure(with annotation: StopClusterMapAnnotation) {
+        var seenNumbers = Set<String>()
+        let numberColors = zip(annotation.routeNumbers, annotation.colors)
+            .filter { seenNumbers.insert($0.0).inserted }
+
+        let text = NSMutableAttributedString()
+        for (index, item) in numberColors.enumerated() {
+            if index > 0 {
+                text.append(
+                    NSAttributedString(
+                        string: "  ",
+                        attributes: [.kern: -1.5]
+                    )
+                )
+            }
+            text.append(
+                NSAttributedString(
+                    string: item.0,
+                    attributes: [
+                        .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .black),
+                        .foregroundColor: item.1,
+                    ]
+                )
             )
-            context.strokePath()
         }
+        routeLabel.attributedText = text
 
-        let text = "\(routeCount)" as NSString
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedDigitSystemFont(ofSize: 9, weight: .bold),
-            .foregroundColor: UIColor(red: 0.14, green: 0.19, blue: 0.18, alpha: 1),
-        ]
-        let size = text.size(withAttributes: attributes)
-        text.draw(
-            at: CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2),
-            withAttributes: attributes
+        let labelSize = routeLabel.sizeThatFits(
+            CGSize(width: CGFloat.greatestFiniteMagnitude, height: 20)
         )
+        bounds.size = CGSize(
+            width: max(25, ceil(labelSize.width) + horizontalInset * 2),
+            height: 23
+        )
+        setNeedsLayout()
+
+        alpha = annotation.isDimmed ? 0.22 : 1
+        transform = annotation.isSelected
+            ? CGAffineTransform(scaleX: 1.1, y: 1.1)
+            : .identity
+        let numbers = numberColors.map { $0.0 }.joined(separator: ", ")
+        accessibilityLabel = "\(annotation.stop.name), routes \(numbers)"
+        accessibilityValue = annotation.isSelected ? "Selected" : nil
     }
 }
 

@@ -112,9 +112,9 @@ struct ContentView: View {
         VStack(spacing: 0) {
             Capsule()
                 .fill(WayboundPalette.ink.opacity(0.22))
-                .frame(width: 38, height: 5)
-                .padding(.top, 9)
-                .padding(.bottom, 8)
+                .frame(width: 34, height: 4)
+                .padding(.top, 6)
+                .padding(.bottom, 5)
 
             if let selectedJourney {
                 JourneyDetailSheet(
@@ -166,7 +166,9 @@ struct ContentView: View {
                 ? min(570, screenHeight * 0.62)
                 : min(285, screenHeight * 0.32)
         }
-        return min(440, max(320, screenHeight * 0.42))
+        // Preserve most of the screen for spatial context. The overview is a
+        // compact chooser, not a second full-height content surface.
+        return min(300, max(228, screenHeight * 0.30))
     }
 
     private func selectJourney(_ routeID: Int) {
@@ -273,10 +275,10 @@ private struct JourneyOverviewSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text("Where these routes go")
                         .font(
-                            .system(size: 23, weight: .black, design: .rounded)
+                            .system(size: 20, weight: .black, design: .rounded)
                             .width(.condensed)
                         )
                         .foregroundStyle(WayboundPalette.ink)
@@ -284,7 +286,7 @@ private struct JourneyOverviewSheet: View {
                         selectedStopName.map { "Routes serving \($0)" }
                             ?? "Up to six nearest boardable routes · one destination each"
                     )
-                    .font(.system(size: 12, weight: .regular, design: .rounded))
+                    .font(.system(size: 10.5, weight: .regular, design: .rounded))
                     .foregroundStyle(WayboundPalette.ink.opacity(0.62))
                     .lineLimit(1)
                 }
@@ -294,7 +296,7 @@ private struct JourneyOverviewSheet: View {
                         Image(systemName: "xmark")
                             .font(.system(size: 11, weight: .bold))
                             .foregroundStyle(WayboundPalette.ink)
-                            .frame(width: 30, height: 30)
+                            .frame(width: 27, height: 27)
                             .background(.white.opacity(0.66))
                             .clipShape(Circle())
                     }
@@ -308,15 +310,15 @@ private struct JourneyOverviewSheet: View {
                     Image(systemName: "location.fill")
                         .font(.system(size: 12, weight: .bold))
                         .foregroundStyle(WayboundPalette.ink)
-                        .frame(width: 32, height: 32)
+                        .frame(width: 29, height: 29)
                         .background(.white.opacity(0.72))
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Center on my location")
             }
-            .padding(.horizontal, 18)
-            .padding(.bottom, 10)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 6)
 
             if journeys.isEmpty && !isLoading {
                 ContentUnavailableView {
@@ -327,7 +329,7 @@ private struct JourneyOverviewSheet: View {
                 .fontDesign(.rounded)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 10) {
+                    LazyVStack(spacing: 6) {
                         ForEach(journeys) { journey in
                             Button {
                                 onSelect(journey.id)
@@ -370,8 +372,8 @@ private struct JourneyOverviewSheet: View {
                             }
                         }
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 28)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 14)
                 }
                 .scrollIndicators(.hidden)
             }
@@ -383,56 +385,45 @@ private struct JourneyRow: View {
     let journey: RouteJourney
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            RouteBadge(route: journey.route, size: 42)
+        HStack(alignment: .center, spacing: 8) {
+            RouteBadge(route: journey.route, size: 34)
 
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(journey.destinationName)
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .font(.system(size: 14.5, weight: .bold, design: .rounded))
                         .foregroundStyle(WayboundPalette.ink)
                         .lineLimit(1)
-                    Spacer(minLength: 4)
+                    Spacer(minLength: 3)
                     Text("\(journey.totalMinutes) min")
-                        .font(.system(size: 15, weight: .bold, design: .monospaced))
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
                         .foregroundStyle(journey.route.color)
                 }
 
-                HStack(spacing: 6) {
-                    Text(journey.route.fullDisplayName)
-                        .lineLimit(1)
-                    Text("·")
-                    Text("bus in \(journey.departureMinutesFromNow) min")
-                        .fontWeight(.semibold)
-                }
-                .font(.system(size: 11.5, design: .rounded))
-                .foregroundStyle(WayboundPalette.ink.opacity(0.68))
-
-                HStack(spacing: 6) {
+                HStack(spacing: 4) {
+                    Text("Bus in \(journey.departureMinutesFromNow)")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundStyle(journey.route.color)
                     TimingChip(icon: "figure.walk", label: "walk", minutes: journey.walkMinutes)
                     TimingChip(icon: "hourglass", label: "wait", minutes: journey.waitMinutes)
                     TimingChip(icon: "bus.fill", label: "ride", minutes: journey.rideMinutes)
                     Spacer(minLength: 0)
                     if journey.departureIsRealtime {
                         LiveBadge()
-                    } else {
-                        Text("Schedule")
-                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                            .foregroundStyle(WayboundPalette.ink.opacity(0.5))
                     }
                 }
             }
 
             Image(systemName: "chevron.right")
-                .font(.caption.bold())
+                .font(.system(size: 10, weight: .bold))
                 .foregroundStyle(WayboundPalette.ink.opacity(0.34))
-                .padding(.top, 17)
         }
-        .padding(12)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
         .background(.white.opacity(0.72))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(journey.route.color.opacity(0.28), lineWidth: 1)
         }
         .accessibilityElement(children: .combine)
@@ -504,7 +495,7 @@ private struct JourneyDetailSheet: View {
                     Image(systemName: "location.fill")
                         .font(.system(size: 12, weight: .bold))
                         .foregroundStyle(WayboundPalette.ink)
-                        .frame(width: 32, height: 32)
+                        .frame(width: 29, height: 29)
                         .background(.white.opacity(0.72))
                         .clipShape(Circle())
                 }
@@ -704,15 +695,15 @@ private struct TimingChip: View {
     let minutes: Int
 
     var body: some View {
-        HStack(spacing: 3) {
+        HStack(spacing: 2) {
             Image(systemName: icon)
-                .font(.system(size: 8.5, weight: .semibold))
+                .font(.system(size: 7.5, weight: .semibold))
             Text("\(label) \(minutes)")
-                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
         }
         .foregroundStyle(WayboundPalette.ink.opacity(0.68))
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 3)
         .background(WayboundPalette.ink.opacity(0.055))
         .clipShape(Capsule())
         .accessibilityLabel("\(label) \(minutes) minutes")

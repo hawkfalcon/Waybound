@@ -1605,12 +1605,22 @@ final class TransitViewModel: NSObject, ObservableObject {
             let incomingDistance = previous.distance(to: candidate)
             let outgoingDistance = candidate.distance(to: next)
             let bypassDistance = previous.distance(to: next)
-            let isSpike = incomingDistance > 300
+            let isLargeSpike = incomingDistance > 300
                 && outgoingDistance > 300
                 && bypassDistance < 75
                 && bypassDistance * 8 < incomingDistance + outgoingDistance
+            // Some official shapes insert a stop coordinate as a tiny A→B→A
+            // spur even though the vehicle remains on the street centerline.
+            // Remove only an almost-exact, short reversal; do not generalize this
+            // to loops, triangles, or ordinary turns. MTD shape shp-2-51 has
+            // exactly this seven-meter artifact at Anapamu & Santa Barbara.
+            let isTinyExactReversal = incomingDistance >= 2
+                && outgoingDistance >= 2
+                && incomingDistance <= 40
+                && outgoingDistance <= 40
+                && bypassDistance <= 2
 
-            if isSpike {
+            if isLargeSpike || isTinyExactReversal {
                 result.remove(at: index)
                 if index > 1 { index -= 1 }
             } else {
