@@ -25,8 +25,35 @@ private struct JourneyBoardingOption {
 private struct JourneyDepartureSelection {
     let option: JourneyBoardingOption
     let departure: APIDeparture
+    let trip: APITrip
     let departureDate: Date
     let departureIsRealtime: Bool
+}
+
+/// Typed rider-facing identities keep discovery, deduplication, and the final
+/// route budget from quietly using different string formats for the same route.
+private struct PublicRouteIdentity: Hashable {
+    let agency: String
+    let routeNumber: String
+
+    var isUsable: Bool { !routeNumber.isEmpty }
+    var stableText: String { "\(agency)|\(routeNumber)" }
+}
+
+private enum JourneyDirectionIdentity: Hashable {
+    case gtfs(Int)
+    case destination(String)
+}
+
+private struct JourneyPatternIdentity: Hashable {
+    let routeID: Int
+    let direction: JourneyDirectionIdentity
+    let headsign: String
+}
+
+private struct SourceRouteDirectionIdentity: Hashable {
+    let routeID: Int
+    let direction: JourneyDirectionIdentity
 }
 
 @MainActor
@@ -482,17 +509,19 @@ final class TransitViewModel: NSObject, ObservableObject {
         .filter { $0.isLetter || $0.isNumber }
     }
 
-    private func publicRouteKey(for route: TransitRoute) -> String {
-        [
-            normalizedAgencyName(route.agencyName),
-            normalizedIdentityText(route.routeNumber ?? ""),
-        ].joined(separator: "|")
+    private func publicRouteIdentity(
+        for route: TransitRoute
+    ) -> PublicRouteIdentity {
+        PublicRouteIdentity(
+            agency: normalizedAgencyName(route.agencyName),
+            routeNumber: normalizedIdentityText(route.routeNumber ?? "")
+        )
     }
 
     private func stableRouteColor(for route: TransitRoute) -> Color {
-        let publicIdentity = publicRouteKey(for: route)
+        let publicIdentity = publicRouteIdentity(for: route)
         var hash: UInt64 = 1_469_598_103_934_665_603
-        for scalar in publicIdentity.unicodeScalars {
+        for scalar in publicIdentity.stableText.unicodeScalars {
             hash ^= UInt64(scalar.value)
             hash = hash &* 1_099_511_628_211
         }
@@ -724,7 +753,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         // colorless public route uses the deterministic fallback palette.
         let officialColorsByPublicRoute = Dictionary(
             grouping: sortedRoutes,
-            by: { publicRouteKey(for: $0) }
+            by: { publicRouteIdentity(for: $0) }
         ).compactMapValues { matchingRoutes in
             matchingRoutes
                 .filter { $0.officialColorHex != nil }
@@ -733,7 +762,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         }
         return sortedRoutes.map { route in
             let officialColorHex = officialColorsByPublicRoute[
-                publicRouteKey(for: route)
+                publicRouteIdentity(for: route)
             ]
             return TransitRoute(
                 id: route.id,
@@ -809,8 +838,12 @@ final class TransitViewModel: NSObject, ObservableObject {
                     }
                     return lhs.sourceStopID < rhs.sourceStopID
                 }
-                .prefix(3)
-            optionsByRoute[route.transitlandID] = Array(sourceOptions)
+
+            // Stop discovery is already bounded and guarantees the three nearest
+            // clusters per route. Inspect every retained physical source record:
+            // distance alone cannot tell which platform serves which direction,
+            // and an early prefix can discard the only catchable return trip.
+            optionsByRoute[route.transitlandID] = sourceOptions
         }
 
         let sourceStopIDs = Set(
@@ -828,8 +861,8 @@ final class TransitViewModel: NSObject, ObservableObject {
             Double(frequencyObservationWindowSeconds)
         )
         var selections: [JourneyDepartureSelection] = []
-        var patternKeyByTripID: [Int: String] = [:]
-        var catchableTripIDsByPattern: [String: Set<Int>] = [:]
+        var patternIdentityByTripID: [Int: JourneyPatternIdentity] = [:]
+        var catchableTripIDsByPattern: [JourneyPatternIdentity: Set<Int>] = [:]
 
         for route in routes {
             var candidates: [JourneyDepartureSelection] = []
@@ -850,18 +883,19 @@ final class TransitViewModel: NSObject, ObservableObject {
                           departureDate <= latestUsefulDeparture
                     else { continue }
 
-                    let patternKey = journeyPatternKey(
+                    let patternIdentity = journeyPatternIdentity(
                         routeID: route.transitlandID,
                         trip: trip
                     )
-                    patternKeyByTripID[trip.id] = patternKey
+                    patternIdentityByTripID[trip.id] = patternIdentity
                     if departureDate <= frequencyObservationEnd {
-                        catchableTripIDsByPattern[patternKey, default: []].insert(trip.id)
+                        catchableTripIDsByPattern[patternIdentity, default: []].insert(trip.id)
                     }
                     candidates.append(
                         JourneyDepartureSelection(
                             option: option,
                             departure: departure,
+                            trip: trip,
                             departureDate: departureDate,
                             departureIsRealtime: isLiveSearch && event.isRealtime
                         )
@@ -876,10 +910,9 @@ final class TransitViewModel: NSObject, ObservableObject {
             let candidatesByPattern = Dictionary(
                 grouping: candidates,
                 by: { candidate in
-                    guard let trip = candidate.departure.trip else { return "" }
-                    return journeyPatternKey(
+                    journeyPatternIdentity(
                         routeID: route.transitlandID,
-                        trip: trip
+                        trip: candidate.trip
                     )
                 }
             )
@@ -913,13 +946,7 @@ final class TransitViewModel: NSObject, ObservableObject {
             // inbound half of routes such as 6 or 11 disappear.
             let representativesByDirection = Dictionary(
                 grouping: patternRepresentatives,
-                by: { representative in
-                    guard let trip = representative.departure.trip else {
-                        return "unknown"
-                    }
-                    return trip.directionID.map { "direction:\($0)" }
-                        ?? "destination:\(normalizedIdentityText(trip.tripHeadsign ?? ""))"
-                }
+                by: { journeyDirectionIdentity(for: $0.trip) }
             )
             var representativeSelections = representativesByDirection.values
                 .compactMap { $0.min(by: { $0.departureDate < $1.departureDate }) }
@@ -927,14 +954,11 @@ final class TransitViewModel: NSObject, ObservableObject {
                 .prefix(3)
                 .map { $0 }
             let selectedTripIDs = Set(
-                representativeSelections.compactMap { $0.departure.trip?.id }
+                representativeSelections.map(\.trip.id)
             )
             let fallbackSelections = patternRepresentatives
                 .filter { representative in
-                    guard let tripID = representative.departure.trip?.id else {
-                        return false
-                    }
-                    return !selectedTripIDs.contains(tripID)
+                    !selectedTripIDs.contains(representative.trip.id)
                 }
                 .sorted { $0.departureDate < $1.departureDate }
                 .prefix(max(0, 3 - representativeSelections.count))
@@ -945,12 +969,11 @@ final class TransitViewModel: NSObject, ObservableObject {
         let tripRequests = selections.compactMap {
             selection -> (Int, URLRequest)? in
             let routeID = selection.option.route.transitlandID
-            guard let tripID = selection.departure.trip?.id,
-                  let request = journeyTripRequest(
-                    routeID: routeID,
-                    tripID: tripID
-                  )
-            else { return nil }
+            let tripID = selection.trip.id
+            guard let request = journeyTripRequest(
+                routeID: routeID,
+                tripID: tripID
+            ) else { return nil }
             return (tripID, request)
         }
 
@@ -970,8 +993,8 @@ final class TransitViewModel: NSObject, ObservableObject {
 
         let journeyCandidates = selections.compactMap {
             selection -> RouteJourney? in
-            guard let tripID = selection.departure.trip?.id,
-                  let data = loadedTrips[tripID],
+            let tripID = selection.trip.id
+            guard let data = loadedTrips[tripID],
                   let response = try? JSONDecoder().decode(TripsResponse.self, from: data),
                   let trip = response.trips.first(where: { $0.id == tripID })
             else { return nil }
@@ -981,7 +1004,7 @@ final class TransitViewModel: NSObject, ObservableObject {
                 scheduleReferenceDate: scheduleReferenceDate
             )
         }
-        let observedDepartureCountByTripID = patternKeyByTripID.reduce(
+        let observedDepartureCountByTripID = patternIdentityByTripID.reduce(
             into: [Int: Int]()
         ) { result, item in
             result[item.key] = catchableTripIDsByPattern[item.value]?.count ?? 0
@@ -992,9 +1015,10 @@ final class TransitViewModel: NSObject, ObservableObject {
         let candidatesByDirection = Dictionary(
             grouping: journeyCandidates,
             by: { journey in
-                let direction = journey.directionID.map { "direction:\($0)" }
-                    ?? "destination:\(normalizedIdentityText(journey.destinationName))"
-                return "\(journey.route.transitlandID)|\(direction)"
+                SourceRouteDirectionIdentity(
+                    routeID: journey.route.transitlandID,
+                    direction: journeyDirectionIdentity(for: journey)
+                )
             }
         )
         let directionalJourneys = candidatesByDirection.values.compactMap {
@@ -1034,15 +1058,16 @@ final class TransitViewModel: NSObject, ObservableObject {
         // identity keeps unrelated services with the same badge separate. Retain
         // up to two directional answers for each of the eight best routes and keep
         // both directions adjacent in the compact sheet.
-        var retainedRouteKeys: [String] = []
-        var journeysByRouteKey: [String: [RouteJourney]] = [:]
-        var directionKeysByRouteKey: [String: Set<String>] = [:]
+        var retainedRouteKeys: [PublicRouteIdentity] = []
+        var journeysByRouteKey: [PublicRouteIdentity: [RouteJourney]] = [:]
+        var directionKeysByRouteKey: [
+            PublicRouteIdentity: Set<JourneyDirectionIdentity>
+        ] = [:]
         for candidate in logicalJourneys {
             guard candidate.route.routeNumber != nil else { continue }
-            let routeKey = publicRouteKey(for: candidate.route)
-            guard !routeKey.isEmpty else { continue }
-            let directionKey = candidate.directionID.map { "direction:\($0)" }
-                ?? "destination:\(normalizedIdentityText(candidate.destinationName))"
+            let routeKey = publicRouteIdentity(for: candidate.route)
+            guard routeKey.isUsable else { continue }
+            let directionKey = journeyDirectionIdentity(for: candidate)
 
             if journeysByRouteKey[routeKey] == nil {
                 guard retainedRouteKeys.count < maximumVisiblePublicRoutes else {
@@ -1059,26 +1084,59 @@ final class TransitViewModel: NSObject, ObservableObject {
         return retainedRouteKeys.flatMap { journeysByRouteKey[$0] ?? [] }
     }
 
-    private func journeyPatternKey(routeID: Int, trip: APITrip) -> String {
-        "\(routeID)|\(trip.directionID ?? -1)|\(normalizedIdentityText(trip.tripHeadsign ?? ""))"
+    private func journeyDirectionIdentity(
+        directionID: Int?,
+        destination: String?
+    ) -> JourneyDirectionIdentity {
+        if let directionID { return .gtfs(directionID) }
+        return .destination(normalizedIdentityText(destination ?? ""))
+    }
+
+    private func journeyDirectionIdentity(
+        for trip: APITrip
+    ) -> JourneyDirectionIdentity {
+        journeyDirectionIdentity(
+            directionID: trip.directionID,
+            destination: trip.tripHeadsign
+        )
+    }
+
+    private func journeyDirectionIdentity(
+        for journey: RouteJourney
+    ) -> JourneyDirectionIdentity {
+        journeyDirectionIdentity(
+            directionID: journey.directionID,
+            destination: journey.destinationName
+        )
+    }
+
+    private func journeyPatternIdentity(
+        routeID: Int,
+        trip: APITrip
+    ) -> JourneyPatternIdentity {
+        JourneyPatternIdentity(
+            routeID: routeID,
+            direction: journeyDirectionIdentity(for: trip),
+            headsign: normalizedIdentityText(trip.tripHeadsign ?? "")
+        )
     }
 
     private func journeyUtilityScore(
         _ journey: RouteJourney,
         observedDepartureCount: Int
     ) -> Int {
-        // Walk + wait remains the strongest signal, but the cost still includes
-        // the ride to the chosen flagship so ranking reflects the complete answer.
-        // Walking receives extra weight because every candidate is already within
-        // the half-mile search. Each additional catchable trip in the next 90 min
-        // offsets four minutes, capped so frequency never hides a very late bus.
+        // Overview admission answers which useful service is easiest to board:
+        // how soon it leaves, how far the rider walks, and how often it returns.
+        // Do not penalize a route for reaching a farther flagship destination;
+        // complete walk + wait + ride timing remains intact in RouteJourney and UI.
+        // Each additional catchable trip in the next 90 minutes offsets four
+        // minutes, capped so frequency never hides a very late bus.
         let frequencyBonus = min(
             maximumFrequencyBonusMinutes,
             max(0, observedDepartureCount - 1) * 4
         )
         return journey.departureMinutesFromNow * 2
             + journey.walkMinutes * 3
-            + journey.rideMinutes
             - frequencyBonus * 2
     }
 
@@ -1530,11 +1588,17 @@ final class TransitViewModel: NSObject, ObservableObject {
             .map(String.init)
             .filter { $0.count >= 3 }
         let finalIndex = stops.count - 1
-        let eligible = stops.indices.filter {
-            stops[$0].offset >= 8
+        let reachable = stops.indices.filter {
+            stops[$0].offset > 0
                 && stops[$0].offset <= maximumFlagshipRideMinutes
         }
-        guard !eligible.isEmpty else { return nil }
+        guard !reachable.isEmpty else { return nil }
+
+        // Prefer a substantial destination, but do not erase a legitimate return
+        // direction merely because the rider is already near its terminus. A short
+        // remaining trip can still answer where that side of the line goes.
+        let usefulDestinations = reachable.filter { stops[$0].offset >= 8 }
+        let eligible = usefulDestinations.isEmpty ? reachable : usefulDestinations
         return eligible.max { lhs, rhs in
                 func score(_ index: Int) -> Int {
                     let item = stops[index]

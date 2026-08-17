@@ -781,17 +781,17 @@ struct WayboundMapView: UIViewRepresentable {
                 x: (segment.start.x + segment.end.x) / 2,
                 y: (segment.start.y + segment.end.y) / 2
             )
-            var memberIDs = [journeyID]
+            var localSegmentByJourneyID = [journeyID: segment]
 
             for (candidateID, geometry) in corridorGeometryByJourneyID
             where candidateID != journeyID {
                 // Midpoint plus endpoint matching rejects crossings while still
                 // tolerating different GTFS sampling intervals on the same road.
-                let midpointIsShared = hasParallelCorridor(
+                guard let midpointSegment = parallelCorridorSegment(
                     near: midpoint,
                     direction: segment,
                     among: geometry.segments
-                )
+                ) else { continue }
                 let endpointIsShared = hasParallelCorridor(
                     near: segment.start,
                     direction: segment,
@@ -801,38 +801,58 @@ struct WayboundMapView: UIViewRepresentable {
                     direction: segment,
                     among: geometry.segments
                 )
-                if midpointIsShared && endpointIsShared {
-                    memberIDs.append(candidateID)
+                if endpointIsShared {
+                    localSegmentByJourneyID[candidateID] = midpointSegment
                 }
             }
 
-            guard memberIDs.count > 1 else { return nil }
-            memberIDs.sort {
+            guard localSegmentByJourneyID.count > 1 else { return nil }
+            let memberIDs = localSegmentByJourneyID.keys.sorted {
                 let firstOrder = corridorGeometryByJourneyID[$0]?.stackOrder ?? .max
                 let secondOrder = corridorGeometryByJourneyID[$1]?.stackOrder ?? .max
                 if firstOrder != secondOrder { return firstOrder < secondOrder }
                 return $0 < $1
             }
-            guard let laneIndex = memberIDs.firstIndex(of: journeyID) else { return nil }
+            guard let referenceID = memberIDs.first,
+                  let referenceSegment = localSegmentByJourneyID[referenceID]
+            else { return nil }
 
-            let midpointIndex = Double(memberIDs.count - 1) / 2
-            let worldSideOffset = (Double(laneIndex) - midpointIndex) * 3
+            // Partition every local corridor by physical travel direction. When
+            // both directions are present they start in touching 3-point lanes on
+            // opposite sides of the GTFS centerline; additional same-direction
+            // routes stack outward rather than crossing through the other group.
+            let alignedIDs = memberIDs.filter { memberID in
+                guard let member = localSegmentByJourneyID[memberID] else {
+                    return false
+                }
+                return member.unitX * referenceSegment.unitX
+                    + member.unitY * referenceSegment.unitY >= 0
+            }
+            let reverseIDs = memberIDs.filter { !alignedIDs.contains($0) }
 
-            // The first local member supplies a canonical corridor orientation.
-            // Reverse trips have an opposing normal, so invert their local scalar
-            // to keep every lane index on the same physical side of the road.
-            let referenceID = memberIDs[0]
-            guard referenceID != journeyID,
-                  let referenceGeometry = corridorGeometryByJourneyID[referenceID],
-                  let referenceSegment = parallelCorridorSegment(
-                    near: midpoint,
-                    direction: segment,
-                    among: referenceGeometry.segments
-                  )
-            else { return worldSideOffset }
+            let physicalOffset: Double
+            if !reverseIDs.isEmpty {
+                if let laneIndex = alignedIDs.firstIndex(of: journeyID) {
+                    physicalOffset = 1.5 + Double(laneIndex) * 3
+                } else if let laneIndex = reverseIDs.firstIndex(of: journeyID) {
+                    physicalOffset = -1.5 - Double(laneIndex) * 3
+                } else {
+                    return nil
+                }
+            } else {
+                guard let laneIndex = alignedIDs.firstIndex(of: journeyID) else {
+                    return nil
+                }
+                physicalOffset = (
+                    Double(laneIndex) - Double(alignedIDs.count - 1) / 2
+                ) * 3
+            }
+
+            // Screen-space offset normals reverse with polyline direction. Convert
+            // the canonical physical side back into this journey's local scalar.
             let directionDot = segment.unitX * referenceSegment.unitX
                 + segment.unitY * referenceSegment.unitY
-            return worldSideOffset * (directionDot >= 0 ? 1 : -1)
+            return physicalOffset * (directionDot >= 0 ? 1 : -1)
         }
 
         private func hasParallelCorridor(
