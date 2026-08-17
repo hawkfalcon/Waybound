@@ -80,7 +80,7 @@ final class TransitViewModel: NSObject, ObservableObject {
     /// stop-to-stop shapes are discarded rather than drawn as real alignments.
     private let maximumTripGeometriesPerRoute = 12
     /// Keep the map to a glanceable set of routes a rider can actually reach.
-    private let maximumVisibleJourneys = 6
+    private let maximumVisibleJourneys = 12
     private let upcomingDepartureWindowSeconds = 10_800 // 3 hours
     /// Frequency is deliberately local to the decision a rider is making now.
     /// A route earns a utility bonus only for catchable trips in the next 90 min.
@@ -737,7 +737,23 @@ final class TransitViewModel: NSObject, ObservableObject {
                         )
                     }
                 }
-                .sorted { $0.walkMinutes < $1.walkMinutes }
+                .sorted { lhs, rhs in
+                    if lhs.walkMinutes != rhs.walkMinutes {
+                        return lhs.walkMinutes < rhs.walkMinutes
+                    }
+                    let lhsDistance = originLocation.distance(from: CLLocation(
+                        latitude: lhs.sourceCoordinate.latitude,
+                        longitude: lhs.sourceCoordinate.longitude
+                    ))
+                    let rhsDistance = originLocation.distance(from: CLLocation(
+                        latitude: rhs.sourceCoordinate.latitude,
+                        longitude: rhs.sourceCoordinate.longitude
+                    ))
+                    if abs(lhsDistance - rhsDistance) > 1 {
+                        return lhsDistance < rhsDistance
+                    }
+                    return lhs.sourceStopID < rhs.sourceStopID
+                }
                 .prefix(3)
             optionsByRoute[route.transitlandID] = Array(sourceOptions)
         }
@@ -791,20 +807,44 @@ final class TransitViewModel: NSObject, ObservableObject {
                 }
             }
 
-            // A route can arrive at this stop in both directions. Inspect a few
-            // actual trips rather than accidentally choosing a bus one stop from
-            // its terminus and calling that the route's useful destination.
-            var seenPatterns: Set<String> = []
-            let representativeSelections = candidates
-                .sorted { $0.departureDate < $1.departureDate }
-                .filter { candidate in
-                    guard let trip = candidate.departure.trip else { return false }
-                    let pattern = journeyPatternKey(
+            // A route can arrive in both directions and can expose the same trip
+            // at several nearby stops. Pick the physically closest catchable stop
+            // within each direction/headsign pattern—not merely the stop where the
+            // vehicle happens to depart earliest along its run.
+            let candidatesByPattern = Dictionary(
+                grouping: candidates,
+                by: { candidate in
+                    guard let trip = candidate.departure.trip else { return "" }
+                    return journeyPatternKey(
                         routeID: route.transitlandID,
                         trip: trip
                     )
-                    return seenPatterns.insert(pattern).inserted
                 }
+            )
+            let representativeSelections = candidatesByPattern.values
+                .compactMap { patternCandidates in
+                    patternCandidates.min { lhs, rhs in
+                        let lhsDistance = originLocation.distance(from: CLLocation(
+                            latitude: lhs.option.sourceCoordinate.latitude,
+                            longitude: lhs.option.sourceCoordinate.longitude
+                        ))
+                        let rhsDistance = originLocation.distance(from: CLLocation(
+                            latitude: rhs.option.sourceCoordinate.latitude,
+                            longitude: rhs.option.sourceCoordinate.longitude
+                        ))
+                        if abs(lhsDistance - rhsDistance) > 1 {
+                            return lhsDistance < rhsDistance
+                        }
+                        if lhs.departureDate != rhs.departureDate {
+                            return lhs.departureDate < rhs.departureDate
+                        }
+                        if lhs.departureIsRealtime != rhs.departureIsRealtime {
+                            return lhs.departureIsRealtime
+                        }
+                        return lhs.option.sourceStopID < rhs.option.sourceStopID
+                    }
+                }
+                .sorted { $0.departureDate < $1.departureDate }
                 .prefix(3)
             selections.append(contentsOf: representativeSelections)
         }

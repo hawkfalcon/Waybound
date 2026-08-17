@@ -38,6 +38,13 @@ struct ContentView: View {
         viewModel.stops.first { $0.id == selectedStopID }
     }
 
+    private var displayedJourneys: [RouteJourney] {
+        guard let selectedStopRouteIDs else { return viewModel.journeys }
+        return viewModel.journeys.filter {
+            selectedStopRouteIDs.contains($0.id)
+        }
+    }
+
     private var highlightedRouteIDs: Set<Int>? {
         if let selectedJourneyID { return [selectedJourneyID] }
         return selectedStopRouteIDs
@@ -47,6 +54,7 @@ struct ContentView: View {
         let journeyRouteIDs = Set(viewModel.journeys.map(\.id))
         return viewModel.routes.filter {
             !journeyRouteIDs.contains($0.transitlandID)
+                && (selectedStopRouteIDs?.contains($0.transitlandID) ?? true)
         }
     }
 
@@ -56,7 +64,7 @@ struct ContentView: View {
             ZStack(alignment: .bottom) {
                 WayboundMapView(
                     routes: viewModel.routes,
-                    journeys: viewModel.journeys,
+                    journeys: displayedJourneys,
                     stops: viewModel.stops,
                     selectedJourneyID: selectedJourneyID,
                     selectedStopID: selectedStopID,
@@ -117,7 +125,7 @@ struct ContentView: View {
                 )
             } else {
                 JourneyOverviewSheet(
-                    journeys: viewModel.journeys,
+                    journeys: displayedJourneys,
                     unavailableRoutes: routesWithoutJourneys,
                     isLoading: viewModel.isLoading || viewModel.isLoadingJourneys,
                     highlightedRouteIDs: highlightedRouteIDs,
@@ -165,8 +173,8 @@ struct ContentView: View {
         guard let journey = viewModel.journeys.first(where: { $0.id == routeID })
         else { return }
         withAnimation(.snappy(duration: 0.3)) {
-            selectedStopID = nil
-            selectedStopRouteIDs = nil
+            // Keep a stop filter underneath route detail so Back returns to the
+            // same stop-specific context instead of restoring every nearby route.
             selectedJourneyID = routeID
         }
         if expansionPrototype == .map {
@@ -193,10 +201,11 @@ struct ContentView: View {
     }
 
     private func clearSelection() {
+        // Route expansion does not own the camera or transit-data lifecycle.
+        // Closing detail should leave both exactly where the rider put them.
         withAnimation(.snappy(duration: 0.3)) {
             selectedJourneyID = nil
         }
-        recenterMap()
     }
 
     private func recenterMap() {
