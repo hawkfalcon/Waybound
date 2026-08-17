@@ -18,6 +18,7 @@ private struct JourneyBoardingOption {
     let route: TransitRoute
     let stop: TransitStop
     let sourceStopID: Int
+    let sourceCoordinate: CLLocationCoordinate2D
     let walkMinutes: Int
 }
 
@@ -81,10 +82,19 @@ final class TransitViewModel: NSObject, ObservableObject {
     /// Keep the map to a glanceable set of routes a rider can actually reach.
     private let maximumVisibleJourneys = 6
     private let upcomingDepartureWindowSeconds = 10_800 // 3 hours
+    /// Frequency is deliberately local to the decision a rider is making now.
+    /// A route earns a utility bonus only for catchable trips in the next 90 min.
+    private let frequencyObservationWindowSeconds = 5_400
+    private let maximumFrequencyBonusMinutes = 18
     private let maximumFlagshipRideMinutes = 180
     private let routeLaneSpacingPoints: Double = 5.5
     private let minimumBoardingBufferMinutes = 2
     private let walkingMetersPerMinute: Double = 80
+    private let duplicateJourneyBoardingDistanceMeters: Double = 200
+    private let duplicateJourneyDestinationDistanceMeters: Double = 1_000
+    private let maximumShapeStopDistanceMeters: Double = 250
+    private let maximumShapeStopRMSMeters: Double = 100
+    private let maximumBoardingShapeDistanceMeters: Double = 120
     // Transitland's REST endpoint filters by radius but does not guarantee
     // distance ordering. Search outward in stages, then sort locally.
     private var stopSearchRadii: [Double] { [250, 500, radiusMeters] }
@@ -297,7 +307,8 @@ final class TransitViewModel: NSObject, ObservableObject {
                     into: [Int: Set<Int>]()
                 ) { result, routeID in
                     result[routeID] = [apiStop.id]
-                }
+                },
+                sourceStopCoordinates: [apiStop.id: coordinate]
             )
         }
     }
@@ -416,12 +427,41 @@ final class TransitViewModel: NSObject, ObservableObject {
     }
 
     private func normalizedAgencyName(_ name: String) -> String {
-        name.folding(
+        normalizedIdentityText(name)
+    }
+
+    private func normalizedIdentityText(_ value: String) -> String {
+        value.folding(
             options: [.caseInsensitive, .diacriticInsensitive],
             locale: Locale(identifier: "en_US_POSIX")
         )
         .lowercased()
         .filter { $0.isLetter || $0.isNumber }
+    }
+
+    private func normalizedPublicRouteIdentity(_ route: TransitRoute) -> String {
+        let routeNumber = normalizedIdentityText(route.routeNumber ?? "")
+        var routeName = normalizedIdentityText(route.displayName)
+        if !routeNumber.isEmpty, routeName.hasPrefix(routeNumber) {
+            routeName.removeFirst(routeNumber.count)
+        }
+        return [
+            normalizedAgencyName(route.agencyName),
+            routeNumber,
+            routeName,
+        ].joined(separator: "|")
+    }
+
+    private func stableRouteColor(for route: TransitRoute) -> Color {
+        let publicIdentity = normalizedPublicRouteIdentity(route)
+        var hash: UInt64 = 1_469_598_103_934_665_603
+        for scalar in publicIdentity.unicodeScalars {
+            hash ^= UInt64(scalar.value)
+            hash = hash &* 1_099_511_628_211
+        }
+        return WayboundPalette.routeColor(
+            at: Int(hash % UInt64(WayboundPalette.routeColors.count))
+        )
     }
 
     private func mergeNearbyStopClusters(
@@ -496,7 +536,14 @@ final class TransitViewModel: NSObject, ObservableObject {
                 agencyNames: Array(Set(cluster.flatMap { $0.agencyNames })).sorted(),
                 routeIDs: Set(cluster.flatMap { $0.routeIDs }),
                 sourceStopIDs: Set(cluster.flatMap { $0.sourceStopIDs }),
-                sourceStopIDsByRoute: sourceStopIDsByRoute
+                sourceStopIDsByRoute: sourceStopIDsByRoute,
+                sourceStopCoordinates: cluster.reduce(
+                    into: [Int: CLLocationCoordinate2D]()
+                ) { result, stop in
+                    for (sourceStopID, coordinate) in stop.sourceStopCoordinates {
+                        result[sourceStopID] = coordinate
+                    }
+                }
             )
         }
     }
@@ -633,9 +680,10 @@ final class TransitViewModel: NSObject, ObservableObject {
                     == .orderedAscending
             }
 
-        // The product palette is assigned after sorting so a route keeps one
-        // identity color across its line, stop badge, pin, and sheet row.
-        return sortedRoutes.enumerated().map { index, route in
+        // Color derives from the public route identity rather than Transitland's
+        // source ID or the nearby-route ordering. Duplicate feed records for the
+        // same public line therefore cannot acquire conflicting colors.
+        return sortedRoutes.map { route in
             TransitRoute(
                 id: route.id,
                 transitlandID: route.transitlandID,
@@ -643,7 +691,7 @@ final class TransitViewModel: NSObject, ObservableObject {
                 longName: route.longName,
                 agencyName: route.agencyName,
                 routeType: route.routeType,
-                color: WayboundPalette.routeColor(at: index),
+                color: stableRouteColor(for: route),
                 polylines: route.polylines
             )
         }
@@ -666,38 +714,32 @@ final class TransitViewModel: NSObject, ObservableObject {
         var optionsByRoute: [Int: [JourneyBoardingOption]] = [:]
 
         for route in routes {
-            let nearestStops = stops
+            let sourceOptions = stops
                 .filter { $0.routeIDs.contains(route.transitlandID) }
-                .sorted { lhs, rhs in
-                    let lhsDistance = originLocation.distance(from: CLLocation(
-                        latitude: lhs.coordinate.latitude,
-                        longitude: lhs.coordinate.longitude
-                    ))
-                    let rhsDistance = originLocation.distance(from: CLLocation(
-                        latitude: rhs.coordinate.latitude,
-                        longitude: rhs.coordinate.longitude
-                    ))
-                    return lhsDistance < rhsDistance
-                }
-                .prefix(3)
-
-            for stop in nearestStops {
-                let distance = originLocation.distance(from: CLLocation(
-                    latitude: stop.coordinate.latitude,
-                    longitude: stop.coordinate.longitude
-                ))
-                let walkMinutes = max(1, Int(ceil(distance / walkingMetersPerMinute)))
-                for sourceStopID in stop.sourceStopIDsByRoute[route.transitlandID] ?? [] {
-                    optionsByRoute[route.transitlandID, default: []].append(
-                        JourneyBoardingOption(
+                .flatMap { stop -> [JourneyBoardingOption] in
+                    (stop.sourceStopIDsByRoute[route.transitlandID] ?? []).map {
+                        sourceStopID in
+                        let sourceCoordinate = stop.sourceStopCoordinates[sourceStopID]
+                            ?? stop.coordinate
+                        let distance = originLocation.distance(from: CLLocation(
+                            latitude: sourceCoordinate.latitude,
+                            longitude: sourceCoordinate.longitude
+                        ))
+                        return JourneyBoardingOption(
                             route: route,
                             stop: stop,
                             sourceStopID: sourceStopID,
-                            walkMinutes: walkMinutes
+                            sourceCoordinate: sourceCoordinate,
+                            walkMinutes: max(
+                                1,
+                                Int(ceil(distance / walkingMetersPerMinute))
+                            )
                         )
-                    )
+                    }
                 }
-            }
+                .sorted { $0.walkMinutes < $1.walkMinutes }
+                .prefix(3)
+            optionsByRoute[route.transitlandID] = Array(sourceOptions)
         }
 
         let sourceStopIDs = Set(
@@ -708,7 +750,12 @@ final class TransitViewModel: NSObject, ObservableObject {
         let latestUsefulDeparture = now.addingTimeInterval(
             Double(upcomingDepartureWindowSeconds)
         )
+        let frequencyObservationEnd = now.addingTimeInterval(
+            Double(frequencyObservationWindowSeconds)
+        )
         var selections: [JourneyDepartureSelection] = []
+        var patternKeyByTripID: [Int: String] = [:]
+        var catchableTripIDsByPattern: [String: Set<Int>] = [:]
 
         for route in routes {
             var candidates: [JourneyDepartureSelection] = []
@@ -717,13 +764,22 @@ final class TransitViewModel: NSObject, ObservableObject {
                     Double(option.walkMinutes + minimumBoardingBufferMinutes) * 60
                 )
                 for departure in departuresByStop[option.sourceStopID] ?? [] {
-                    guard departure.trip?.route?.id == route.transitlandID,
+                    guard let trip = departure.trip,
+                          trip.route?.id == route.transitlandID,
                           let event = departure.departure ?? departure.arrival,
                           let departureDate = event.effectiveDate,
                           departureDate >= earliestBoardableDate,
                           departureDate <= latestUsefulDeparture
                     else { continue }
 
+                    let patternKey = journeyPatternKey(
+                        routeID: route.transitlandID,
+                        trip: trip
+                    )
+                    patternKeyByTripID[trip.id] = patternKey
+                    if departureDate <= frequencyObservationEnd {
+                        catchableTripIDsByPattern[patternKey, default: []].insert(trip.id)
+                    }
                     candidates.append(
                         JourneyDepartureSelection(
                             option: option,
@@ -743,7 +799,10 @@ final class TransitViewModel: NSObject, ObservableObject {
                 .sorted { $0.departureDate < $1.departureDate }
                 .filter { candidate in
                     guard let trip = candidate.departure.trip else { return false }
-                    let pattern = "\(trip.directionID ?? -1)|\(trip.tripHeadsign ?? "")"
+                    let pattern = journeyPatternKey(
+                        routeID: route.transitlandID,
+                        trip: trip
+                    )
                     return seenPatterns.insert(pattern).inserted
                 }
                 .prefix(3)
@@ -785,6 +844,11 @@ final class TransitViewModel: NSObject, ObservableObject {
             else { return nil }
             return makeJourney(from: trip, selection: selection, now: now)
         }
+        let observedDepartureCountByTripID = patternKeyByTripID.reduce(
+            into: [Int: Int]()
+        ) { result, item in
+            result[item.key] = catchableTripIDsByPattern[item.value]?.count ?? 0
+        }
         let candidatesByRoute = Dictionary(
             grouping: journeyCandidates,
             by: { $0.route.transitlandID }
@@ -794,37 +858,34 @@ final class TransitViewModel: NSObject, ObservableObject {
             let usefulCandidates = candidates.filter { $0.rideMinutes >= 8 }
             let pool = usefulCandidates.isEmpty ? candidates : usefulCandidates
             return pool.min {
-                if $0.departureDate != $1.departureDate {
-                    return $0.departureDate < $1.departureDate
-                }
-                return $0.totalMinutes < $1.totalMinutes
+                journeyRanksAhead(
+                    $0,
+                    of: $1,
+                    observedDepartureCounts: observedDepartureCountByTripID,
+                    origin: originLocation
+                )
             }
         }
 
-        // Proximity is the primary map-ranking signal. Departure time breaks
-        // ties between routes boarding at the same pole or intersection.
-        var journeys = Array(
-            allJourneys.sorted { lhs, rhs in
-                let lhsDistance = originLocation.distance(from: CLLocation(
-                    latitude: lhs.boardingStop.coordinate.latitude,
-                    longitude: lhs.boardingStop.coordinate.longitude
-                ))
-                let rhsDistance = originLocation.distance(from: CLLocation(
-                    latitude: rhs.boardingStop.coordinate.latitude,
-                    longitude: rhs.boardingStop.coordinate.longitude
-                ))
-                if abs(lhsDistance - rhsDistance) > 1 {
-                    return lhsDistance < rhsDistance
-                }
-                if lhs.departureDate != rhs.departureDate {
-                    return lhs.departureDate < rhs.departureDate
-                }
-                return lhs.route.fullDisplayName.localizedStandardCompare(
-                    rhs.route.fullDisplayName
-                ) == .orderedAscending
-            }
-            .prefix(maximumVisibleJourneys)
-        )
+        // Transitland may expose the same public line through more than one feed
+        // or route record. Rank first, then retain only the most useful departure
+        // for a matching public route, destination, and physical journey.
+        let utilityOrderedJourneys = allJourneys.sorted {
+            journeyRanksAhead(
+                $0,
+                of: $1,
+                observedDepartureCounts: observedDepartureCountByTripID,
+                origin: originLocation
+            )
+        }
+        var logicalJourneys: [RouteJourney] = []
+        for candidate in utilityOrderedJourneys {
+            guard !logicalJourneys.contains(where: {
+                representsSamePublicJourney($0, candidate)
+            }) else { continue }
+            logicalJourneys.append(candidate)
+        }
+        var journeys = Array(logicalJourneys.prefix(maximumVisibleJourneys))
 
         let midpoint = Double(max(0, journeys.count - 1)) / 2
         journeys = journeys.enumerated().map { index, journey in
@@ -834,6 +895,85 @@ final class TransitViewModel: NSObject, ObservableObject {
             )
         }
         return journeys
+    }
+
+    private func journeyPatternKey(routeID: Int, trip: APITrip) -> String {
+        "\(routeID)|\(trip.directionID ?? -1)|\(normalizedIdentityText(trip.tripHeadsign ?? ""))"
+    }
+
+    private func journeyUtilityScore(
+        _ journey: RouteJourney,
+        observedDepartureCount: Int
+    ) -> Int {
+        // Walk + wait remains the strongest signal, but the cost still includes
+        // the ride to the chosen flagship so ranking reflects the complete answer.
+        // Walking receives extra weight because every candidate is already within
+        // the half-mile search. Each additional catchable trip in the next 90 min
+        // offsets four minutes, capped so frequency never hides a very late bus.
+        let frequencyBonus = min(
+            maximumFrequencyBonusMinutes,
+            max(0, observedDepartureCount - 1) * 4
+        )
+        return journey.departureMinutesFromNow * 2
+            + journey.walkMinutes * 3
+            + journey.rideMinutes
+            - frequencyBonus * 2
+    }
+
+    private func journeyRanksAhead(
+        _ lhs: RouteJourney,
+        of rhs: RouteJourney,
+        observedDepartureCounts: [Int: Int],
+        origin: CLLocation
+    ) -> Bool {
+        let lhsScore = journeyUtilityScore(
+            lhs,
+            observedDepartureCount: observedDepartureCounts[lhs.tripID] ?? 0
+        )
+        let rhsScore = journeyUtilityScore(
+            rhs,
+            observedDepartureCount: observedDepartureCounts[rhs.tripID] ?? 0
+        )
+        if lhsScore != rhsScore { return lhsScore < rhsScore }
+        if lhs.departureDate != rhs.departureDate {
+            return lhs.departureDate < rhs.departureDate
+        }
+
+        let lhsDistance = origin.distance(from: CLLocation(
+            latitude: lhs.boardingStop.coordinate.latitude,
+            longitude: lhs.boardingStop.coordinate.longitude
+        ))
+        let rhsDistance = origin.distance(from: CLLocation(
+            latitude: rhs.boardingStop.coordinate.latitude,
+            longitude: rhs.boardingStop.coordinate.longitude
+        ))
+        if abs(lhsDistance - rhsDistance) > 1 {
+            return lhsDistance < rhsDistance
+        }
+        if lhs.departureIsRealtime != rhs.departureIsRealtime {
+            return lhs.departureIsRealtime
+        }
+        return lhs.route.fullDisplayName.localizedStandardCompare(
+            rhs.route.fullDisplayName
+        ) == .orderedAscending
+    }
+
+    private func representsSamePublicJourney(
+        _ first: RouteJourney,
+        _ second: RouteJourney
+    ) -> Bool {
+        guard normalizedPublicRouteIdentity(first.route)
+                == normalizedPublicRouteIdentity(second.route)
+        else { return false }
+
+        let boardingDistance = MKMapPoint(first.boardingStop.coordinate).distance(
+            to: MKMapPoint(second.boardingStop.coordinate)
+        )
+        let destinationDistance = MKMapPoint(first.destinationCoordinate).distance(
+            to: MKMapPoint(second.destinationCoordinate)
+        )
+        return boardingDistance <= duplicateJourneyBoardingDistanceMeters
+            && destinationDistance <= duplicateJourneyDestinationDistanceMeters
     }
 
     private func fetchUpcomingDepartures(
@@ -1004,11 +1144,25 @@ final class TransitViewModel: NSObject, ObservableObject {
             departureMinutesFromNow - selection.option.walkMinutes
         )
         let totalMinutes = selection.option.walkMinutes + waitMinutes + flagship.offset
+        let exactBoardingCoordinate = coordinate(for: stopTimes[boardingIndex].stop)
+            ?? selection.option.sourceCoordinate
+        let logicalStop = selection.option.stop
+        let routeBoardingStop = TransitStop(
+            id: logicalStop.id,
+            name: logicalStop.name,
+            coordinate: exactBoardingCoordinate,
+            routeNames: logicalStop.routeNames,
+            agencyNames: logicalStop.agencyNames,
+            routeIDs: logicalStop.routeIDs,
+            sourceStopIDs: logicalStop.sourceStopIDs,
+            sourceStopIDsByRoute: logicalStop.sourceStopIDsByRoute,
+            sourceStopCoordinates: logicalStop.sourceStopCoordinates
+        )
 
         return RouteJourney(
             route: selection.option.route,
             tripID: trip.id,
-            boardingStop: selection.option.stop,
+            boardingStop: routeBoardingStop,
             sourceStopID: selection.option.sourceStopID,
             destinationName: destinationName,
             destinationCoordinate: flagshipCoordinate,
@@ -1154,13 +1308,17 @@ final class TransitViewModel: NSObject, ObservableObject {
         }
 
         guard let best,
-              best.maximumDistance <= 500,
-              best.fitScore <= 200,
+              best.maximumDistance <= maximumShapeStopDistanceMeters,
+              best.fitScore <= maximumShapeStopRMSMeters,
               let boardingIndex = best.indices.first,
               let finalIndex = best.indices.last
         else { return nil }
+        let boardingShapeDistance = MKMapPoint(orderedStops[0]).distance(
+            to: MKMapPoint(best.line[boardingIndex])
+        )
         let flagshipIndex = best.indices[flagshipStopIndex]
-        guard flagshipIndex > boardingIndex,
+        guard boardingShapeDistance <= maximumBoardingShapeDistanceMeters,
+              flagshipIndex > boardingIndex,
               finalIndex >= flagshipIndex
         else { return nil }
 

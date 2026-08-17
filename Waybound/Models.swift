@@ -18,6 +18,10 @@ struct TransitStop: Identifiable, Equatable {
     /// Preserves the physical Transitland stop record used by each route so
     /// departure lookups do not accidentally query only the cluster winner.
     let sourceStopIDsByRoute: [Int: Set<Int>]
+    /// Coordinates stay keyed to their source records after several colocated
+    /// records become one logical stop. Journey walking and route anchoring must
+    /// use the exact platform served by the selected trip, not the cluster winner.
+    let sourceStopCoordinates: [Int: CLLocationCoordinate2D]
 
     static func == (lhs: TransitStop, rhs: TransitStop) -> Bool {
         lhs.id == rhs.id
