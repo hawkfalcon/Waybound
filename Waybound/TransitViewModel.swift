@@ -841,7 +841,11 @@ final class TransitViewModel: NSObject, ObservableObject {
                     guard let trip = departure.trip,
                           trip.route?.id == route.transitlandID,
                           let event = departure.departure ?? departure.arrival,
-                          let departureDate = event.effectiveDate,
+                          let departureDate = riderFacingDepartureDate(
+                              for: event,
+                              scheduleReferenceDate: scheduleReferenceDate,
+                              isLiveSearch: isLiveSearch
+                          ),
                           departureDate >= earliestBoardableDate,
                           departureDate <= latestUsefulDeparture
                     else { continue }
@@ -1172,6 +1176,63 @@ final class TransitViewModel: NSObject, ObservableObject {
         return nil
     }
 
+    /// Transitland's service-window fallback returns a trip from its representative
+    /// service week, including that older week's timestamps. For a future preview,
+    /// preserve the returned local wall-clock time but place it on the date the
+    /// rider selected; otherwise the normal eligibility filter rejects the fallback
+    /// as a bus that departed days ago.
+    private func riderFacingDepartureDate(
+        for event: APIStopTimeEvent,
+        scheduleReferenceDate: Date,
+        isLiveSearch: Bool
+    ) -> Date? {
+        guard !isLiveSearch else { return event.effectiveDate }
+        guard let sourceDate = event.scheduledDate ?? event.effectiveDate else {
+            return nil
+        }
+
+        let calendar = Calendar.autoupdatingCurrent
+        let components: (hour: Int, minute: Int, second: Int)
+        if let localComponents = localClockComponents(from: event.scheduledLocal) {
+            components = localComponents
+        } else {
+            let dateComponents = calendar.dateComponents(
+                [.hour, .minute, .second],
+                from: sourceDate
+            )
+            guard let hour = dateComponents.hour,
+                  let minute = dateComponents.minute
+            else { return nil }
+            components = (hour, minute, dateComponents.second ?? 0)
+        }
+
+        return calendar.date(
+            bySettingHour: components.hour,
+            minute: components.minute,
+            second: components.second,
+            of: scheduleReferenceDate
+        )
+    }
+
+    private func localClockComponents(
+        from localTimestamp: String?
+    ) -> (hour: Int, minute: Int, second: Int)? {
+        guard let localTimestamp, !localTimestamp.isEmpty else { return nil }
+        let clockText = localTimestamp.split(separator: "T").last
+            ?? Substring(localTimestamp)
+        let parts = clockText.split(separator: ":", maxSplits: 2)
+        guard parts.count >= 2,
+              let hour = Int(parts[0]),
+              let minute = Int(parts[1]),
+              (0...23).contains(hour),
+              (0...59).contains(minute)
+        else { return nil }
+        let secondDigits = parts.count > 2
+            ? parts[2].prefix { $0.isNumber } : Substring("0")
+        let second = Int(secondDigits) ?? 0
+        return (hour, minute, min(max(second, 0), 59))
+    }
+
     private func fetchUpcomingDepartures(
         for stopIDs: Set<Int>,
         scheduleReferenceDate: Date,
@@ -1228,7 +1289,14 @@ final class TransitViewModel: NSObject, ObservableObject {
             URLQueryItem(name: "limit", value: "200"),
             URLQueryItem(name: "include_geometry", value: "false"),
             URLQueryItem(name: "include_alerts", value: "false"),
-            URLQueryItem(name: "use_service_window", value: "false"),
+            // A future agency feed can be published before Transitland promotes
+            // it to the active version. In that brief boundary, allow the API's
+            // matching-week fallback rather than dropping that agency entirely.
+            // Dates covered by the active feed still use their exact schedule.
+            URLQueryItem(
+                name: "use_service_window",
+                value: isLiveSearch ? "false" : "true"
+            ),
         ]
 
         if isLiveSearch {
