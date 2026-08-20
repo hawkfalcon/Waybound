@@ -11,6 +11,15 @@ struct WayboundCameraRequest: Equatable {
     }
 }
 
+private enum RouteMapStyle {
+    // Keep the color strokes almost touching, but leave enough room for a very
+    // thin separator so no route can paint over its neighbor at any zoom level.
+    static let laneSpacingPoints: Double = 3.25
+    static let standardLineWidth: Double = 3
+    static let selectedLineWidth: Double = 3.2
+    static let casingExpansion: Double = 0.5
+}
+
 struct WayboundMapView: UIViewRepresentable {
     let routes: [TransitRoute]
     let journeys: [RouteJourney]
@@ -148,7 +157,7 @@ struct WayboundMapView: UIViewRepresentable {
                     journeyID: journey.id,
                     color: UIColor(journey.route.color),
                     opacity: isHighlighted ? 0.22 : 0.05,
-                    lineWidth: 3,
+                    lineWidth: RouteMapStyle.standardLineWidth,
                     dashed: false,
                     to: mapView
                 )
@@ -166,7 +175,9 @@ struct WayboundMapView: UIViewRepresentable {
                     journeyID: journey.id,
                     color: UIColor(journey.route.color),
                     opacity: opacity,
-                    lineWidth: isSelected ? 4.5 : (isHighlighted ? 3 : 2.5),
+                    lineWidth: isSelected
+                        ? RouteMapStyle.selectedLineWidth
+                        : (isHighlighted ? RouteMapStyle.standardLineWidth : 2.5),
                     dashed: false,
                     to: mapView
                 )
@@ -180,7 +191,7 @@ struct WayboundMapView: UIViewRepresentable {
                         journeyID: journey.id,
                         color: UIColor(journey.route.color),
                         opacity: 0.58,
-                        lineWidth: 3,
+                        lineWidth: RouteMapStyle.standardLineWidth,
                         dashed: true,
                         to: mapView
                     )
@@ -536,6 +547,13 @@ struct WayboundMapView: UIViewRepresentable {
 
         private func routeStopAnnotations() -> [RouteStopMapAnnotation] {
             let mergeDistance: CLLocationDistance = 12
+            let boardingStopSuppressionDistance: CLLocationDistance = 28
+            let boardingStopLocations = parent.journeys.map {
+                CLLocation(
+                    latitude: $0.boardingStop.coordinate.latitude,
+                    longitude: $0.boardingStop.coordinate.longitude
+                )
+            }
             var groups: [[RouteStopMarker]] = []
 
             for journey in parent.journeys {
@@ -578,6 +596,17 @@ struct WayboundMapView: UIViewRepresentable {
                     longitude: group.map { $0.stop.coordinate.longitude }
                         .reduce(0, +) / Double(group.count)
                 )
+                let markerLocation = CLLocation(
+                    latitude: coordinate.latitude,
+                    longitude: coordinate.longitude
+                )
+                // A prominent boarding marker already represents this physical
+                // stop. Do not also place a small route dot where it can sit on top.
+                guard boardingStopLocations.allSatisfy({ location in
+                    markerLocation.distance(from: location) >
+                        boardingStopSuppressionDistance
+                }) else { return nil }
+
                 let sortedJourneys = group.map(\.journey).sorted {
                     $0.route.fullDisplayName.localizedStandardCompare(
                         $1.route.fullDisplayName
@@ -752,7 +781,18 @@ struct WayboundMapView: UIViewRepresentable {
                 alignmentDeltaY[index] /= Double(offsetCounts[index])
                 return offsetSums[index] / Double(offsetCounts[index])
             }
-            let explicitlyStacked = offsetCounts.map { $0 > 0 }
+            var explicitlyStacked = offsetCounts.map { $0 > 0 }
+
+            // GTFS shapes often sample the same curve at different positions. Fill
+            // short misses between two confidently stacked vertices so a strand
+            // cannot briefly fall through the middle of its bundle.
+            bridgeShortCorridorGaps(
+                points: points,
+                explicitlyStacked: &explicitlyStacked,
+                offsets: &offsets,
+                deltaX: &alignmentDeltaX,
+                deltaY: &alignmentDeltaY
+            )
 
             // Fade both the lane and the small centerline correction back to the
             // route's own shape. Branches peel away gradually instead of gaining a
@@ -802,6 +842,64 @@ struct WayboundMapView: UIViewRepresentable {
                 coordinates: alignedCoordinates,
                 offsets: offsets
             )
+        }
+
+        private func bridgeShortCorridorGaps(
+            points: [MKMapPoint],
+            explicitlyStacked: inout [Bool],
+            offsets: inout [Double],
+            deltaX: inout [Double],
+            deltaY: inout [Double]
+        ) {
+            let maximumGapDistance: CLLocationDistance = 72
+            guard points.count > 2,
+                  points.count == explicitlyStacked.count
+            else { return }
+
+            var leftIndex = 0
+            while leftIndex < points.count - 1 {
+                guard explicitlyStacked[leftIndex] else {
+                    leftIndex += 1
+                    continue
+                }
+
+                var rightIndex = leftIndex + 1
+                var gapDistance: CLLocationDistance = 0
+                while rightIndex < points.count {
+                    gapDistance += points[rightIndex - 1].distance(
+                        to: points[rightIndex]
+                    )
+                    if explicitlyStacked[rightIndex] { break }
+                    rightIndex += 1
+                }
+
+                guard rightIndex < points.count else { break }
+                defer { leftIndex = rightIndex }
+                guard rightIndex > leftIndex + 1,
+                      gapDistance <= maximumGapDistance
+                else { continue }
+
+                let leftOffset = offsets[leftIndex]
+                let rightOffset = offsets[rightIndex]
+                // Opposite signs can represent a legitimate local lane recentering.
+                // Let that transition happen naturally instead of forcing a route
+                // through the center of another strand.
+                guard leftOffset * rightOffset >= 0 else { continue }
+
+                var distanceFromLeft: CLLocationDistance = 0
+                for index in (leftIndex + 1)..<rightIndex {
+                    distanceFromLeft += points[index - 1].distance(to: points[index])
+                    let progress = gapDistance > 0
+                        ? distanceFromLeft / gapDistance : 0
+                    offsets[index] = leftOffset
+                        + (rightOffset - leftOffset) * progress
+                    deltaX[index] = deltaX[leftIndex]
+                        + (deltaX[rightIndex] - deltaX[leftIndex]) * progress
+                    deltaY[index] = deltaY[leftIndex]
+                        + (deltaY[rightIndex] - deltaY[leftIndex]) * progress
+                    explicitlyStacked[index] = true
+                }
+            }
         }
 
         private func applyTaperedLayout(
@@ -873,8 +971,8 @@ struct WayboundMapView: UIViewRepresentable {
             else { return nil }
 
             // Partition every local corridor by physical travel direction. When
-            // both directions are present they start in touching 3-point lanes on
-            // opposite sides of the GTFS centerline; additional same-direction
+            // both directions are present they start in adjacent fixed-width lanes
+            // on opposite sides of the GTFS centerline; additional same-direction
             // routes stack outward rather than crossing through the other group.
             let alignedIDs = memberIDs.filter { memberID in
                 guard let member = localSegmentByJourneyID[memberID] else {
@@ -885,12 +983,15 @@ struct WayboundMapView: UIViewRepresentable {
             }
             let reverseIDs = memberIDs.filter { !alignedIDs.contains($0) }
 
+            let laneSpacing = RouteMapStyle.laneSpacingPoints
             let physicalOffset: Double
             if !reverseIDs.isEmpty {
                 if let laneIndex = alignedIDs.firstIndex(of: journeyID) {
-                    physicalOffset = 1.5 + Double(laneIndex) * 3
+                    physicalOffset = laneSpacing / 2
+                        + Double(laneIndex) * laneSpacing
                 } else if let laneIndex = reverseIDs.firstIndex(of: journeyID) {
-                    physicalOffset = -1.5 - Double(laneIndex) * 3
+                    physicalOffset = -laneSpacing / 2
+                        - Double(laneIndex) * laneSpacing
                 } else {
                     return nil
                 }
@@ -900,7 +1001,7 @@ struct WayboundMapView: UIViewRepresentable {
                 }
                 physicalOffset = (
                     Double(laneIndex) - Double(alignedIDs.count - 1) / 2
-                ) * 3
+                ) * laneSpacing
             }
 
             let alignedStart: MKMapPoint
@@ -981,7 +1082,10 @@ struct WayboundMapView: UIViewRepresentable {
             direction: MapRouteSegment,
             among candidates: [MapRouteSegment]
         ) -> MapRouteSegment? {
-            let maximumSeparation: CLLocationDistance = 20
+            // Two operators can publish centerlines on opposite sides of the same
+            // wide street. Keep enough tolerance to recognize that shared road,
+            // while the strict tangent test still rejects crossings and turns.
+            let maximumSeparation: CLLocationDistance = 28
             let minimumParallelDot = 0.93
             return candidates
                 .filter { candidate in
@@ -1333,7 +1437,9 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
             ).cgColor
         )
         context.setLineWidth(
-            CGFloat(routeOverlay.lineWidth + 1.0) / zoomScale
+            CGFloat(
+                routeOverlay.lineWidth + RouteMapStyle.casingExpansion
+            ) / zoomScale
         )
         context.strokePath()
 
@@ -1706,6 +1812,7 @@ private final class RouteStopAnnotationView: MKAnnotationView {
         centerOffset = .zero
         collisionMode = .none
         displayPriority = .required
+        zPriority = .min
         backgroundColor = .clear
         isUserInteractionEnabled = false
         isAccessibilityElement = false
@@ -1767,6 +1874,7 @@ private final class StopClusterAnnotationView: MKAnnotationView {
         centerOffset = .zero
         collisionMode = .rectangle
         displayPriority = .defaultHigh
+        zPriority = .max
         canShowCallout = false
 
         backgroundColor = UIColor.white.withAlphaComponent(0.97)
@@ -1848,6 +1956,7 @@ private final class LadderStopAnnotationView: MKAnnotationView {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
         collisionMode = .rectangle
         displayPriority = .required
+        zPriority = .max
         canShowCallout = false
     }
 
