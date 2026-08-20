@@ -672,17 +672,17 @@ struct WayboundMapView: UIViewRepresentable {
             to mapView: MKMapView
         ) {
             for coordinates in polylines where coordinates.count >= 2 {
-                let laneOffsets = sharedCorridorLaneOffsets(
+                let laneLayout = sharedCorridorLaneLayout(
                     for: coordinates,
                     journeyID: journeyID
                 )
                 let overlay = RouteLaneOverlay(
-                    coordinates: coordinates,
+                    coordinates: laneLayout.coordinates,
                     journeyID: journeyID,
                     color: color,
                     opacity: opacity,
                     lineWidth: lineWidth,
-                    laneOffsetPoints: laneOffsets,
+                    laneOffsetPoints: laneLayout.offsets,
                     dashed: dashed
                 )
                 routeOverlays.append(overlay)
@@ -704,79 +704,134 @@ struct WayboundMapView: UIViewRepresentable {
             }
         }
 
-        /// Isolated geometry remains on the authoritative GTFS centerline. On a
-        /// shared road, only the journeys actually present on that local corridor
-        /// receive consecutive three-point lanes. Because each lane is three
-        /// points wide, neighboring route colors touch instead of floating apart.
-        private func sharedCorridorLaneOffsets(
+        /// Isolated geometry remains on its authoritative GTFS centerline. Routes
+        /// sharing one road first align to a single local corridor spine and then
+        /// receive consecutive three-point lanes. This produces one compact ribbon
+        /// instead of several almost-parallel shapes drifting across the road.
+        private func sharedCorridorLaneLayout(
             for coordinates: [CLLocationCoordinate2D],
             journeyID: Int
-        ) -> [Double] {
+        ) -> CorridorLaneLayout {
             guard coordinates.count >= 2 else {
-                return Array(repeating: 0, count: coordinates.count)
+                return CorridorLaneLayout(
+                    coordinates: coordinates,
+                    offsets: Array(repeating: 0, count: coordinates.count)
+                )
             }
 
             let points = coordinates.map { MKMapPoint($0) }
             var offsetSums = Array(repeating: 0.0, count: points.count)
             var offsetCounts = Array(repeating: 0, count: points.count)
+            var alignmentDeltaX = Array(repeating: 0.0, count: points.count)
+            var alignmentDeltaY = Array(repeating: 0.0, count: points.count)
 
             for index in 0..<(points.count - 1) {
                 guard let segment = MapRouteSegment(
                     start: points[index],
                     end: points[index + 1]
                 ),
-                      let offset = sharedCorridorLaneOffset(
+                      let layout = sharedCorridorSegmentLayout(
                         for: segment,
                         journeyID: journeyID
                       )
                 else { continue }
 
-                offsetSums[index] += offset
-                offsetSums[index + 1] += offset
+                offsetSums[index] += layout.offset
+                offsetSums[index + 1] += layout.offset
                 offsetCounts[index] += 1
                 offsetCounts[index + 1] += 1
+                alignmentDeltaX[index] += layout.alignedStart.x - points[index].x
+                alignmentDeltaY[index] += layout.alignedStart.y - points[index].y
+                alignmentDeltaX[index + 1] += layout.alignedEnd.x - points[index + 1].x
+                alignmentDeltaY[index + 1] += layout.alignedEnd.y - points[index + 1].y
             }
 
             var offsets = offsetSums.indices.map { index in
                 guard offsetCounts[index] > 0 else { return 0.0 }
+                alignmentDeltaX[index] /= Double(offsetCounts[index])
+                alignmentDeltaY[index] /= Double(offsetCounts[index])
                 return offsetSums[index] / Double(offsetCounts[index])
             }
             let explicitlyStacked = offsetCounts.map { $0 > 0 }
 
-            // Fade a lane back to zero over a short geographic distance. Signed
-            // propagation preserves the chosen side of the road and prevents a
-            // sudden diagonal jog at the beginning or end of a shared corridor.
+            // Fade both the lane and the small centerline correction back to the
+            // route's own shape. Branches peel away gradually instead of gaining a
+            // diagonal connector where a shared corridor starts or ends.
             let taperDistance: CLLocationDistance = 42
             if offsets.count > 1 {
                 for index in 1..<offsets.count where !explicitlyStacked[index] {
-                    let distance = points[index - 1].distance(to: points[index])
-                    let candidate = offsets[index - 1] * max(
+                    let factor = max(
                         0,
-                        1 - distance / taperDistance
+                        1 - points[index - 1].distance(to: points[index])
+                            / taperDistance
                     )
-                    if abs(candidate) > abs(offsets[index]) {
-                        offsets[index] = candidate
-                    }
+                    applyTaperedLayout(
+                        from: index - 1,
+                        to: index,
+                        factor: factor,
+                        offsets: &offsets,
+                        deltaX: &alignmentDeltaX,
+                        deltaY: &alignmentDeltaY
+                    )
                 }
                 for index in stride(from: offsets.count - 2, through: 0, by: -1)
                 where !explicitlyStacked[index] {
-                    let distance = points[index].distance(to: points[index + 1])
-                    let candidate = offsets[index + 1] * max(
+                    let factor = max(
                         0,
-                        1 - distance / taperDistance
+                        1 - points[index].distance(to: points[index + 1])
+                            / taperDistance
                     )
-                    if abs(candidate) > abs(offsets[index]) {
-                        offsets[index] = candidate
-                    }
+                    applyTaperedLayout(
+                        from: index + 1,
+                        to: index,
+                        factor: factor,
+                        offsets: &offsets,
+                        deltaX: &alignmentDeltaX,
+                        deltaY: &alignmentDeltaY
+                    )
                 }
             }
-            return offsets
+
+            let alignedCoordinates = points.indices.map { index in
+                MKMapPoint(
+                    x: points[index].x + alignmentDeltaX[index],
+                    y: points[index].y + alignmentDeltaY[index]
+                ).coordinate
+            }
+            return CorridorLaneLayout(
+                coordinates: alignedCoordinates,
+                offsets: offsets
+            )
         }
 
-        private func sharedCorridorLaneOffset(
+        private func applyTaperedLayout(
+            from sourceIndex: Int,
+            to destinationIndex: Int,
+            factor: Double,
+            offsets: inout [Double],
+            deltaX: inout [Double],
+            deltaY: inout [Double]
+        ) {
+            let candidateOffset = offsets[sourceIndex] * factor
+            if abs(candidateOffset) > abs(offsets[destinationIndex]) {
+                offsets[destinationIndex] = candidateOffset
+            }
+
+            let candidateX = deltaX[sourceIndex] * factor
+            let candidateY = deltaY[sourceIndex] * factor
+            if hypot(candidateX, candidateY) > hypot(
+                deltaX[destinationIndex],
+                deltaY[destinationIndex]
+            ) {
+                deltaX[destinationIndex] = candidateX
+                deltaY[destinationIndex] = candidateY
+            }
+        }
+
+        private func sharedCorridorSegmentLayout(
             for segment: MapRouteSegment,
             journeyID: Int
-        ) -> Double? {
+        ) -> CorridorSegmentLayout? {
             let midpoint = MKMapPoint(
                 x: (segment.start.x + segment.end.x) / 2,
                 y: (segment.start.y + segment.end.y) / 2
@@ -848,11 +903,65 @@ struct WayboundMapView: UIViewRepresentable {
                 ) * 3
             }
 
+            let alignedStart: MKMapPoint
+            let alignedEnd: MKMapPoint
+            if referenceID == journeyID {
+                alignedStart = segment.start
+                alignedEnd = segment.end
+            } else if let referenceGeometry = corridorGeometryByJourneyID[referenceID] {
+                alignedStart = corridorProjection(
+                    of: segment.start,
+                    parallelTo: segment,
+                    onto: referenceGeometry.segments
+                )
+                alignedEnd = corridorProjection(
+                    of: segment.end,
+                    parallelTo: segment,
+                    onto: referenceGeometry.segments
+                )
+            } else {
+                alignedStart = segment.start
+                alignedEnd = segment.end
+            }
+
             // Screen-space offset normals reverse with polyline direction. Convert
             // the canonical physical side back into this journey's local scalar.
             let directionDot = segment.unitX * referenceSegment.unitX
                 + segment.unitY * referenceSegment.unitY
-            return physicalOffset * (directionDot >= 0 ? 1 : -1)
+            return CorridorSegmentLayout(
+                offset: physicalOffset * (directionDot >= 0 ? 1 : -1),
+                alignedStart: alignedStart,
+                alignedEnd: alignedEnd
+            )
+        }
+
+        /// Remove only perpendicular drift from a member shape. Longitudinal
+        /// progress remains untouched, so routes share the same road spine without
+        /// bunching samples together or inventing shortcuts at intersections.
+        private func corridorProjection(
+            of point: MKMapPoint,
+            parallelTo direction: MapRouteSegment,
+            onto candidates: [MapRouteSegment]
+        ) -> MKMapPoint {
+            guard let reference = parallelCorridorSegment(
+                near: point,
+                direction: direction,
+                among: candidates
+            ) else {
+                // Do not extend the reference corridor to pull an unrelated turn
+                // or branch onto it; only endpoints genuinely near that road move.
+                return point
+            }
+            let deltaX = reference.end.x - reference.start.x
+            let deltaY = reference.end.y - reference.start.y
+            let lengthSquared = deltaX * deltaX + deltaY * deltaY
+            guard lengthSquared > 0 else { return point }
+            let progress = ((point.x - reference.start.x) * deltaX
+                + (point.y - reference.start.y) * deltaY) / lengthSquared
+            return MKMapPoint(
+                x: reference.start.x + progress * deltaX,
+                y: reference.start.y + progress * deltaY
+            )
         }
 
         private func hasParallelCorridor(
@@ -919,6 +1028,17 @@ struct WayboundMapView: UIViewRepresentable {
         private struct CorridorJourneyGeometry {
             let stackOrder: Int
             let segments: [MapRouteSegment]
+        }
+
+        private struct CorridorLaneLayout {
+            let coordinates: [CLLocationCoordinate2D]
+            let offsets: [Double]
+        }
+
+        private struct CorridorSegmentLayout {
+            let offset: Double
+            let alignedStart: MKMapPoint
+            let alignedEnd: MKMapPoint
         }
 
         private struct MapRouteSegment {
@@ -1203,6 +1323,19 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
                 lengths: [8 / zoomScale, 7 / zoomScale]
             )
         }
+
+        // A narrow map-colored casing keeps adjacent route colors individually
+        // readable while preserving one compact transit-map ribbon.
+        context.addPath(path)
+        context.setStrokeColor(
+            UIColor.white.withAlphaComponent(
+                routeOverlay.opacity * 0.78
+            ).cgColor
+        )
+        context.setLineWidth(
+            CGFloat(routeOverlay.lineWidth + 1.0) / zoomScale
+        )
+        context.strokePath()
 
         context.addPath(path)
         context.setStrokeColor(
