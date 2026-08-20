@@ -258,9 +258,12 @@ struct ContentView: View {
     }
 
     private func expandedRegion(for journey: RouteJourney) -> MKCoordinateRegion {
-        region(
-            containing: [viewModel.userCoordinate]
-                + journey.stops.map(\.coordinate),
+        // The stop sequence begins at the rider's nearest viable boarding stop.
+        // Frame only the first few downstream stops: this gives useful route
+        // context without shrinking the map to fit a trip that may run for miles.
+        let nearbyRouteStops = journey.stops.prefix(6).map(\.coordinate)
+        return region(
+            containing: [viewModel.userCoordinate] + nearbyRouteStops,
             reservesBottomSheet: true
         )
     }
@@ -283,7 +286,7 @@ struct ContentView: View {
             rect = rect.union(MKMapRect(x: point.x, y: point.y, width: 1, height: 1))
         }
 
-        let minimumMapPoints = MKMapPointsPerMeterAtLatitude(first.latitude) * 1_200
+        let minimumMapPoints = MKMapPointsPerMeterAtLatitude(first.latitude) * 450
         let contentWidth = max(rect.size.width, minimumMapPoints)
         let contentHeight = max(rect.size.height, minimumMapPoints)
         let horizontalPadding = contentWidth * 0.20
