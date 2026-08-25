@@ -15,12 +15,29 @@ private enum RouteMapStyle {
     static let standardLineWidth: Double = 3.4
     static let selectedLineWidth: Double = 3.65
     static let separatorWidth: Double = 0.55
+    static let trunkLineWidth: Double = 4.4
+    static let trunkCasingExpansion: Double = 0.9
     static let laneSpacingPoints = standardLineWidth + separatorWidth
+
+    static func zoomLevel(for zoomScale: MKZoomScale) -> Double {
+        log2(max(Double(zoomScale), 0.000_000_1)) + 20
+    }
+
+    /// Shared corridors are one frequency-colored trunk at city scale. Between
+    /// zoom levels 13 and 14.75 they cross-fade into the close-up color ribbon.
+    static func detailProgress(for zoomScale: MKZoomScale) -> Double {
+        let linear = max(
+            0,
+            min(1, (zoomLevel(for: zoomScale) - 13) / 1.75)
+        )
+        // Smoothstep prevents a visible speed change at either end of the blend.
+        return linear * linear * (3 - 2 * linear)
+    }
 
     /// Keep the network readable from neighborhood scale, then make it more
     /// tactile as the rider zooms toward individual streets and stops.
     static func zoomLineExpansion(for zoomScale: MKZoomScale) -> Double {
-        let zoomLevel = log2(max(Double(zoomScale), 0.000_000_1)) + 20
+        let zoomLevel = zoomLevel(for: zoomScale)
         let progress = max(0, min(1, (zoomLevel - 13.75) / 3.25))
         return progress * 2.2
     }
@@ -164,6 +181,7 @@ struct WayboundMapView: UIViewRepresentable {
                         journey.id,
                         CorridorJourneyGeometry(
                             stackOrder: index,
+                            observedDepartureCount: journey.observedDepartureCount,
                             segments: routeSegments(for: completeTrip)
                         )
                     )
@@ -184,6 +202,7 @@ struct WayboundMapView: UIViewRepresentable {
                     color: UIColor(journey.route.color),
                     opacity: isHighlighted ? 0.22 : 0.05,
                     lineWidth: RouteMapStyle.standardLineWidth,
+                    isSelected: selectedID == journey.id,
                     dashed: false,
                     to: mapView
                 )
@@ -204,6 +223,7 @@ struct WayboundMapView: UIViewRepresentable {
                     lineWidth: isSelected
                         ? RouteMapStyle.selectedLineWidth
                         : (isHighlighted ? RouteMapStyle.standardLineWidth : 2.5),
+                    isSelected: isSelected,
                     dashed: false,
                     to: mapView
                 )
@@ -218,6 +238,7 @@ struct WayboundMapView: UIViewRepresentable {
                         color: UIColor(journey.route.color),
                         opacity: 0.58,
                         lineWidth: RouteMapStyle.standardLineWidth,
+                        isSelected: true,
                         dashed: true,
                         to: mapView
                     )
@@ -723,6 +744,7 @@ struct WayboundMapView: UIViewRepresentable {
             color: UIColor,
             opacity: Double,
             lineWidth: Double,
+            isSelected: Bool,
             dashed: Bool,
             to mapView: MKMapView
         ) {
@@ -739,6 +761,8 @@ struct WayboundMapView: UIViewRepresentable {
                     lineWidth: lineWidth,
                     laneOffsetPoints: laneLayout.offsets,
                     sharedCorridorVertices: laneLayout.sharedVertices,
+                    trunkOwnerVertices: laneLayout.trunkOwnerVertices,
+                    isSelected: isSelected,
                     dashed: dashed
                 )
                 routeOverlays.append(overlay)
@@ -775,6 +799,10 @@ struct WayboundMapView: UIViewRepresentable {
                     sharedVertices: Array(
                         repeating: false,
                         count: coordinates.count
+                    ),
+                    trunkOwnerVertices: Array(
+                        repeating: false,
+                        count: coordinates.count
                     )
                 )
             }
@@ -784,6 +812,7 @@ struct WayboundMapView: UIViewRepresentable {
             var offsetCounts = Array(repeating: 0, count: points.count)
             var alignmentDeltaX = Array(repeating: 0.0, count: points.count)
             var alignmentDeltaY = Array(repeating: 0.0, count: points.count)
+            var trunkOwnerVotes = Array(repeating: 0, count: points.count)
 
             for index in 0..<(points.count - 1) {
                 guard let segment = MapRouteSegment(
@@ -804,6 +833,10 @@ struct WayboundMapView: UIViewRepresentable {
                 alignmentDeltaY[index] += layout.alignedStart.y - points[index].y
                 alignmentDeltaX[index + 1] += layout.alignedEnd.x - points[index + 1].x
                 alignmentDeltaY[index + 1] += layout.alignedEnd.y - points[index + 1].y
+                if layout.isTrunkOwner {
+                    trunkOwnerVotes[index] += 1
+                    trunkOwnerVotes[index + 1] += 1
+                }
             }
 
             var offsets = offsetSums.indices.map { index in
@@ -813,6 +846,7 @@ struct WayboundMapView: UIViewRepresentable {
                 return offsetSums[index] / Double(offsetCounts[index])
             }
             var explicitlyStacked = offsetCounts.map { $0 > 0 }
+            var trunkOwnerVertices = trunkOwnerVotes.map { $0 > 0 }
 
             // GTFS shapes often sample the same curve at different positions. Fill
             // short misses between two confidently stacked vertices so a strand
@@ -820,6 +854,7 @@ struct WayboundMapView: UIViewRepresentable {
             bridgeShortCorridorGaps(
                 points: points,
                 explicitlyStacked: &explicitlyStacked,
+                trunkOwnerVertices: &trunkOwnerVertices,
                 offsets: &offsets,
                 deltaX: &alignmentDeltaX,
                 deltaY: &alignmentDeltaY
@@ -872,20 +907,23 @@ struct WayboundMapView: UIViewRepresentable {
             return CorridorLaneLayout(
                 coordinates: alignedCoordinates,
                 offsets: offsets,
-                sharedVertices: explicitlyStacked
+                sharedVertices: explicitlyStacked,
+                trunkOwnerVertices: trunkOwnerVertices
             )
         }
 
         private func bridgeShortCorridorGaps(
             points: [MKMapPoint],
             explicitlyStacked: inout [Bool],
+            trunkOwnerVertices: inout [Bool],
             offsets: inout [Double],
             deltaX: inout [Double],
             deltaY: inout [Double]
         ) {
             let maximumGapDistance: CLLocationDistance = 72
             guard points.count > 2,
-                  points.count == explicitlyStacked.count
+                  points.count == explicitlyStacked.count,
+                  points.count == trunkOwnerVertices.count
             else { return }
 
             var leftIndex = 0
@@ -918,6 +956,8 @@ struct WayboundMapView: UIViewRepresentable {
                 // through the center of another strand.
                 guard leftOffset * rightOffset >= 0 else { continue }
 
+                let bridgesSameTrunkOwner = trunkOwnerVertices[leftIndex]
+                    && trunkOwnerVertices[rightIndex]
                 var distanceFromLeft: CLLocationDistance = 0
                 for index in (leftIndex + 1)..<rightIndex {
                     distanceFromLeft += points[index - 1].distance(to: points[index])
@@ -930,6 +970,7 @@ struct WayboundMapView: UIViewRepresentable {
                     deltaY[index] = deltaY[leftIndex]
                         + (deltaY[rightIndex] - deltaY[leftIndex]) * progress
                     explicitlyStacked[index] = true
+                    trunkOwnerVertices[index] = bridgesSameTrunkOwner
                 }
             }
         }
@@ -998,6 +1039,33 @@ struct WayboundMapView: UIViewRepresentable {
                 if firstOrder != secondOrder { return firstOrder < secondOrder }
                 return $0 < $1
             }
+            let dominanceCandidates: [Int]
+            if let selectedID = parent.selectedJourneyID,
+               memberIDs.contains(selectedID) {
+                dominanceCandidates = [selectedID]
+            } else if let highlightedIDs = parent.highlightedJourneyIDs {
+                let highlightedMembers = memberIDs.filter {
+                    highlightedIDs.contains($0)
+                }
+                dominanceCandidates = highlightedMembers.isEmpty
+                    ? memberIDs : highlightedMembers
+            } else {
+                dominanceCandidates = memberIDs
+            }
+            guard let dominantID = dominanceCandidates.min(by: {
+                firstID, secondID in
+                let first = corridorGeometryByJourneyID[firstID]
+                let second = corridorGeometryByJourneyID[secondID]
+                let firstFrequency = first?.observedDepartureCount ?? 0
+                let secondFrequency = second?.observedDepartureCount ?? 0
+                if firstFrequency != secondFrequency {
+                    return firstFrequency > secondFrequency
+                }
+                let firstOrder = first?.stackOrder ?? .max
+                let secondOrder = second?.stackOrder ?? .max
+                if firstOrder != secondOrder { return firstOrder < secondOrder }
+                return firstID < secondID
+            }) else { return nil }
             guard let referenceID = memberIDs.first,
                   let referenceSegment = localSegmentByJourneyID[referenceID]
             else { return nil }
@@ -1064,7 +1132,8 @@ struct WayboundMapView: UIViewRepresentable {
             return CorridorSegmentLayout(
                 offset: physicalOffset * (directionDot >= 0 ? 1 : -1),
                 alignedStart: alignedStart,
-                alignedEnd: alignedEnd
+                alignedEnd: alignedEnd,
+                isTrunkOwner: journeyID == dominantID
             )
         }
 
@@ -1163,6 +1232,7 @@ struct WayboundMapView: UIViewRepresentable {
 
         private struct CorridorJourneyGeometry {
             let stackOrder: Int
+            let observedDepartureCount: Int
             let segments: [MapRouteSegment]
         }
 
@@ -1170,12 +1240,14 @@ struct WayboundMapView: UIViewRepresentable {
             let coordinates: [CLLocationCoordinate2D]
             let offsets: [Double]
             let sharedVertices: [Bool]
+            let trunkOwnerVertices: [Bool]
         }
 
         private struct CorridorSegmentLayout {
             let offset: Double
             let alignedStart: MKMapPoint
             let alignedEnd: MKMapPoint
+            let isTrunkOwner: Bool
         }
 
         private struct MapRouteSegment {
@@ -1307,12 +1379,15 @@ struct WayboundMapView: UIViewRepresentable {
                 Double(mapView.bounds.width)
                     / max(1, mapView.visibleMapRect.size.width)
             )
-            let laneOffsetScale = RouteMapStyle.laneOffsetScale(
-                for: zoomScale
-            )
+            let zoomDetailProgress = RouteMapStyle.detailProgress(for: zoomScale)
+            let trunkProgress = 1 - zoomDetailProgress
             var best: (journeyID: Int, distance: CGFloat)?
 
             for overlay in routeOverlays {
+                let detailProgress = overlay.isSelected ? 1 : zoomDetailProgress
+                let laneOffsetScale = RouteMapStyle.laneOffsetScale(
+                    for: zoomScale
+                ) * detailProgress
                 let rawPoints = overlay.coordinates.map {
                     mapView.convert($0, toPointTo: mapView)
                 }
@@ -1322,28 +1397,51 @@ struct WayboundMapView: UIViewRepresentable {
                 let laneSamples = deduplicatedRouteLaneSamples(
                     points: rawPoints,
                     offsets: rawLaneOffsets,
+                    sharedVertices: overlay.sharedCorridorVertices,
+                    trunkOwnerVertices: overlay.trunkOwnerVertices,
                     minimumDistance: 0.245
                 )
-                // Offset every source sample before simplification. Otherwise a
-                // straight GTFS shape can lose the interior vertices where routes
-                // enter a shared corridor and collapse back onto one line.
-                let lanePoints = simplifiedRoutePoints(
-                    stableRouteOffsetPoints(
-                        laneSamples.points,
-                        offsets: laneSamples.offsets
-                    ),
-                    tolerance: 0.7
+                // Use the same fanning geometry and visibility rules as drawing.
+                let lanePoints = stableRouteOffsetPoints(
+                    laneSamples.points,
+                    offsets: laneSamples.offsets
                 )
                 guard lanePoints.count >= 2 else { continue }
 
-                for index in 0..<(lanePoints.count - 1) {
+                func considerSegment(from start: CGPoint, to end: CGPoint) {
                     let distance = distanceFromPoint(
                         tapPoint,
-                        toSegmentFrom: lanePoints[index],
-                        to: lanePoints[index + 1]
+                        toSegmentFrom: start,
+                        to: end
                     )
                     if best.map({ distance < $0.distance }) ?? true {
                         best = (overlay.journeyID, distance)
+                    }
+                }
+
+                for index in 0..<(lanePoints.count - 1) {
+                    let isShared = laneSamples.sharedVertices[index]
+                        && laneSamples.sharedVertices[index + 1]
+                    if !isShared {
+                        considerSegment(
+                            from: lanePoints[index],
+                            to: lanePoints[index + 1]
+                        )
+                        continue
+                    }
+                    if detailProgress > 0.05 {
+                        considerSegment(
+                            from: lanePoints[index],
+                            to: lanePoints[index + 1]
+                        )
+                    }
+                    let ownsTrunk = laneSamples.trunkOwnerVertices[index]
+                        && laneSamples.trunkOwnerVertices[index + 1]
+                    if ownsTrunk, trunkProgress > 0.05 {
+                        considerSegment(
+                            from: laneSamples.points[index],
+                            to: laneSamples.points[index + 1]
+                        )
                     }
                 }
             }
@@ -1401,6 +1499,8 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
     let lineWidth: Double
     let laneOffsetPoints: [Double]
     let sharedCorridorVertices: [Bool]
+    let trunkOwnerVertices: [Bool]
+    let isSelected: Bool
     let dashed: Bool
     private let polyline: MKPolyline
 
@@ -1417,6 +1517,8 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
         lineWidth: Double,
         laneOffsetPoints: [Double],
         sharedCorridorVertices: [Bool],
+        trunkOwnerVertices: [Bool],
+        isSelected: Bool,
         dashed: Bool
     ) {
         self.coordinates = coordinates
@@ -1426,6 +1528,8 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
         self.lineWidth = lineWidth
         self.laneOffsetPoints = laneOffsetPoints
         self.sharedCorridorVertices = sharedCorridorVertices
+        self.trunkOwnerVertices = trunkOwnerVertices
+        self.isSelected = isSelected
         self.dashed = dashed
         self.polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
         super.init()
@@ -1443,7 +1547,12 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
         let coordinates = routeOverlay.coordinates
         guard coordinates.count >= 2 else { return }
         let rawPoints = coordinates.map { point(for: MKMapPoint($0)) }
-        let laneOffsetScale = RouteMapStyle.laneOffsetScale(for: zoomScale)
+        let zoomDetailProgress = RouteMapStyle.detailProgress(for: zoomScale)
+        // A selected journey never disappears into the far-zoom trunk. It stays
+        // individually traceable while all unselected shared routes consolidate.
+        let detailProgress = routeOverlay.isSelected ? 1 : zoomDetailProgress
+        let fullLaneOffsetScale = RouteMapStyle.laneOffsetScale(for: zoomScale)
+        let laneOffsetScale = fullLaneOffsetScale * detailProgress
         let rawLaneOffsets = routeOverlay.laneOffsetPoints.map {
             CGFloat($0 * laneOffsetScale) / zoomScale
         }
@@ -1452,55 +1561,58 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
             points: rawPoints,
             offsets: rawLaneOffsets,
             sharedVertices: routeOverlay.sharedCorridorVertices,
+            trunkOwnerVertices: routeOverlay.trunkOwnerVertices,
             minimumDistance: 0.245 / zoomScale
         )
+        guard laneSamples.points.count >= 2 else { return }
 
         // Apply the corridor lanes before simplifying. Geometry-only RDP can
         // otherwise discard every interior sample on a straight shared road and
         // accidentally put all of its routes back on the same centerline.
-        let rawOffsetPoints = stableRouteOffsetPoints(
+        let offsetPoints = stableRouteOffsetPoints(
             laneSamples.points,
             offsets: laneSamples.offsets
         )
-        let offsetPoints = simplifiedRoutePoints(
-            rawOffsetPoints,
-            tolerance: 0.7 / zoomScale
+        let segmentCount = offsetPoints.count - 1
+        let hasSharedState = laneSamples.sharedVertices.count == offsetPoints.count
+        let hasOwnerState = laneSamples.trunkOwnerVertices.count == offsetPoints.count
+        let sharedSegments = (0..<segmentCount).map { index in
+            hasSharedState
+                && laneSamples.sharedVertices[index]
+                && laneSamples.sharedVertices[index + 1]
+        }
+        let isolatedSegments = sharedSegments.map { !$0 }
+        let ownedTrunkSegments = (0..<segmentCount).map { index in
+            sharedSegments[index]
+                && hasOwnerState
+                && laneSamples.trunkOwnerVertices[index]
+                && laneSamples.trunkOwnerVertices[index + 1]
+        }
+        let tolerance = 0.7 / zoomScale
+        let isolatedPath = routeSegmentPath(
+            points: offsetPoints,
+            includedSegments: isolatedSegments,
+            tolerance: tolerance
         )
-        guard offsetPoints.count >= 2 else { return }
-
-        let routePath = CGMutablePath()
-        routePath.move(to: offsetPoints[0])
-        for point in offsetPoints.dropFirst() {
-            routePath.addLine(to: point)
-        }
-
-        // Only shared portions receive a black casing. With lane spacing equal to
-        // color width plus this casing, neighboring colors remain tightly packed
-        // but never paint over one another.
-        let separatorPath = CGMutablePath()
-        var separatorHasContent = false
-        var continuesSeparator = false
-        if laneSamples.sharedVertices.count == rawOffsetPoints.count {
-            for index in 0..<(rawOffsetPoints.count - 1) {
-                let isSharedSegment = laneSamples.sharedVertices[index]
-                    && laneSamples.sharedVertices[index + 1]
-                if isSharedSegment {
-                    if !continuesSeparator {
-                        separatorPath.move(to: rawOffsetPoints[index])
-                    }
-                    separatorPath.addLine(to: rawOffsetPoints[index + 1])
-                    separatorHasContent = true
-                    continuesSeparator = true
-                } else {
-                    continuesSeparator = false
-                }
-            }
-        }
+        let detailPath = routeSegmentPath(
+            points: offsetPoints,
+            includedSegments: sharedSegments,
+            tolerance: tolerance
+        )
+        // The owning route draws the consolidated path on the aligned corridor
+        // centerline, not on its close-zoom lane.
+        let trunkPath = routeSegmentPath(
+            points: laneSamples.points,
+            includedSegments: ownedTrunkSegments,
+            tolerance: tolerance
+        )
 
         let lineWidth = RouteMapStyle.lineWidth(
             baseWidth: routeOverlay.lineWidth,
             zoomScale: zoomScale
         )
+        let trunkProgress = 1 - zoomDetailProgress
+        let baseOpacity = routeOverlay.opacity
         context.saveGState()
         context.setLineCap(.round)
         context.setLineJoin(.round)
@@ -1511,35 +1623,121 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
             )
         }
 
-        if separatorHasContent {
-            context.addPath(separatorPath)
+        // City scale: one smooth shared trunk, colored by the route with the most
+        // catchable departures in the selected planning window.
+        if trunkPath.hasContent, trunkProgress > 0.001 {
+            let trunkOpacity = baseOpacity * trunkProgress
+            context.addPath(trunkPath.path)
             context.setStrokeColor(
                 UIColor.black.withAlphaComponent(
-                    CGFloat(min(0.72, routeOverlay.opacity * 0.72))
+                    CGFloat(min(0.66, trunkOpacity * 0.66))
+                ).cgColor
+            )
+            context.setLineWidth(
+                CGFloat(
+                    RouteMapStyle.trunkLineWidth
+                        + RouteMapStyle.trunkCasingExpansion
+                ) / zoomScale
+            )
+            context.strokePath()
+
+            context.addPath(trunkPath.path)
+            context.setStrokeColor(
+                routeOverlay.color.withAlphaComponent(CGFloat(trunkOpacity)).cgColor
+            )
+            context.setLineWidth(
+                CGFloat(RouteMapStyle.trunkLineWidth) / zoomScale
+            )
+            context.strokePath()
+        }
+
+        // Neighborhood scale: shared colors cross-fade in while their offsets fan
+        // smoothly from the centerline into the compact subway-style ribbon.
+        if detailPath.hasContent, detailProgress > 0.001 {
+            let detailOpacity = baseOpacity * detailProgress
+            context.addPath(detailPath.path)
+            context.setStrokeColor(
+                UIColor.black.withAlphaComponent(
+                    CGFloat(min(0.72, detailOpacity * 0.72))
                 ).cgColor
             )
             context.setLineWidth(
                 CGFloat(lineWidth + RouteMapStyle.separatorWidth) / zoomScale
             )
             context.strokePath()
+
+            context.addPath(detailPath.path)
+            context.setStrokeColor(
+                routeOverlay.color.withAlphaComponent(CGFloat(detailOpacity)).cgColor
+            )
+            context.setLineWidth(CGFloat(lineWidth) / zoomScale)
+            context.strokePath()
         }
 
-        context.addPath(routePath)
-        context.setStrokeColor(
-            routeOverlay.color.withAlphaComponent(
-                CGFloat(routeOverlay.opacity)
-            ).cgColor
-        )
-        context.setLineWidth(CGFloat(lineWidth) / zoomScale)
-        context.strokePath()
+        // Branches never become gray or disappear. Their persistent route color,
+        // edge destination tag, and selected-route emphasis preserve where each
+        // service goes even while only shared geometry is consolidated.
+        if isolatedPath.hasContent {
+            context.addPath(isolatedPath.path)
+            context.setStrokeColor(
+                routeOverlay.color.withAlphaComponent(CGFloat(baseOpacity)).cgColor
+            )
+            context.setLineWidth(CGFloat(lineWidth) / zoomScale)
+            context.strokePath()
+        }
         context.restoreGState()
     }
+}
+
+private struct RouteSegmentPath {
+    let path: CGPath
+    let hasContent: Bool
+}
+
+private func routeSegmentPath(
+    points: [CGPoint],
+    includedSegments: [Bool],
+    tolerance: CGFloat
+) -> RouteSegmentPath {
+    guard points.count >= 2,
+          includedSegments.count == points.count - 1
+    else {
+        return RouteSegmentPath(path: CGMutablePath(), hasContent: false)
+    }
+
+    let path = CGMutablePath()
+    var run: [CGPoint] = []
+    var hasContent = false
+
+    func appendRun() {
+        guard run.count >= 2 else { return }
+        let simplified = simplifiedRoutePoints(run, tolerance: tolerance)
+        guard simplified.count >= 2 else { return }
+        path.move(to: simplified[0])
+        for point in simplified.dropFirst() {
+            path.addLine(to: point)
+        }
+        hasContent = true
+    }
+
+    for index in includedSegments.indices {
+        if includedSegments[index] {
+            if run.isEmpty { run.append(points[index]) }
+            run.append(points[index + 1])
+        } else if !run.isEmpty {
+            appendRun()
+            run.removeAll(keepingCapacity: true)
+        }
+    }
+    appendRun()
+    return RouteSegmentPath(path: path, hasContent: hasContent)
 }
 
 private struct RouteLaneSamples {
     var points: [CGPoint]
     var offsets: [CGFloat]
     var sharedVertices: [Bool]
+    var trunkOwnerVertices: [Bool]
 }
 
 /// Remove coincident GTFS samples without throwing away their corridor state.
@@ -1549,21 +1747,30 @@ private func deduplicatedRouteLaneSamples(
     points: [CGPoint],
     offsets: [CGFloat],
     sharedVertices: [Bool] = [],
+    trunkOwnerVertices: [Bool] = [],
     minimumDistance: CGFloat
 ) -> RouteLaneSamples {
     guard points.count == offsets.count else {
         return RouteLaneSamples(
             points: points,
             offsets: Array(repeating: 0, count: points.count),
-            sharedVertices: Array(repeating: false, count: points.count)
+            sharedVertices: Array(repeating: false, count: points.count),
+            trunkOwnerVertices: Array(repeating: false, count: points.count)
         )
     }
     let hasSharedState = sharedVertices.count == points.count
-    var result = RouteLaneSamples(points: [], offsets: [], sharedVertices: [])
+    let hasTrunkOwnerState = trunkOwnerVertices.count == points.count
+    var result = RouteLaneSamples(
+        points: [],
+        offsets: [],
+        sharedVertices: [],
+        trunkOwnerVertices: []
+    )
 
     for index in points.indices {
         let point = points[index]
         let isShared = hasSharedState ? sharedVertices[index] : false
+        let isTrunkOwner = hasTrunkOwnerState ? trunkOwnerVertices[index] : false
         if let previous = result.points.last,
            hypot(point.x - previous.x, point.y - previous.y) <= minimumDistance {
             let lastIndex = result.points.count - 1
@@ -1572,11 +1779,14 @@ private func deduplicatedRouteLaneSamples(
             }
             result.sharedVertices[lastIndex] =
                 result.sharedVertices[lastIndex] || isShared
+            result.trunkOwnerVertices[lastIndex] =
+                result.trunkOwnerVertices[lastIndex] || isTrunkOwner
             continue
         }
         result.points.append(point)
         result.offsets.append(offsets[index])
         result.sharedVertices.append(isShared)
+        result.trunkOwnerVertices.append(isTrunkOwner)
     }
     return result
 }

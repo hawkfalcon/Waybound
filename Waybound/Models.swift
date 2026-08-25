@@ -86,6 +86,10 @@ struct RouteJourney: Identifiable, Equatable {
     let destinationCoordinate: CLLocationCoordinate2D
     let departureDate: Date
     let departureMinutesFromNow: Int
+    /// Catchable trips observed for this direction in the active 90-minute
+    /// planning window. Shared far-zoom corridors use this service intensity to
+    /// choose a representative route color rather than an arbitrary draw order.
+    let observedDepartureCount: Int
     let walkMinutes: Int
     let waitMinutes: Int
     let rideMinutes: Int

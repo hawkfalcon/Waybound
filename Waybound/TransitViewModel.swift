@@ -991,6 +991,11 @@ final class TransitViewModel: NSObject, ObservableObject {
             return result
         }
 
+        let observedDepartureCountByTripID = patternIdentityByTripID.reduce(
+            into: [Int: Int]()
+        ) { result, item in
+            result[item.key] = catchableTripIDsByPattern[item.value]?.count ?? 0
+        }
         let journeyCandidates = selections.compactMap {
             selection -> RouteJourney? in
             let tripID = selection.trip.id
@@ -1001,13 +1006,9 @@ final class TransitViewModel: NSObject, ObservableObject {
             return makeJourney(
                 from: trip,
                 selection: selection,
-                scheduleReferenceDate: scheduleReferenceDate
+                scheduleReferenceDate: scheduleReferenceDate,
+                observedDepartureCount: observedDepartureCountByTripID[tripID] ?? 0
             )
-        }
-        let observedDepartureCountByTripID = patternIdentityByTripID.reduce(
-            into: [Int: Int]()
-        ) { result, item in
-            result[item.key] = catchableTripIDsByPattern[item.value]?.count ?? 0
         }
         // Keep one useful trip for each direction of each source route. Collapsing
         // here by route ID alone hid the return direction of ordinary two-way
@@ -1431,7 +1432,8 @@ final class TransitViewModel: NSObject, ObservableObject {
     private func makeJourney(
         from trip: APITrip,
         selection: JourneyDepartureSelection,
-        scheduleReferenceDate: Date
+        scheduleReferenceDate: Date,
+        observedDepartureCount: Int
     ) -> RouteJourney? {
         guard let stopTimes = trip.stopTimes?.sorted(by: {
                   $0.stopSequence < $1.stopSequence
@@ -1554,6 +1556,7 @@ final class TransitViewModel: NSObject, ObservableObject {
             destinationCoordinate: flagshipCoordinate,
             departureDate: selection.departureDate,
             departureMinutesFromNow: departureMinutesFromNow,
+            observedDepartureCount: observedDepartureCount,
             walkMinutes: selection.option.walkMinutes,
             waitMinutes: waitMinutes,
             rideMinutes: flagship.offset,
