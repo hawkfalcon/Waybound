@@ -12,12 +12,33 @@ struct WayboundCameraRequest: Equatable {
 }
 
 private enum RouteMapStyle {
-    // Keep the color strokes almost touching, but leave enough room for a very
-    // thin separator so no route can paint over its neighbor at any zoom level.
-    static let laneSpacingPoints: Double = 3.25
-    static let standardLineWidth: Double = 3
-    static let selectedLineWidth: Double = 3.2
-    static let casingExpansion: Double = 0.5
+    static let standardLineWidth: Double = 3.4
+    static let selectedLineWidth: Double = 3.65
+    static let separatorWidth: Double = 0.55
+    static let laneSpacingPoints = standardLineWidth + separatorWidth
+
+    /// Keep the network readable from neighborhood scale, then make it more
+    /// tactile as the rider zooms toward individual streets and stops.
+    static func zoomLineExpansion(for zoomScale: MKZoomScale) -> Double {
+        let zoomLevel = log2(max(Double(zoomScale), 0.000_000_1)) + 20
+        let progress = max(0, min(1, (zoomLevel - 13.75) / 3.25))
+        return progress * 2.2
+    }
+
+    static func lineWidth(
+        baseWidth: Double,
+        zoomScale: MKZoomScale
+    ) -> Double {
+        baseWidth + zoomLineExpansion(for: zoomScale)
+    }
+
+    static func laneSpacing(for zoomScale: MKZoomScale) -> Double {
+        standardLineWidth + zoomLineExpansion(for: zoomScale) + separatorWidth
+    }
+
+    static func laneOffsetScale(for zoomScale: MKZoomScale) -> Double {
+        laneSpacing(for: zoomScale) / laneSpacingPoints
+    }
 }
 
 struct WayboundMapView: UIViewRepresentable {
@@ -712,6 +733,7 @@ struct WayboundMapView: UIViewRepresentable {
                     opacity: opacity,
                     lineWidth: lineWidth,
                     laneOffsetPoints: laneLayout.offsets,
+                    sharedCorridorVertices: laneLayout.sharedVertices,
                     dashed: dashed
                 )
                 routeOverlays.append(overlay)
@@ -735,7 +757,7 @@ struct WayboundMapView: UIViewRepresentable {
 
         /// Isolated geometry remains on its authoritative GTFS centerline. Routes
         /// sharing one road first align to a single local corridor spine and then
-        /// receive consecutive three-point lanes. This produces one compact ribbon
+        /// receive consecutive screen-space lanes. This produces one compact ribbon
         /// instead of several almost-parallel shapes drifting across the road.
         private func sharedCorridorLaneLayout(
             for coordinates: [CLLocationCoordinate2D],
@@ -744,7 +766,11 @@ struct WayboundMapView: UIViewRepresentable {
             guard coordinates.count >= 2 else {
                 return CorridorLaneLayout(
                     coordinates: coordinates,
-                    offsets: Array(repeating: 0, count: coordinates.count)
+                    offsets: Array(repeating: 0, count: coordinates.count),
+                    sharedVertices: Array(
+                        repeating: false,
+                        count: coordinates.count
+                    )
                 )
             }
 
@@ -840,7 +866,8 @@ struct WayboundMapView: UIViewRepresentable {
             }
             return CorridorLaneLayout(
                 coordinates: alignedCoordinates,
-                offsets: offsets
+                offsets: offsets,
+                sharedVertices: explicitlyStacked
             )
         }
 
@@ -1137,6 +1164,7 @@ struct WayboundMapView: UIViewRepresentable {
         private struct CorridorLaneLayout {
             let coordinates: [CLLocationCoordinate2D]
             let offsets: [Double]
+            let sharedVertices: [Bool]
         }
 
         private struct CorridorSegmentLayout {
@@ -1270,24 +1298,36 @@ struct WayboundMapView: UIViewRepresentable {
                   let mapView = recognizer.view as? MKMapView
             else { return }
             let tapPoint = recognizer.location(in: mapView)
+            let zoomScale = MKZoomScale(
+                Double(mapView.bounds.width)
+                    / max(1, mapView.visibleMapRect.size.width)
+            )
+            let laneOffsetScale = RouteMapStyle.laneOffsetScale(
+                for: zoomScale
+            )
             var best: (journeyID: Int, distance: CGFloat)?
 
             for overlay in routeOverlays {
                 let rawPoints = overlay.coordinates.map {
                     mapView.convert($0, toPointTo: mapView)
                 }
-                let basePoints = simplifiedRoutePoints(
-                    rawPoints,
+                let rawLaneOffsets = overlay.laneOffsetPoints.map {
+                    CGFloat($0 * laneOffsetScale)
+                }
+                let laneSamples = deduplicatedRouteLaneSamples(
+                    points: rawPoints,
+                    offsets: rawLaneOffsets,
+                    minimumDistance: 0.245
+                )
+                // Offset every source sample before simplification. Otherwise a
+                // straight GTFS shape can lose the interior vertices where routes
+                // enter a shared corridor and collapse back onto one line.
+                let lanePoints = simplifiedRoutePoints(
+                    stableRouteOffsetPoints(
+                        laneSamples.points,
+                        offsets: laneSamples.offsets
+                    ),
                     tolerance: 0.7
-                )
-                let laneOffsets = simplifiedRouteValues(
-                    for: basePoints,
-                    originalPoints: rawPoints,
-                    originalValues: overlay.laneOffsetPoints.map { CGFloat($0) }
-                )
-                let lanePoints = stableRouteOffsetPoints(
-                    basePoints,
-                    offsets: laneOffsets
                 )
                 guard lanePoints.count >= 2 else { continue }
 
@@ -1355,6 +1395,7 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
     let opacity: Double
     let lineWidth: Double
     let laneOffsetPoints: [Double]
+    let sharedCorridorVertices: [Bool]
     let dashed: Bool
     private let polyline: MKPolyline
 
@@ -1370,6 +1411,7 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
         opacity: Double,
         lineWidth: Double,
         laneOffsetPoints: [Double],
+        sharedCorridorVertices: [Bool],
         dashed: Bool
     ) {
         self.coordinates = coordinates
@@ -1378,6 +1420,7 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
         self.opacity = opacity
         self.lineWidth = lineWidth
         self.laneOffsetPoints = laneOffsetPoints
+        self.sharedCorridorVertices = sharedCorridorVertices
         self.dashed = dashed
         self.polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
         super.init()
@@ -1395,29 +1438,64 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
         let coordinates = routeOverlay.coordinates
         guard coordinates.count >= 2 else { return }
         let rawPoints = coordinates.map { point(for: MKMapPoint($0)) }
-        let basePoints = simplifiedRoutePoints(
-            rawPoints,
+        let laneOffsetScale = RouteMapStyle.laneOffsetScale(for: zoomScale)
+        let rawLaneOffsets = routeOverlay.laneOffsetPoints.map {
+            CGFloat($0 * laneOffsetScale) / zoomScale
+        }
+        guard rawPoints.count == rawLaneOffsets.count else { return }
+        let laneSamples = deduplicatedRouteLaneSamples(
+            points: rawPoints,
+            offsets: rawLaneOffsets,
+            sharedVertices: routeOverlay.sharedCorridorVertices,
+            minimumDistance: 0.245 / zoomScale
+        )
+
+        // Apply the corridor lanes before simplifying. Geometry-only RDP can
+        // otherwise discard every interior sample on a straight shared road and
+        // accidentally put all of its routes back on the same centerline.
+        let rawOffsetPoints = stableRouteOffsetPoints(
+            laneSamples.points,
+            offsets: laneSamples.offsets
+        )
+        let offsetPoints = simplifiedRoutePoints(
+            rawOffsetPoints,
             tolerance: 0.7 / zoomScale
         )
-        guard basePoints.count >= 2 else { return }
-        let laneOffsets = simplifiedRouteValues(
-            for: basePoints,
-            originalPoints: rawPoints,
-            originalValues: routeOverlay.laneOffsetPoints.map {
-                CGFloat($0) / zoomScale
-            }
-        )
-        let offsetPoints = stableRouteOffsetPoints(
-            basePoints,
-            offsets: laneOffsets
-        )
+        guard offsetPoints.count >= 2 else { return }
 
-        let path = CGMutablePath()
-        path.move(to: offsetPoints[0])
+        let routePath = CGMutablePath()
+        routePath.move(to: offsetPoints[0])
         for point in offsetPoints.dropFirst() {
-            path.addLine(to: point)
+            routePath.addLine(to: point)
         }
 
+        // Only shared portions receive a black casing. With lane spacing equal to
+        // color width plus this casing, neighboring colors remain tightly packed
+        // but never paint over one another.
+        let separatorPath = CGMutablePath()
+        var separatorHasContent = false
+        var continuesSeparator = false
+        if laneSamples.sharedVertices.count == rawOffsetPoints.count {
+            for index in 0..<(rawOffsetPoints.count - 1) {
+                let isSharedSegment = laneSamples.sharedVertices[index]
+                    && laneSamples.sharedVertices[index + 1]
+                if isSharedSegment {
+                    if !continuesSeparator {
+                        separatorPath.move(to: rawOffsetPoints[index])
+                    }
+                    separatorPath.addLine(to: rawOffsetPoints[index + 1])
+                    separatorHasContent = true
+                    continuesSeparator = true
+                } else {
+                    continuesSeparator = false
+                }
+            }
+        }
+
+        let lineWidth = RouteMapStyle.lineWidth(
+            baseWidth: routeOverlay.lineWidth,
+            zoomScale: zoomScale
+        )
         context.saveGState()
         context.setLineCap(.round)
         context.setLineJoin(.round)
@@ -1428,33 +1506,78 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
             )
         }
 
-        // A narrow map-colored casing keeps adjacent route colors individually
-        // readable while preserving one compact transit-map ribbon.
-        context.addPath(path)
+        if separatorHasContent {
+            context.addPath(separatorPath)
+            context.setStrokeColor(
+                UIColor.black.withAlphaComponent(
+                    CGFloat(min(0.72, routeOverlay.opacity * 0.72))
+                ).cgColor
+            )
+            context.setLineWidth(
+                CGFloat(lineWidth + RouteMapStyle.separatorWidth) / zoomScale
+            )
+            context.strokePath()
+        }
+
+        context.addPath(routePath)
         context.setStrokeColor(
-            UIColor.white.withAlphaComponent(
-                routeOverlay.opacity * 0.78
+            routeOverlay.color.withAlphaComponent(
+                CGFloat(routeOverlay.opacity)
             ).cgColor
         )
-        context.setLineWidth(
-            CGFloat(
-                routeOverlay.lineWidth + RouteMapStyle.casingExpansion
-            ) / zoomScale
-        )
-        context.strokePath()
-
-        context.addPath(path)
-        context.setStrokeColor(
-            routeOverlay.color.withAlphaComponent(routeOverlay.opacity).cgColor
-        )
-        context.setLineWidth(CGFloat(routeOverlay.lineWidth) / zoomScale)
+        context.setLineWidth(CGFloat(lineWidth) / zoomScale)
         context.strokePath()
         context.restoreGState()
     }
 }
 
-/// A small screen-space simplification removes duplicate/backtracking shape
-/// samples before lane offsets can magnify them into visible crossbars.
+private struct RouteLaneSamples {
+    var points: [CGPoint]
+    var offsets: [CGFloat]
+    var sharedVertices: [Bool]
+}
+
+/// Remove coincident GTFS samples without throwing away their corridor state.
+/// Lane offsets must be applied before geometric simplification, but applying
+/// them to zero-length segments can create spikes and crossbars.
+private func deduplicatedRouteLaneSamples(
+    points: [CGPoint],
+    offsets: [CGFloat],
+    sharedVertices: [Bool] = [],
+    minimumDistance: CGFloat
+) -> RouteLaneSamples {
+    guard points.count == offsets.count else {
+        return RouteLaneSamples(
+            points: points,
+            offsets: Array(repeating: 0, count: points.count),
+            sharedVertices: Array(repeating: false, count: points.count)
+        )
+    }
+    let hasSharedState = sharedVertices.count == points.count
+    var result = RouteLaneSamples(points: [], offsets: [], sharedVertices: [])
+
+    for index in points.indices {
+        let point = points[index]
+        let isShared = hasSharedState ? sharedVertices[index] : false
+        if let previous = result.points.last,
+           hypot(point.x - previous.x, point.y - previous.y) <= minimumDistance {
+            let lastIndex = result.points.count - 1
+            if abs(offsets[index]) >= abs(result.offsets[lastIndex]) {
+                result.offsets[lastIndex] = offsets[index]
+            }
+            result.sharedVertices[lastIndex] =
+                result.sharedVertices[lastIndex] || isShared
+            continue
+        }
+        result.points.append(point)
+        result.offsets.append(offsets[index])
+        result.sharedVertices.append(isShared)
+    }
+    return result
+}
+
+/// A small screen-space simplification removes residual shape noise after the
+/// screen-space lane offset has been applied.
 private func simplifiedRoutePoints(
     _ points: [CGPoint],
     tolerance: CGFloat
@@ -1496,38 +1619,6 @@ private func simplifiedRoutePoints(
     }
 
     return simplifyRange(0, deduplicated.count - 1)
-}
-
-/// Ramer–Douglas–Peucker retains source points, so carry each retained point's
-/// corridor factor through the same ordered sequence. The nearest fallback is
-/// only for sub-pixel floating-point differences in MapKit conversion.
-private func simplifiedRouteValues(
-    for simplifiedPoints: [CGPoint],
-    originalPoints: [CGPoint],
-    originalValues: [CGFloat]
-) -> [CGFloat] {
-    guard originalPoints.count == originalValues.count,
-          !originalPoints.isEmpty
-    else { return Array(repeating: 0, count: simplifiedPoints.count) }
-
-    var cursor = 0
-    return simplifiedPoints.map { point in
-        if cursor < originalPoints.count,
-           let match = originalPoints[cursor...].firstIndex(of: point) {
-            cursor = match + 1
-            return originalValues[match]
-        }
-        let nearestIndex = originalPoints.indices.min { first, second in
-            hypot(
-                point.x - originalPoints[first].x,
-                point.y - originalPoints[first].y
-            ) < hypot(
-                point.x - originalPoints[second].x,
-                point.y - originalPoints[second].y
-            )
-        } ?? 0
-        return originalValues[nearestIndex]
-    }
 }
 
 private func stableRouteOffsetPoints(
