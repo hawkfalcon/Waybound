@@ -3,10 +3,6 @@
 <plist version="1.0">
 <dict>
 	<key>UIBackgroundModes</key>
-	<array>
-		<string>remote-notification</string>
-	</array>
-   <key>NSLocationWhenInUseUsageDescription</key>
-   <string>Waybound needs your location to show nearby transit stops and routes.</string>
+	<array/>
 </dict>
 </plist>
