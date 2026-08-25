@@ -67,10 +67,15 @@ struct WayboundMapView: UIViewRepresentable {
         mapView.isRotateEnabled = false
         mapView.isPitchEnabled = false
         mapView.tintColor = UIColor(WayboundPalette.routeColors[1])
-        mapView.preferredConfiguration = MKStandardMapConfiguration(
+        let mapConfiguration = MKStandardMapConfiguration(
             elevationStyle: .flat,
             emphasisStyle: .muted
         )
+        // Waybound supplies its own transit stops and destination hierarchy.
+        // Hide Apple's POI layer so incidental business and venue labels do not
+        // compete with route strands; street and geographic labels remain visible.
+        mapConfiguration.pointOfInterestFilter = .excludingAll
+        mapView.preferredConfiguration = mapConfiguration
 
         let tap = UITapGestureRecognizer(
             target: context.coordinator,
