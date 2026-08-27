@@ -34,6 +34,14 @@ private enum RouteMapStyle {
         return linear * linear * (3 - 2 * linear)
     }
 
+    static func stopDetailProgress(for zoomScale: MKZoomScale) -> Double {
+        let linear = max(
+            0,
+            min(1, (zoomLevel(for: zoomScale) - 13.75) / 0.75)
+        )
+        return linear * linear * (3 - 2 * linear)
+    }
+
     /// Keep the network readable from neighborhood scale, then make it more
     /// tactile as the rider zooms toward individual streets and stops.
     static func zoomLineExpansion(for zoomScale: MKZoomScale) -> Double {
@@ -181,6 +189,10 @@ struct WayboundMapView: UIViewRepresentable {
                         journey.id,
                         CorridorJourneyGeometry(
                             stackOrder: index,
+                            routeNumber: journey.route.routeNumber
+                                ?? journey.route.shortName,
+                            agencyName: journey.route.agencyName,
+                            directionID: journey.directionID,
                             observedDepartureCount: journey.observedDepartureCount,
                             segments: routeSegments(for: completeTrip)
                         )
@@ -291,6 +303,7 @@ struct WayboundMapView: UIViewRepresentable {
                     )
                 )
             }
+            updateRouteStopVisibility(on: mapView)
         }
 
         private func destinationTagBudget(in mapView: MKMapView) -> Int {
@@ -358,7 +371,35 @@ struct WayboundMapView: UIViewRepresentable {
             )
         }
 
+        private func routeStopVisibility(
+            for routeStop: RouteStopMapAnnotation,
+            on mapView: MKMapView
+        ) -> Double {
+            let belongsToSelectedRoute = parent.selectedJourneyID.map {
+                routeStop.routeIDs.contains($0)
+            } ?? false
+            if belongsToSelectedRoute { return 1 }
+            let zoomScale = MKZoomScale(
+                Double(mapView.bounds.width)
+                    / max(1, mapView.visibleMapRect.size.width)
+            )
+            return RouteMapStyle.stopDetailProgress(for: zoomScale)
+        }
+
+        private func updateRouteStopVisibility(on mapView: MKMapView) {
+            for annotation in mapView.annotations {
+                guard let routeStop = annotation as? RouteStopMapAnnotation,
+                      let view = mapView.view(for: routeStop)
+                        as? RouteStopAnnotationView
+                else { continue }
+                view.setZoomVisibility(
+                    routeStopVisibility(for: routeStop, on: mapView)
+                )
+            }
+        }
+
         func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
+            updateRouteStopVisibility(on: mapView)
             viewportRefreshWorkItem?.cancel()
             let workItem = DispatchWorkItem { [weak self, weak mapView] in
                 guard let self, let mapView else { return }
@@ -749,8 +790,12 @@ struct WayboundMapView: UIViewRepresentable {
             to mapView: MKMapView
         ) {
             for coordinates in polylines where coordinates.count >= 2 {
+                // Regular samples give branch merges enough geometry to fan over
+                // distance. Sparse GTFS vertices otherwise force an entire ribbon
+                // to change lane at one sharp point.
+                let preparedCoordinates = densifiedRouteCoordinates(coordinates)
                 let laneLayout = sharedCorridorLaneLayout(
-                    for: coordinates,
+                    for: preparedCoordinates,
                     journeyID: journeyID
                 )
                 let overlay = RouteLaneOverlay(
@@ -784,6 +829,34 @@ struct WayboundMapView: UIViewRepresentable {
             }
         }
 
+        private func densifiedRouteCoordinates(
+            _ coordinates: [CLLocationCoordinate2D]
+        ) -> [CLLocationCoordinate2D] {
+            let maximumSegmentLength: CLLocationDistance = 18
+            guard coordinates.count >= 2 else { return coordinates }
+            var result = [coordinates[0]]
+
+            for index in 0..<(coordinates.count - 1) {
+                let start = MKMapPoint(coordinates[index])
+                let end = MKMapPoint(coordinates[index + 1])
+                let distance = start.distance(to: end)
+                let subdivisionCount = max(
+                    1,
+                    Int(ceil(distance / maximumSegmentLength))
+                )
+                for subdivision in 1...subdivisionCount {
+                    let progress = Double(subdivision) / Double(subdivisionCount)
+                    result.append(
+                        MKMapPoint(
+                            x: start.x + (end.x - start.x) * progress,
+                            y: start.y + (end.y - start.y) * progress
+                        ).coordinate
+                    )
+                }
+            }
+            return result
+        }
+
         /// Isolated geometry remains on its authoritative GTFS centerline. Routes
         /// sharing one road first align to a single local corridor spine and then
         /// receive consecutive screen-space lanes. This produces one compact ribbon
@@ -808,23 +881,45 @@ struct WayboundMapView: UIViewRepresentable {
             }
 
             let points = coordinates.map { MKMapPoint($0) }
+            var segmentLayouts: [CorridorSegmentLayout?] = []
+            segmentLayouts.reserveCapacity(points.count - 1)
+            for index in 0..<(points.count - 1) {
+                guard let segment = MapRouteSegment(
+                    start: points[index],
+                    end: points[index + 1]
+                ) else {
+                    segmentLayouts.append(nil)
+                    continue
+                }
+                segmentLayouts.append(
+                    sharedCorridorSegmentLayout(
+                        for: segment,
+                        journeyID: journeyID
+                    )
+                )
+            }
+
+            // A parallel shape seen for only a few meters is normally an
+            // intersection, a terminal bay, or a near-parallel turn—not a shared
+            // road. Refusing those tiny runs removes one-vertex side-steps without
+            // deleting any authoritative route geometry.
+            removeShortCorridorRuns(
+                points: points,
+                layouts: &segmentLayouts
+            )
+
             var offsetSums = Array(repeating: 0.0, count: points.count)
             var offsetCounts = Array(repeating: 0, count: points.count)
             var alignmentDeltaX = Array(repeating: 0.0, count: points.count)
             var alignmentDeltaY = Array(repeating: 0.0, count: points.count)
             var trunkOwnerVotes = Array(repeating: 0, count: points.count)
+            var referenceVotes = Array(
+                repeating: [Int: Int](),
+                count: points.count
+            )
 
-            for index in 0..<(points.count - 1) {
-                guard let segment = MapRouteSegment(
-                    start: points[index],
-                    end: points[index + 1]
-                ),
-                      let layout = sharedCorridorSegmentLayout(
-                        for: segment,
-                        journeyID: journeyID
-                      )
-                else { continue }
-
+            for (index, optionalLayout) in segmentLayouts.enumerated() {
+                guard let layout = optionalLayout else { continue }
                 offsetSums[index] += layout.offset
                 offsetSums[index + 1] += layout.offset
                 offsetCounts[index] += 1
@@ -833,6 +928,8 @@ struct WayboundMapView: UIViewRepresentable {
                 alignmentDeltaY[index] += layout.alignedStart.y - points[index].y
                 alignmentDeltaX[index + 1] += layout.alignedEnd.x - points[index + 1].x
                 alignmentDeltaY[index + 1] += layout.alignedEnd.y - points[index + 1].y
+                referenceVotes[index][layout.referenceID, default: 0] += 1
+                referenceVotes[index + 1][layout.referenceID, default: 0] += 1
                 if layout.isTrunkOwner {
                     trunkOwnerVotes[index] += 1
                     trunkOwnerVotes[index + 1] += 1
@@ -847,15 +944,44 @@ struct WayboundMapView: UIViewRepresentable {
             }
             var explicitlyStacked = offsetCounts.map { $0 > 0 }
             var trunkOwnerVertices = trunkOwnerVotes.map { $0 > 0 }
+            var corridorReferenceIDs = referenceVotes.map { votes -> Int? in
+                votes.keys.sorted { firstID, secondID in
+                    let firstVotes = votes[firstID] ?? 0
+                    let secondVotes = votes[secondID] ?? 0
+                    if firstVotes != secondVotes {
+                        return firstVotes > secondVotes
+                    }
+                    return corridorLaneComesBefore(firstID, secondID)
+                }.first
+            }
 
-            // GTFS shapes often sample the same curve at different positions. Fill
-            // short misses between two confidently stacked vertices so a strand
-            // cannot briefly fall through the middle of its bundle.
+            // The first shared section establishes this strand's lane. Hold that
+            // lane for the whole contiguous corridor: another route entering or
+            // leaving is not allowed to recenter continuing strands. A route that
+            // joins later takes an outside lane of its own and tapers into it.
+            stabilizeCorridorRunOffsets(
+                layouts: segmentLayouts,
+                offsets: &offsets
+            )
+
+            // Fill only small misses that return to the same physical spine and
+            // nearly the same lane. Broad bridging was able to pull a strand across
+            // a downtown turn and create the diagonal jogs visible in testing.
             bridgeShortCorridorGaps(
                 points: points,
                 explicitlyStacked: &explicitlyStacked,
                 trunkOwnerVertices: &trunkOwnerVertices,
+                corridorReferenceIDs: &corridorReferenceIDs,
                 offsets: &offsets,
+                deltaX: &alignmentDeltaX,
+                deltaY: &alignmentDeltaY
+            )
+
+            // Centerline corrections still follow bends, but cannot jump laterally
+            // when the locally preferred reference shape changes.
+            stabilizeSharedAlignmentTransitions(
+                points: points,
+                explicitlyStacked: explicitlyStacked,
                 deltaX: &alignmentDeltaX,
                 deltaY: &alignmentDeltaY
             )
@@ -863,7 +989,7 @@ struct WayboundMapView: UIViewRepresentable {
             // Fade both the lane and the small centerline correction back to the
             // route's own shape. Branches peel away gradually instead of gaining a
             // diagonal connector where a shared corridor starts or ends.
-            let taperDistance: CLLocationDistance = 42
+            let taperDistance: CLLocationDistance = 58
             if offsets.count > 1 {
                 for index in 1..<offsets.count where !explicitlyStacked[index] {
                     let factor = max(
@@ -912,18 +1038,82 @@ struct WayboundMapView: UIViewRepresentable {
             )
         }
 
+        private func removeShortCorridorRuns(
+            points: [MKMapPoint],
+            layouts: inout [CorridorSegmentLayout?]
+        ) {
+            let minimumSharedDistance: CLLocationDistance = 30
+            guard layouts.count == points.count - 1 else { return }
+            var runStart = 0
+
+            while runStart < layouts.count {
+                while runStart < layouts.count, layouts[runStart] == nil {
+                    runStart += 1
+                }
+                guard runStart < layouts.count else { break }
+                var runEnd = runStart + 1
+                while runEnd < layouts.count, layouts[runEnd] != nil {
+                    runEnd += 1
+                }
+                let runDistance = (runStart..<runEnd).reduce(0.0) {
+                    distance, index in
+                    distance + points[index].distance(to: points[index + 1])
+                }
+                if runDistance < minimumSharedDistance {
+                    for index in runStart..<runEnd {
+                        layouts[index] = nil
+                    }
+                }
+                runStart = runEnd
+            }
+        }
+
+        private func stabilizeCorridorRunOffsets(
+            layouts: [CorridorSegmentLayout?],
+            offsets: inout [Double]
+        ) {
+            guard offsets.count == layouts.count + 1 else { return }
+            var runStart = 0
+
+            while runStart < layouts.count {
+                while runStart < layouts.count, layouts[runStart] == nil {
+                    runStart += 1
+                }
+                guard runStart < layouts.count,
+                      let firstLayout = layouts[runStart]
+                else { break }
+                var runEnd = runStart + 1
+                while runEnd < layouts.count, layouts[runEnd] != nil {
+                    runEnd += 1
+                }
+
+                // At a clipped viewport edge there is no topology history, so use
+                // the compact local stack. A genuine mid-shape join takes the
+                // precomputed outside lane and leaves incumbents untouched.
+                let stableOffset = runStart == 0
+                    ? firstLayout.offset : firstLayout.enteringOffset
+                for vertexIndex in runStart...runEnd {
+                    offsets[vertexIndex] = stableOffset
+                }
+                runStart = runEnd
+            }
+        }
+
         private func bridgeShortCorridorGaps(
             points: [MKMapPoint],
             explicitlyStacked: inout [Bool],
             trunkOwnerVertices: inout [Bool],
+            corridorReferenceIDs: inout [Int?],
             offsets: inout [Double],
             deltaX: inout [Double],
             deltaY: inout [Double]
         ) {
-            let maximumGapDistance: CLLocationDistance = 72
+            let maximumGapDistance: CLLocationDistance = 48
+            let maximumLaneChange = RouteMapStyle.laneSpacingPoints * 1.1
             guard points.count > 2,
                   points.count == explicitlyStacked.count,
-                  points.count == trunkOwnerVertices.count
+                  points.count == trunkOwnerVertices.count,
+                  points.count == corridorReferenceIDs.count
             else { return }
 
             var leftIndex = 0
@@ -946,15 +1136,16 @@ struct WayboundMapView: UIViewRepresentable {
                 guard rightIndex < points.count else { break }
                 defer { leftIndex = rightIndex }
                 guard rightIndex > leftIndex + 1,
-                      gapDistance <= maximumGapDistance
+                      gapDistance <= maximumGapDistance,
+                      let leftReferenceID = corridorReferenceIDs[leftIndex],
+                      corridorReferenceIDs[rightIndex] == leftReferenceID
                 else { continue }
 
                 let leftOffset = offsets[leftIndex]
                 let rightOffset = offsets[rightIndex]
-                // Opposite signs can represent a legitimate local lane recentering.
-                // Let that transition happen naturally instead of forcing a route
-                // through the center of another strand.
-                guard leftOffset * rightOffset >= 0 else { continue }
+                guard leftOffset * rightOffset >= 0,
+                      abs(leftOffset - rightOffset) <= maximumLaneChange
+                else { continue }
 
                 let bridgesSameTrunkOwner = trunkOwnerVertices[leftIndex]
                     && trunkOwnerVertices[rightIndex]
@@ -971,7 +1162,50 @@ struct WayboundMapView: UIViewRepresentable {
                         + (deltaY[rightIndex] - deltaY[leftIndex]) * progress
                     explicitlyStacked[index] = true
                     trunkOwnerVertices[index] = bridgesSameTrunkOwner
+                    corridorReferenceIDs[index] = leftReferenceID
                 }
+            }
+        }
+
+        private func stabilizeSharedAlignmentTransitions(
+            points: [MKMapPoint],
+            explicitlyStacked: [Bool],
+            deltaX: inout [Double],
+            deltaY: inout [Double]
+        ) {
+            let alignmentTransitionDistance: CLLocationDistance = 54
+            guard points.count > 1,
+                  points.count == explicitlyStacked.count
+            else { return }
+
+            for index in 1..<points.count {
+                guard explicitlyStacked[index - 1],
+                      explicitlyStacked[index]
+                else { continue }
+                let distance = points[index - 1].distance(to: points[index])
+                let alignmentProgress = max(
+                    0.05,
+                    min(1, distance / alignmentTransitionDistance)
+                )
+                deltaX[index] = deltaX[index - 1]
+                    + (deltaX[index] - deltaX[index - 1]) * alignmentProgress
+                deltaY[index] = deltaY[index - 1]
+                    + (deltaY[index] - deltaY[index - 1]) * alignmentProgress
+            }
+
+            for index in stride(from: points.count - 2, through: 0, by: -1) {
+                guard explicitlyStacked[index],
+                      explicitlyStacked[index + 1]
+                else { continue }
+                let distance = points[index].distance(to: points[index + 1])
+                let alignmentProgress = max(
+                    0.05,
+                    min(1, distance / alignmentTransitionDistance)
+                )
+                deltaX[index] = deltaX[index + 1]
+                    + (deltaX[index] - deltaX[index + 1]) * alignmentProgress
+                deltaY[index] = deltaY[index + 1]
+                    + (deltaY[index] - deltaY[index + 1]) * alignmentProgress
             }
         }
 
@@ -999,6 +1233,39 @@ struct WayboundMapView: UIViewRepresentable {
             }
         }
 
+        private func corridorLaneComesBefore(
+            _ firstID: Int,
+            _ secondID: Int
+        ) -> Bool {
+            guard let first = corridorGeometryByJourneyID[firstID],
+                  let second = corridorGeometryByJourneyID[secondID]
+            else { return firstID < secondID }
+
+            let routeComparison = first.routeNumber.compare(
+                second.routeNumber,
+                options: [.caseInsensitive, .numeric]
+            )
+            if routeComparison != .orderedSame {
+                return routeComparison == .orderedAscending
+            }
+            let agencyComparison = first.agencyName.compare(
+                second.agencyName,
+                options: [.caseInsensitive, .diacriticInsensitive]
+            )
+            if agencyComparison != .orderedSame {
+                return agencyComparison == .orderedAscending
+            }
+            let firstDirection = first.directionID ?? Int.max
+            let secondDirection = second.directionID ?? Int.max
+            if firstDirection != secondDirection {
+                return firstDirection < secondDirection
+            }
+            if first.stackOrder != second.stackOrder {
+                return first.stackOrder < second.stackOrder
+            }
+            return firstID < secondID
+        }
+
         private func sharedCorridorSegmentLayout(
             for segment: MapRouteSegment,
             journeyID: Int
@@ -1011,34 +1278,34 @@ struct WayboundMapView: UIViewRepresentable {
 
             for (candidateID, geometry) in corridorGeometryByJourneyID
             where candidateID != journeyID {
-                // Midpoint plus endpoint matching rejects crossings while still
-                // tolerating different GTFS sampling intervals on the same road.
+                // A true shared road remains close and parallel across this entire
+                // short sample. Requiring both endpoints eliminates incidental
+                // matches at crossings and the inside edge of unrelated turns.
                 guard let midpointSegment = parallelCorridorSegment(
                     near: midpoint,
                     direction: segment,
                     among: geometry.segments
-                ) else { continue }
-                let endpointIsShared = hasParallelCorridor(
-                    near: segment.start,
-                    direction: segment,
-                    among: geometry.segments
-                ) || hasParallelCorridor(
-                    near: segment.end,
-                    direction: segment,
-                    among: geometry.segments
-                )
-                if endpointIsShared {
-                    localSegmentByJourneyID[candidateID] = midpointSegment
-                }
+                ),
+                      hasParallelCorridor(
+                        near: segment.start,
+                        direction: segment,
+                        among: geometry.segments
+                      ),
+                      hasParallelCorridor(
+                        near: segment.end,
+                        direction: segment,
+                        among: geometry.segments
+                      )
+                else { continue }
+                localSegmentByJourneyID[candidateID] = midpointSegment
             }
 
             guard localSegmentByJourneyID.count > 1 else { return nil }
-            let memberIDs = localSegmentByJourneyID.keys.sorted {
-                let firstOrder = corridorGeometryByJourneyID[$0]?.stackOrder ?? .max
-                let secondOrder = corridorGeometryByJourneyID[$1]?.stackOrder ?? .max
-                if firstOrder != secondOrder { return firstOrder < secondOrder }
-                return $0 < $1
-            }
+            // Public route identity—not live utility ranking—defines lateral order.
+            // The sheet can reorder by usefulness without making map colors swap.
+            let memberIDs = localSegmentByJourneyID.keys.sorted(
+                by: corridorLaneComesBefore
+            )
             let dominanceCandidates: [Int]
             if let selectedID = parent.selectedJourneyID,
                memberIDs.contains(selectedID) {
@@ -1085,13 +1352,18 @@ struct WayboundMapView: UIViewRepresentable {
 
             let laneSpacing = RouteMapStyle.laneSpacingPoints
             let physicalOffset: Double
+            let enteringPhysicalOffset: Double
             if !reverseIDs.isEmpty {
                 if let laneIndex = alignedIDs.firstIndex(of: journeyID) {
                     physicalOffset = laneSpacing / 2
                         + Double(laneIndex) * laneSpacing
+                    enteringPhysicalOffset = laneSpacing / 2
+                        + Double(alignedIDs.count - 1) * laneSpacing
                 } else if let laneIndex = reverseIDs.firstIndex(of: journeyID) {
                     physicalOffset = -laneSpacing / 2
                         - Double(laneIndex) * laneSpacing
+                    enteringPhysicalOffset = -laneSpacing / 2
+                        - Double(reverseIDs.count - 1) * laneSpacing
                 } else {
                     return nil
                 }
@@ -1102,6 +1374,13 @@ struct WayboundMapView: UIViewRepresentable {
                 physicalOffset = (
                     Double(laneIndex) - Double(alignedIDs.count - 1) / 2
                 ) * laneSpacing
+                // A new strand enters from the nearest outside edge rather than
+                // inserting itself between established colors. This intentionally
+                // lets topology override natural-number order at that one merge.
+                let joinsLowerEdge = laneIndex * 2 < alignedIDs.count - 1
+                let edgeSign: Double = joinsLowerEdge ? -1 : 1
+                let edgeMagnitude = Double(alignedIDs.count) / 2 * laneSpacing
+                enteringPhysicalOffset = edgeSign * edgeMagnitude
             }
 
             let alignedStart: MKMapPoint
@@ -1109,61 +1388,55 @@ struct WayboundMapView: UIViewRepresentable {
             if referenceID == journeyID {
                 alignedStart = segment.start
                 alignedEnd = segment.end
-            } else if let referenceGeometry = corridorGeometryByJourneyID[referenceID] {
+            } else {
+                // Project both endpoints onto the same locally matched segment.
+                // Searching again per endpoint can select two different parallel
+                // pieces of a terminal loop and manufacture a sideways jog.
                 alignedStart = corridorProjection(
                     of: segment.start,
-                    parallelTo: segment,
-                    onto: referenceGeometry.segments
+                    onto: referenceSegment
                 )
                 alignedEnd = corridorProjection(
                     of: segment.end,
-                    parallelTo: segment,
-                    onto: referenceGeometry.segments
+                    onto: referenceSegment
                 )
-            } else {
-                alignedStart = segment.start
-                alignedEnd = segment.end
             }
 
             // Screen-space offset normals reverse with polyline direction. Convert
             // the canonical physical side back into this journey's local scalar.
             let directionDot = segment.unitX * referenceSegment.unitX
                 + segment.unitY * referenceSegment.unitY
+            let directionSign: Double = directionDot >= 0 ? 1 : -1
             return CorridorSegmentLayout(
-                offset: physicalOffset * (directionDot >= 0 ? 1 : -1),
+                offset: physicalOffset * directionSign,
+                enteringOffset: enteringPhysicalOffset * directionSign,
                 alignedStart: alignedStart,
                 alignedEnd: alignedEnd,
+                referenceID: referenceID,
                 isTrunkOwner: journeyID == dominantID
             )
         }
 
-        /// Remove only perpendicular drift from a member shape. Longitudinal
-        /// progress remains untouched, so routes share the same road spine without
-        /// bunching samples together or inventing shortcuts at intersections.
+        /// Remove only perpendicular drift from a member shape. Both endpoints of
+        /// one short sample use the same reference segment, preserving longitudinal
+        /// progress and preventing a dense terminal loop from becoming a shortcut.
         private func corridorProjection(
             of point: MKMapPoint,
-            parallelTo direction: MapRouteSegment,
-            onto candidates: [MapRouteSegment]
+            onto reference: MapRouteSegment
         ) -> MKMapPoint {
-            guard let reference = parallelCorridorSegment(
-                near: point,
-                direction: direction,
-                among: candidates
-            ) else {
-                // Do not extend the reference corridor to pull an unrelated turn
-                // or branch onto it; only endpoints genuinely near that road move.
-                return point
-            }
             let deltaX = reference.end.x - reference.start.x
             let deltaY = reference.end.y - reference.start.y
             let lengthSquared = deltaX * deltaX + deltaY * deltaY
             guard lengthSquared > 0 else { return point }
             let progress = ((point.x - reference.start.x) * deltaX
                 + (point.y - reference.start.y) * deltaY) / lengthSquared
-            return MKMapPoint(
+            let projection = MKMapPoint(
                 x: reference.start.x + progress * deltaX,
                 y: reference.start.y + progress * deltaY
             )
+            // Alignment only corrects small feed-to-feed centerline drift. Larger
+            // moves are a different street, bay, or branch and stay authoritative.
+            return point.distance(to: projection) <= 20 ? projection : point
         }
 
         private func hasParallelCorridor(
@@ -1183,10 +1456,10 @@ struct WayboundMapView: UIViewRepresentable {
             direction: MapRouteSegment,
             among candidates: [MapRouteSegment]
         ) -> MapRouteSegment? {
-            // Two operators can publish centerlines on opposite sides of the same
-            // wide street. Keep enough tolerance to recognize that shared road,
-            // while the strict tangent test still rejects crossings and turns.
-            let maximumSeparation: CLLocationDistance = 28
+            // Two feeds can publish centerlines on different parts of the same
+            // street. Twenty meters still covers that drift without treating a
+            // nearby terminal bay or parallel downtown street as one corridor.
+            let maximumSeparation: CLLocationDistance = 20
             let minimumParallelDot = 0.93
             return candidates
                 .filter { candidate in
@@ -1232,6 +1505,9 @@ struct WayboundMapView: UIViewRepresentable {
 
         private struct CorridorJourneyGeometry {
             let stackOrder: Int
+            let routeNumber: String
+            let agencyName: String
+            let directionID: Int?
             let observedDepartureCount: Int
             let segments: [MapRouteSegment]
         }
@@ -1245,8 +1521,10 @@ struct WayboundMapView: UIViewRepresentable {
 
         private struct CorridorSegmentLayout {
             let offset: Double
+            let enteringOffset: Double
             let alignedStart: MKMapPoint
             let alignedEnd: MKMapPoint
+            let referenceID: Int
             let isTrunkOwner: Bool
         }
 
@@ -1298,6 +1576,9 @@ struct WayboundMapView: UIViewRepresentable {
                 }
                 view.annotation = routeStop
                 view.configure(with: routeStop)
+                view.setZoomVisibility(
+                    routeStopVisibility(for: routeStop, on: mapView)
+                )
                 return view
 
             case let destination as DestinationMapAnnotation:
@@ -2111,6 +2392,7 @@ private final class DestinationAnnotationView: MKAnnotationView {
 
 private final class RouteStopAnnotationView: MKAnnotationView {
     private var colors: [UIColor] = []
+    private var configuredAlpha: CGFloat = 0.92
 
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
@@ -2130,8 +2412,15 @@ private final class RouteStopAnnotationView: MKAnnotationView {
 
     func configure(with annotation: RouteStopMapAnnotation) {
         colors = annotation.colors
-        alpha = annotation.isDimmed ? 0.18 : 0.92
+        configuredAlpha = annotation.isDimmed ? 0.18 : 0.92
+        alpha = configuredAlpha
         setNeedsDisplay()
+    }
+
+    func setZoomVisibility(_ progress: Double) {
+        let clampedProgress = max(0, min(1, progress))
+        alpha = configuredAlpha * CGFloat(clampedProgress)
+        isHidden = clampedProgress < 0.01
     }
 
     override func draw(_ rect: CGRect) {
