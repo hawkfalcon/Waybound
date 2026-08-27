@@ -127,6 +127,8 @@ struct WayboundMapView: UIViewRepresentable {
         private var routeOverlays: [RouteLaneOverlay] = []
         private var corridorGeometryByJourneyID: [Int: CorridorJourneyGeometry] = [:]
         private var viewportRefreshWorkItem: DispatchWorkItem?
+        private var lastRouteClipRect: MKMapRect?
+        private var lastEscapeDrivenRefresh = Date.distantPast
 
         init(parent: WayboundMapView) {
             self.parent = parent
@@ -174,18 +176,30 @@ struct WayboundMapView: UIViewRepresentable {
             )
             routeOverlays = []
 
-            guard let routeViewport = routeViewportMapRect(in: mapView),
+            guard let visibleRouteViewport = routeViewportMapRect(in: mapView),
                   let tagViewport = destinationTagViewportMapRect(in: mapView)
             else { return }
+            // Clip against a generously padded viewport rather than the exact
+            // screen. Pinch-zooming out then reveals geometry that is already
+            // drawn instead of waiting for the debounced rebuild, which used to
+            // show cropped line ends for a beat at every zoom-out.
+            let routeViewport = visibleRouteViewport.insetBy(
+                dx: -visibleRouteViewport.size.width * 1.5,
+                dy: -visibleRouteViewport.size.height * 1.5
+            )
+            lastRouteClipRect = routeViewport
             let selectedID = parent.selectedJourneyID
             let highlightedJourneyIDs = parent.highlightedJourneyIDs
+            // Ribbon lanes and the far-zoom trunk are built only from the vivid
+            // "where can I go" flagship paths. Approach geometry ("where the
+            // bus has been") and post-destination continuations stay plain
+            // centerlines: they may not claim a lane, mark another route's
+            // flagship as shared, or win a trunk that would then be drawn
+            // faded — or, for continuations, not drawn at all.
             corridorGeometryByJourneyID = Dictionary(
                 uniqueKeysWithValues: parent.journeys.enumerated().map {
                     index, journey in
-                    let completeTrip = journey.approachPolylines
-                        + journey.flagshipPolylines
-                        + journey.continuationPolylines
-                    return (
+                    (
                         journey.id,
                         CorridorJourneyGeometry(
                             stackOrder: index,
@@ -194,7 +208,7 @@ struct WayboundMapView: UIViewRepresentable {
                             agencyName: journey.route.agencyName,
                             directionID: journey.directionID,
                             observedDepartureCount: journey.observedDepartureCount,
-                            segments: routeSegments(for: completeTrip)
+                            segments: routeSegments(for: journey.flagshipPolylines)
                         )
                     )
                 }
@@ -202,7 +216,9 @@ struct WayboundMapView: UIViewRepresentable {
 
             // Draw the already-travelled portion underneath every active route.
             // It answers "where is this bus coming from?" without competing with
-            // the path the rider can still take from the boarding stop.
+            // the path the rider can still take from the boarding stop. It is
+            // deliberately plain context: it stays on its own centerline and
+            // never joins the corridor ribbon or the far-zoom trunk.
             for journey in parent.journeys {
                 let isHighlighted = highlightedJourneyIDs?.contains(journey.id) ?? true
                 addOverlays(
@@ -216,6 +232,7 @@ struct WayboundMapView: UIViewRepresentable {
                     lineWidth: RouteMapStyle.standardLineWidth,
                     isSelected: selectedID == journey.id,
                     dashed: false,
+                    joinsCorridors: false,
                     to: mapView
                 )
             }
@@ -237,6 +254,7 @@ struct WayboundMapView: UIViewRepresentable {
                         : (isHighlighted ? RouteMapStyle.standardLineWidth : 2.5),
                     isSelected: isSelected,
                     dashed: false,
+                    joinsCorridors: true,
                     to: mapView
                 )
 
@@ -252,6 +270,7 @@ struct WayboundMapView: UIViewRepresentable {
                         lineWidth: RouteMapStyle.standardLineWidth,
                         isSelected: true,
                         dashed: true,
+                        joinsCorridors: false,
                         to: mapView
                     )
                 }
@@ -400,6 +419,22 @@ struct WayboundMapView: UIViewRepresentable {
 
         func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
             updateRouteStopVisibility(on: mapView)
+
+            // While the camera stays inside the padded clip rect the overlays
+            // already cover everything on screen, so the refresh can wait for
+            // the debounce. Once the visible region escapes that padding — a
+            // fast zoom-out or fling — rebuild immediately (throttled) so line
+            // ends never sit visibly cropped while the user watches.
+            if let clipRect = lastRouteClipRect,
+               let visibleRect = routeViewportMapRect(in: mapView),
+               !mapRect(clipRect, contains: visibleRect),
+               Date().timeIntervalSince(lastEscapeDrivenRefresh) > 0.12 {
+                lastEscapeDrivenRefresh = Date()
+                viewportRefreshWorkItem?.cancel()
+                refreshViewportContent(on: mapView)
+                return
+            }
+
             viewportRefreshWorkItem?.cancel()
             let workItem = DispatchWorkItem { [weak self, weak mapView] in
                 guard let self, let mapView else { return }
@@ -407,6 +442,14 @@ struct WayboundMapView: UIViewRepresentable {
             }
             viewportRefreshWorkItem = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: workItem)
+        }
+
+        private func mapRect(
+            _ outer: MKMapRect,
+            contains inner: MKMapRect
+        ) -> Bool {
+            inner.minX >= outer.minX && inner.maxX <= outer.maxX
+                && inner.minY >= outer.minY && inner.maxY <= outer.maxY
         }
 
         private func routeViewportMapRect(in mapView: MKMapView) -> MKMapRect? {
@@ -787,6 +830,7 @@ struct WayboundMapView: UIViewRepresentable {
             lineWidth: Double,
             isSelected: Bool,
             dashed: Bool,
+            joinsCorridors: Bool,
             to mapView: MKMapView
         ) {
             for coordinates in polylines where coordinates.count >= 2 {
@@ -794,10 +838,26 @@ struct WayboundMapView: UIViewRepresentable {
                 // distance. Sparse GTFS vertices otherwise force an entire ribbon
                 // to change lane at one sharp point.
                 let preparedCoordinates = densifiedRouteCoordinates(coordinates)
-                let laneLayout = sharedCorridorLaneLayout(
-                    for: preparedCoordinates,
-                    journeyID: journeyID
-                )
+                let laneLayout = joinsCorridors
+                    ? sharedCorridorLaneLayout(
+                        for: preparedCoordinates,
+                        journeyID: journeyID
+                    )
+                    : CorridorLaneLayout(
+                        coordinates: preparedCoordinates,
+                        offsets: Array(
+                            repeating: 0,
+                            count: preparedCoordinates.count
+                        ),
+                        sharedVertices: Array(
+                            repeating: false,
+                            count: preparedCoordinates.count
+                        ),
+                        trunkOwnerVertices: Array(
+                            repeating: false,
+                            count: preparedCoordinates.count
+                        )
+                    )
                 let overlay = RouteLaneOverlay(
                     coordinates: laneLayout.coordinates,
                     journeyID: journeyID,
@@ -960,6 +1020,7 @@ struct WayboundMapView: UIViewRepresentable {
             // leaving is not allowed to recenter continuing strands. A route that
             // joins later takes an outside lane of its own and tapers into it.
             stabilizeCorridorRunOffsets(
+                points: points,
                 layouts: segmentLayouts,
                 offsets: &offsets
             )
@@ -1069,11 +1130,21 @@ struct WayboundMapView: UIViewRepresentable {
         }
 
         private func stabilizeCorridorRunOffsets(
+            points: [MKMapPoint],
             layouts: [CorridorSegmentLayout?],
             offsets: inout [Double]
         ) {
-            guard offsets.count == layouts.count + 1 else { return }
+            guard offsets.count == layouts.count + 1,
+                  points.count == offsets.count
+            else { return }
+            // A brief detection dropout — a bend dipping under the parallel
+            // threshold, a crossing street — splits one physical corridor into
+            // two runs. Reissuing the outside "entering" lane to the second run
+            // made strands jog sideways and back for no visible reason. Only a
+            // genuinely long departure from the corridor counts as leaving it.
+            let corridorContinuationDistance: CLLocationDistance = 150
             var runStart = 0
+            var previousRun: (endIndex: Int, offset: Double, referenceID: Int)?
 
             while runStart < layouts.count {
                 while runStart < layouts.count, layouts[runStart] == nil {
@@ -1087,14 +1158,27 @@ struct WayboundMapView: UIViewRepresentable {
                     runEnd += 1
                 }
 
-                // At a clipped viewport edge there is no topology history, so use
-                // the compact local stack. A genuine mid-shape join takes the
-                // precomputed outside lane and leaves incumbents untouched.
-                let stableOffset = runStart == 0
-                    ? firstLayout.offset : firstLayout.enteringOffset
+                let stableOffset: Double
+                if let previousRun,
+                   previousRun.referenceID == firstLayout.referenceID,
+                   (previousRun.endIndex..<runStart).reduce(0.0, {
+                       $0 + points[$1].distance(to: points[$1 + 1])
+                   }) <= corridorContinuationDistance {
+                    // Same corridor, short dropout: hold the lane already won.
+                    stableOffset = previousRun.offset
+                } else if runStart == 0 {
+                    // At a clipped viewport edge there is no topology history,
+                    // so use the compact local stack.
+                    stableOffset = firstLayout.offset
+                } else {
+                    // A genuine mid-shape join takes the precomputed outside
+                    // lane and leaves incumbents untouched.
+                    stableOffset = firstLayout.enteringOffset
+                }
                 for vertexIndex in runStart...runEnd {
                     offsets[vertexIndex] = stableOffset
                 }
+                previousRun = (runEnd, stableOffset, firstLayout.referenceID)
                 runStart = runEnd
             }
         }
@@ -1108,7 +1192,13 @@ struct WayboundMapView: UIViewRepresentable {
             deltaX: inout [Double],
             deltaY: inout [Double]
         ) {
-            let maximumGapDistance: CLLocationDistance = 48
+            // Matches the corridor-continuation distance used when stabilizing
+            // run offsets: a dropout short enough to hold its lane through is
+            // also short enough to bridge, so the ribbon stays straight instead
+            // of pinching to the centerline and fanning back out. The gates
+            // below (same reference shape, same side, at most one lane of
+            // change) still prevent bridging across a genuine turn.
+            let maximumGapDistance: CLLocationDistance = 150
             let maximumLaneChange = RouteMapStyle.laneSpacingPoints * 1.1
             guard points.count > 2,
                   points.count == explicitlyStacked.count,
@@ -1703,12 +1793,18 @@ struct WayboundMapView: UIViewRepresentable {
                 for index in 0..<(lanePoints.count - 1) {
                     let isShared = laneSamples.sharedVertices[index]
                         && laneSamples.sharedVertices[index + 1]
-                    if !isShared {
+                    let hasIsolatedCoverage =
+                        laneSamples.isolatedVertices[index]
+                        && laneSamples.isolatedVertices[index + 1]
+                    // Mirror the renderer: any segment still carrying isolated
+                    // geometry is drawn at full strength at every zoom, so it
+                    // is always tappable.
+                    if !isShared || hasIsolatedCoverage {
                         considerSegment(
                             from: lanePoints[index],
                             to: lanePoints[index + 1]
                         )
-                        continue
+                        if !isShared { continue }
                     }
                     if detailProgress > 0.05 {
                         considerSegment(
@@ -1862,7 +1958,17 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
                 && laneSamples.sharedVertices[index]
                 && laneSamples.sharedVertices[index + 1]
         }
-        let isolatedSegments = sharedSegments.map { !$0 }
+        // A segment keeps drawing at full strength whenever it still contains
+        // any non-interlined geometry. At far zoom the dedup radius spans whole
+        // blocks, so a merged vertex can carry both shared and isolated
+        // coverage — treating those as purely shared made entire routes fade
+        // with the detail cross-fade even though most of that stretch was not
+        // interlined at all.
+        let isolatedSegments = (0..<segmentCount).map { index in
+            !sharedSegments[index]
+                || (laneSamples.isolatedVertices[index]
+                    && laneSamples.isolatedVertices[index + 1])
+        }
         let ownedTrunkSegments = (0..<segmentCount).map { index in
             sharedSegments[index]
                 && hasOwnerState
@@ -2018,12 +2124,21 @@ private struct RouteLaneSamples {
     var points: [CGPoint]
     var offsets: [CGFloat]
     var sharedVertices: [Bool]
+    var isolatedVertices: [Bool]
     var trunkOwnerVertices: [Bool]
 }
 
 /// Remove coincident GTFS samples without throwing away their corridor state.
 /// Lane offsets must be applied before geometric simplification, but applying
 /// them to zero-length segments can create spikes and crossbars.
+///
+/// Shared and isolated coverage are tracked independently. At far zoom the
+/// merge distance spans whole blocks, and collapsing an isolated stretch into
+/// a vertex that also absorbed shared samples must not reclassify that stretch
+/// as interlined — that is what made entire routes fade when zooming out.
+/// A merged vertex therefore remembers "contains shared geometry" and
+/// "contains isolated geometry" separately, and a run keeps full opacity as
+/// long as it has isolated coverage.
 private func deduplicatedRouteLaneSamples(
     points: [CGPoint],
     offsets: [CGFloat],
@@ -2036,6 +2151,7 @@ private func deduplicatedRouteLaneSamples(
             points: points,
             offsets: Array(repeating: 0, count: points.count),
             sharedVertices: Array(repeating: false, count: points.count),
+            isolatedVertices: Array(repeating: true, count: points.count),
             trunkOwnerVertices: Array(repeating: false, count: points.count)
         )
     }
@@ -2045,6 +2161,7 @@ private func deduplicatedRouteLaneSamples(
         points: [],
         offsets: [],
         sharedVertices: [],
+        isolatedVertices: [],
         trunkOwnerVertices: []
     )
 
@@ -2060,6 +2177,8 @@ private func deduplicatedRouteLaneSamples(
             }
             result.sharedVertices[lastIndex] =
                 result.sharedVertices[lastIndex] || isShared
+            result.isolatedVertices[lastIndex] =
+                result.isolatedVertices[lastIndex] || !isShared
             result.trunkOwnerVertices[lastIndex] =
                 result.trunkOwnerVertices[lastIndex] || isTrunkOwner
             continue
@@ -2067,6 +2186,7 @@ private func deduplicatedRouteLaneSamples(
         result.points.append(point)
         result.offsets.append(offsets[index])
         result.sharedVertices.append(isShared)
+        result.isolatedVertices.append(!isShared)
         result.trunkOwnerVertices.append(isTrunkOwner)
     }
     return result
