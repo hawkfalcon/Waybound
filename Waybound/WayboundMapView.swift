@@ -129,12 +129,28 @@ struct WayboundMapView: UIViewRepresentable {
         private var viewportRefreshWorkItem: DispatchWorkItem?
         private var lastRouteClipRect: MKMapRect?
         private var lastEscapeDrivenRefresh = Date.distantPast
+        private var lastContentSignature: Int?
+        private var corridorSignature: Int?
+        /// Full-polyline lane layouts, computed once per corridor-content change
+        /// and only clipped per viewport tick. Recomputing these on every pan
+        /// frame was O(routes² × segments²) and drove the memory spikes that got
+        /// the app jettisoned.
+        private var laneLayoutsByJourneyID: [Int: [CorridorLaneLayout]] = [:]
 
         init(parent: WayboundMapView) {
             self.parent = parent
         }
 
         func rebuildMapContent(on mapView: MKMapView) {
+            // updateUIView runs on every SwiftUI state change — camera requests,
+            // sheet interactions, timers — and a full teardown/re-add of every
+            // annotation and overlay on each of those was constant allocation
+            // churn. Rebuild only when something the map actually shows changed;
+            // pure viewport work goes through the cheaper debounced refresh.
+            let signature = contentSignature()
+            guard signature != lastContentSignature else { return }
+            lastContentSignature = signature
+
             viewportRefreshWorkItem?.cancel()
             mapView.removeOverlays(mapView.overlays)
             mapView.removeAnnotations(
@@ -164,6 +180,164 @@ struct WayboundMapView: UIViewRepresentable {
             refreshViewportContent(on: mapView)
         }
 
+        /// Everything the map draws is derived from these inputs. Journey IDs
+        /// stand in for geometry because a RouteJourney's shape is immutable
+        /// for the lifetime of its trip ID.
+        private func contentSignature() -> Int {
+            var hasher = Hasher()
+            for journey in parent.journeys {
+                hasher.combine(journey.id)
+                hasher.combine(journey.observedDepartureCount)
+            }
+            hasher.combine(parent.selectedJourneyID)
+            hasher.combine(parent.selectedStopID)
+            hasher.combine(parent.highlightedJourneyIDs)
+            hasher.combine(parent.showsMapLadder)
+            hasher.combine(parent.viewportBottomInset)
+            return hasher.finalize()
+        }
+
+        /// Corridor lanes depend on the journey set and on which route wins
+        /// trunk dominance (selection/highlight), but not on the viewport.
+        /// Recompute them only when one of those inputs changes; panning and
+        /// zooming reuse the cached layouts and merely re-clip them.
+        private func ensureCorridorLaneLayouts() {
+            var hasher = Hasher()
+            for journey in parent.journeys {
+                hasher.combine(journey.id)
+                hasher.combine(journey.observedDepartureCount)
+            }
+            hasher.combine(parent.selectedJourneyID)
+            hasher.combine(parent.highlightedJourneyIDs)
+            let signature = hasher.finalize()
+            guard signature != corridorSignature else { return }
+            corridorSignature = signature
+
+            // Ribbon lanes and the far-zoom trunk are built only from the vivid
+            // "where can I go" flagship paths. Approach geometry ("where the
+            // bus has been") and post-destination continuations stay plain
+            // centerlines: they may not claim a lane, mark another route's
+            // flagship as shared, or win a trunk that would then be drawn
+            // faded — or, for continuations, not drawn at all.
+            corridorGeometryByJourneyID = Dictionary(
+                uniqueKeysWithValues: parent.journeys.enumerated().map {
+                    index, journey in
+                    (
+                        journey.id,
+                        CorridorJourneyGeometry(
+                            stackOrder: index,
+                            routeNumber: journey.route.routeNumber
+                                ?? journey.route.shortName,
+                            agencyName: journey.route.agencyName,
+                            directionID: journey.directionID,
+                            observedDepartureCount: journey.observedDepartureCount,
+                            segmentIndex: CorridorSegmentIndex(
+                                segments: routeSegments(
+                                    for: journey.flagshipPolylines
+                                )
+                            )
+                        )
+                    )
+                }
+            )
+
+            laneLayoutsByJourneyID = [:]
+            for journey in parent.journeys {
+                // Regular samples give branch merges enough geometry to fan
+                // over distance. Sparse GTFS vertices otherwise force an entire
+                // ribbon to change lane at one sharp point.
+                laneLayoutsByJourneyID[journey.id] = journey.flagshipPolylines
+                    .filter { $0.count >= 2 }
+                    .map {
+                        sharedCorridorLaneLayout(
+                            for: densifiedRouteCoordinates($0),
+                            journeyID: journey.id
+                        )
+                    }
+            }
+        }
+
+        /// Approach and continuation context lines take no lane and join no
+        /// corridor; they draw exactly on their own centerline.
+        private func plainLaneLayouts(
+            for polylines: [[CLLocationCoordinate2D]]
+        ) -> [CorridorLaneLayout] {
+            polylines.compactMap { coordinates in
+                guard coordinates.count >= 2 else { return nil }
+                return CorridorLaneLayout(
+                    coordinates: coordinates,
+                    offsets: Array(repeating: 0, count: coordinates.count),
+                    sharedVertices: Array(
+                        repeating: false,
+                        count: coordinates.count
+                    ),
+                    trunkOwnerVertices: Array(
+                        repeating: false,
+                        count: coordinates.count
+                    )
+                )
+            }
+        }
+
+        /// Split a cached lane layout into the runs whose segments touch the
+        /// padded viewport. Vertices are kept whole rather than trimmed to the
+        /// exact boundary: the clip rect already extends 1.5 screens past the
+        /// visible edge, and preserving vertices keeps every per-vertex lane
+        /// attribute valid without interpolation.
+        private func clippedLaneLayouts(
+            _ layouts: [CorridorLaneLayout],
+            to rect: MKMapRect
+        ) -> [CorridorLaneLayout] {
+            layouts.flatMap { layout -> [CorridorLaneLayout] in
+                let count = layout.coordinates.count
+                guard count >= 2,
+                      layout.offsets.count == count,
+                      layout.sharedVertices.count == count,
+                      layout.trunkOwnerVertices.count == count
+                else { return [] }
+                let points = layout.coordinates.map { MKMapPoint($0) }
+                var result: [CorridorLaneLayout] = []
+                var runStart: Int?
+
+                func closeRun(at lastVertex: Int) {
+                    guard let start = runStart, lastVertex > start else {
+                        runStart = nil
+                        return
+                    }
+                    result.append(
+                        CorridorLaneLayout(
+                            coordinates: Array(
+                                layout.coordinates[start...lastVertex]
+                            ),
+                            offsets: Array(layout.offsets[start...lastVertex]),
+                            sharedVertices: Array(
+                                layout.sharedVertices[start...lastVertex]
+                            ),
+                            trunkOwnerVertices: Array(
+                                layout.trunkOwnerVertices[start...lastVertex]
+                            )
+                        )
+                    )
+                    runStart = nil
+                }
+
+                for index in 0..<(count - 1) {
+                    let segmentIsVisible = clippedSegment(
+                        from: points[index],
+                        to: points[index + 1],
+                        inside: rect
+                    ) != nil
+                    if segmentIsVisible {
+                        if runStart == nil { runStart = index }
+                    } else {
+                        closeRun(at: index)
+                    }
+                }
+                closeRun(at: count - 1)
+                return result
+            }
+        }
+
         /// Centerlines clip to the real drawable map boundary: the screen edges and
         /// the exact top of the sheet. Destination cards use a separate safe layout
         /// rectangle, so keeping labels readable never shortens the route itself.
@@ -190,29 +364,7 @@ struct WayboundMapView: UIViewRepresentable {
             lastRouteClipRect = routeViewport
             let selectedID = parent.selectedJourneyID
             let highlightedJourneyIDs = parent.highlightedJourneyIDs
-            // Ribbon lanes and the far-zoom trunk are built only from the vivid
-            // "where can I go" flagship paths. Approach geometry ("where the
-            // bus has been") and post-destination continuations stay plain
-            // centerlines: they may not claim a lane, mark another route's
-            // flagship as shared, or win a trunk that would then be drawn
-            // faded — or, for continuations, not drawn at all.
-            corridorGeometryByJourneyID = Dictionary(
-                uniqueKeysWithValues: parent.journeys.enumerated().map {
-                    index, journey in
-                    (
-                        journey.id,
-                        CorridorJourneyGeometry(
-                            stackOrder: index,
-                            routeNumber: journey.route.routeNumber
-                                ?? journey.route.shortName,
-                            agencyName: journey.route.agencyName,
-                            directionID: journey.directionID,
-                            observedDepartureCount: journey.observedDepartureCount,
-                            segments: routeSegments(for: journey.flagshipPolylines)
-                        )
-                    )
-                }
-            )
+            ensureCorridorLaneLayouts()
 
             // Draw the already-travelled portion underneath every active route.
             // It answers "where is this bus coming from?" without competing with
@@ -222,9 +374,11 @@ struct WayboundMapView: UIViewRepresentable {
             for journey in parent.journeys {
                 let isHighlighted = highlightedJourneyIDs?.contains(journey.id) ?? true
                 addOverlays(
-                    for: clippedPolylines(
-                        journey.approachPolylines,
-                        to: routeViewport
+                    layouts: plainLaneLayouts(
+                        for: clippedPolylines(
+                            journey.approachPolylines,
+                            to: routeViewport
+                        )
                     ),
                     journeyID: journey.id,
                     color: UIColor(journey.route.color),
@@ -232,7 +386,6 @@ struct WayboundMapView: UIViewRepresentable {
                     lineWidth: RouteMapStyle.standardLineWidth,
                     isSelected: selectedID == journey.id,
                     dashed: false,
-                    joinsCorridors: false,
                     to: mapView
                 )
             }
@@ -242,8 +395,8 @@ struct WayboundMapView: UIViewRepresentable {
                 let isHighlighted = highlightedJourneyIDs?.contains(journey.id) ?? true
                 let opacity = isHighlighted ? 0.94 : 0.12
                 addOverlays(
-                    for: clippedPolylines(
-                        journey.flagshipPolylines,
+                    layouts: clippedLaneLayouts(
+                        laneLayoutsByJourneyID[journey.id] ?? [],
                         to: routeViewport
                     ),
                     journeyID: journey.id,
@@ -254,15 +407,16 @@ struct WayboundMapView: UIViewRepresentable {
                         : (isHighlighted ? RouteMapStyle.standardLineWidth : 2.5),
                     isSelected: isSelected,
                     dashed: false,
-                    joinsCorridors: true,
                     to: mapView
                 )
 
                 if isSelected && parent.showsMapLadder {
                     addOverlays(
-                        for: clippedPolylines(
-                            journey.continuationPolylines,
-                            to: routeViewport
+                        layouts: plainLaneLayouts(
+                            for: clippedPolylines(
+                                journey.continuationPolylines,
+                                to: routeViewport
+                            )
                         ),
                         journeyID: journey.id,
                         color: UIColor(journey.route.color),
@@ -270,7 +424,6 @@ struct WayboundMapView: UIViewRepresentable {
                         lineWidth: RouteMapStyle.standardLineWidth,
                         isSelected: true,
                         dashed: true,
-                        joinsCorridors: false,
                         to: mapView
                     )
                 }
@@ -823,41 +976,16 @@ struct WayboundMapView: UIViewRepresentable {
         }
 
         private func addOverlays(
-            for polylines: [[CLLocationCoordinate2D]],
+            layouts: [CorridorLaneLayout],
             journeyID: Int,
             color: UIColor,
             opacity: Double,
             lineWidth: Double,
             isSelected: Bool,
             dashed: Bool,
-            joinsCorridors: Bool,
             to mapView: MKMapView
         ) {
-            for coordinates in polylines where coordinates.count >= 2 {
-                // Regular samples give branch merges enough geometry to fan over
-                // distance. Sparse GTFS vertices otherwise force an entire ribbon
-                // to change lane at one sharp point.
-                let preparedCoordinates = densifiedRouteCoordinates(coordinates)
-                let laneLayout = joinsCorridors
-                    ? sharedCorridorLaneLayout(
-                        for: preparedCoordinates,
-                        journeyID: journeyID
-                    )
-                    : CorridorLaneLayout(
-                        coordinates: preparedCoordinates,
-                        offsets: Array(
-                            repeating: 0,
-                            count: preparedCoordinates.count
-                        ),
-                        sharedVertices: Array(
-                            repeating: false,
-                            count: preparedCoordinates.count
-                        ),
-                        trunkOwnerVertices: Array(
-                            repeating: false,
-                            count: preparedCoordinates.count
-                        )
-                    )
+            for laneLayout in layouts where laneLayout.coordinates.count >= 2 {
                 let overlay = RouteLaneOverlay(
                     coordinates: laneLayout.coordinates,
                     journeyID: journeyID,
@@ -1167,8 +1295,8 @@ struct WayboundMapView: UIViewRepresentable {
                     // Same corridor, short dropout: hold the lane already won.
                     stableOffset = previousRun.offset
                 } else if runStart == 0 {
-                    // At a clipped viewport edge there is no topology history,
-                    // so use the compact local stack.
+                    // The route begins already inside the corridor, so there is
+                    // no topology history: use the compact local stack.
                     stableOffset = firstLayout.offset
                 } else {
                     // A genuine mid-shape join takes the precomputed outside
@@ -1371,20 +1499,24 @@ struct WayboundMapView: UIViewRepresentable {
                 // A true shared road remains close and parallel across this entire
                 // short sample. Requiring both endpoints eliminates incidental
                 // matches at crossings and the inside edge of unrelated turns.
+                // The spatial index narrows each test to the handful of
+                // candidate segments actually near that point.
                 guard let midpointSegment = parallelCorridorSegment(
                     near: midpoint,
                     direction: segment,
-                    among: geometry.segments
+                    among: geometry.segmentIndex.segments(near: midpoint)
                 ),
                       hasParallelCorridor(
                         near: segment.start,
                         direction: segment,
-                        among: geometry.segments
+                        among: geometry.segmentIndex.segments(
+                            near: segment.start
+                        )
                       ),
                       hasParallelCorridor(
                         near: segment.end,
                         direction: segment,
-                        among: geometry.segments
+                        among: geometry.segmentIndex.segments(near: segment.end)
                       )
                 else { continue }
                 localSegmentByJourneyID[candidateID] = midpointSegment
@@ -1599,7 +1731,84 @@ struct WayboundMapView: UIViewRepresentable {
             let agencyName: String
             let directionID: Int?
             let observedDepartureCount: Int
-            let segments: [MapRouteSegment]
+            let segmentIndex: CorridorSegmentIndex
+        }
+
+        /// Coarse spatial hash over a journey's corridor segments. Corridor
+        /// detection asks "which of this journey's segments pass within 20
+        /// meters of this point?" thousands of times per layout pass; scanning
+        /// the full segment list for each query made the whole pass
+        /// O(routes² × segments²) and was the main driver of the memory/CPU
+        /// spikes that got the app jettisoned. Each segment is registered in
+        /// every grid cell its padded bounding box overlaps, so a query only
+        /// inspects the one cell containing the query point.
+        private struct CorridorSegmentIndex {
+            private static let queryPadding: CLLocationDistance = 24
+            private let cellSize: Double
+            private let segments: [MapRouteSegment]
+            private var segmentIndicesByCell: [UInt64: [Int32]] = [:]
+
+            init(segments: [MapRouteSegment]) {
+                self.segments = segments
+                guard let first = segments.first else {
+                    cellSize = 1
+                    return
+                }
+                // Map-point units per meter vary only with latitude; one city
+                // area is uniform enough for a conservative padded grid.
+                let pointsPerMeter = MKMapPointsPerMeterAtLatitude(
+                    first.start.coordinate.latitude
+                )
+                cellSize = max(1, 64 * pointsPerMeter)
+                let padding = Self.queryPadding * pointsPerMeter
+
+                for (index, segment) in segments.enumerated() {
+                    let minCellX = Int32(
+                        (min(segment.start.x, segment.end.x) - padding)
+                            / cellSize
+                    )
+                    let maxCellX = Int32(
+                        (max(segment.start.x, segment.end.x) + padding)
+                            / cellSize
+                    )
+                    let minCellY = Int32(
+                        (min(segment.start.y, segment.end.y) - padding)
+                            / cellSize
+                    )
+                    let maxCellY = Int32(
+                        (max(segment.start.y, segment.end.y) + padding)
+                            / cellSize
+                    )
+                    guard minCellX <= maxCellX, minCellY <= maxCellY else {
+                        continue
+                    }
+                    for cellX in minCellX...maxCellX {
+                        for cellY in minCellY...maxCellY {
+                            segmentIndicesByCell[
+                                Self.cellKey(cellX, cellY),
+                                default: []
+                            ].append(Int32(index))
+                        }
+                    }
+                }
+            }
+
+            /// Valid for query radii up to `queryPadding` meters — enough for
+            /// the 20-meter corridor separation test.
+            func segments(near point: MKMapPoint) -> [MapRouteSegment] {
+                guard !segments.isEmpty else { return [] }
+                let key = Self.cellKey(
+                    Int32(point.x / cellSize),
+                    Int32(point.y / cellSize)
+                )
+                guard let indices = segmentIndicesByCell[key] else { return [] }
+                return indices.map { segments[Int($0)] }
+            }
+
+            private static func cellKey(_ x: Int32, _ y: Int32) -> UInt64 {
+                UInt64(UInt32(bitPattern: x)) << 32
+                    | UInt64(UInt32(bitPattern: y))
+            }
         }
 
         private struct CorridorLaneLayout {
@@ -1883,7 +2092,13 @@ private final class RouteLaneOverlay: NSObject, MKOverlay {
 
     var coordinate: CLLocationCoordinate2D { polyline.coordinate }
     var boundingMapRect: MKMapRect {
-        polyline.boundingMapRect.insetBy(dx: -1_000_000, dy: -1_000_000)
+        // Pad for screen-space stroke widths and lane offsets so strokes are
+        // not clipped at tile edges (~6 km covers them down to city-overview
+        // zoom). The old ±1,000,000-point inflation made every map tile within
+        // ~150 km run this overlay's full draw pipeline — dozens of large
+        // temporary arrays per tile per overlay — which multiplied CPU and
+        // memory for no visual benefit.
+        polyline.boundingMapRect.insetBy(dx: -40_000, dy: -40_000)
     }
 
     init(
