@@ -7,7 +7,7 @@ private enum RouteExpansionPrototype: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .sheet: "Stops in sheet"
+        case .sheet: "Stops listed"
         case .map: "Stops on map"
         }
     }
@@ -462,9 +462,24 @@ private struct JourneyOverviewSheet: View {
 
     private var contextDescription: String {
         let routeScope = selectedStopName.map { "Trips serving \($0)" }
-            ?? "Up to eight numbered routes · both useful directions"
+            ?? "Buses you can catch nearby"
         guard let planningDate else { return routeScope }
         return "\(planningDate.formatted(date: .abbreviated, time: .shortened)) · \(routeScope)"
+    }
+
+    /// Both useful directions of one route are a single mental object ("the
+    /// 11"), so they sit adjacent in the list. Groups keep the ranking of
+    /// their best journey; within a group the sooner departure leads.
+    private var groupedJourneys: [RouteJourney] {
+        var groupOrder: [String] = []
+        var groups: [String: [RouteJourney]] = [:]
+        for journey in journeys {
+            let key = "\(journey.route.agencyName)|"
+                + (journey.route.routeNumber ?? journey.route.shortName)
+            if groups[key] == nil { groupOrder.append(key) }
+            groups[key, default: []].append(journey)
+        }
+        return groupOrder.flatMap { groups[$0] ?? [] }
     }
 
     var body: some View {
@@ -545,7 +560,7 @@ private struct JourneyOverviewSheet: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 6) {
-                        ForEach(journeys) { journey in
+                        ForEach(groupedJourneys) { journey in
                             Button {
                                 onSelect(journey.id)
                             } label: {
@@ -594,8 +609,20 @@ private struct JourneyOverviewSheet: View {
 private struct JourneyRow: View {
     let journey: RouteJourney
 
+    private var arrivalTimeText: String {
+        journey.arrivalDate.formatted(date: .omitted, time: .shortened)
+    }
+
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
+            // The accent stripe is the same ink as the route's map strand, so
+            // scanning between a card and the line it describes needs no
+            // reading — the card visually *is* a piece of the route.
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(journey.route.color)
+                .frame(width: 3.5)
+                .padding(.vertical, 2)
+
             RouteBadge(route: journey.route, size: 34)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -605,8 +632,11 @@ private struct JourneyRow: View {
                         .foregroundStyle(WayboundPalette.ink)
                         .lineLimit(1)
                     Spacer(minLength: 3)
-                    Text("\(journey.totalMinutes) min")
-                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    // The commitment answer: when do I get there? Clock time
+                    // is what riders plan around; duration stays for comparing
+                    // options against each other.
+                    Text("Arrive \(arrivalTimeText)")
+                        .font(.system(size: 12.5, weight: .bold, design: .monospaced))
                         .foregroundStyle(journey.route.color)
                 }
 
@@ -618,8 +648,14 @@ private struct JourneyRow: View {
                     TimingChip(icon: "hourglass", label: "wait", minutes: journey.waitMinutes)
                     TimingChip(icon: "bus.fill", label: "ride", minutes: journey.rideMinutes)
                     Spacer(minLength: 0)
-                    if journey.departureIsRealtime {
-                        LiveBadge()
+                    // Realtime is the norm and earns no marker; only the
+                    // exception — a schedule-only estimate — is called out.
+                    if !journey.departureIsRealtime {
+                        ScheduledBadge()
+                    } else {
+                        Text("\(journey.totalMinutes) min")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(WayboundPalette.ink.opacity(0.55))
                     }
                 }
             }
@@ -638,7 +674,7 @@ private struct JourneyRow: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(journey.route.fullDisplayName) to \(journey.destinationName). Bus in \(journey.departureMinutesFromNow) minutes. Walk \(journey.walkMinutes), wait \(journey.waitMinutes), ride \(journey.rideMinutes), \(journey.totalMinutes) minutes total."
+            "\(journey.route.fullDisplayName) to \(journey.destinationName). Bus in \(journey.departureMinutesFromNow) minutes, arriving \(arrivalTimeText). Walk \(journey.walkMinutes), wait \(journey.waitMinutes), ride \(journey.rideMinutes), \(journey.totalMinutes) minutes total.\(journey.departureIsRealtime ? "" : " Scheduled estimate.")"
         )
     }
 }
@@ -680,7 +716,11 @@ private struct JourneyDetailSheet: View {
     let onRecenter: () -> Void
 
     private var timingDescription: String {
-        let relativeTiming = "\(journey.totalMinutes) min total · bus in \(journey.departureMinutesFromNow) min"
+        let arrivalTime = journey.arrivalDate.formatted(
+            date: .omitted,
+            time: .shortened
+        )
+        let relativeTiming = "Arrive \(arrivalTime) · \(journey.totalMinutes) min · bus in \(journey.departureMinutesFromNow)"
         guard let planningDate else { return relativeTiming }
         let previewTime = planningDate.formatted(
             .dateTime.weekday(.abbreviated).hour().minute()
@@ -785,14 +825,11 @@ private struct JourneyDetailSheet: View {
                 TimingChip(icon: "bus.fill", label: "ride", minutes: journey.rideMinutes)
                 Spacer()
                 if journey.departureIsRealtime {
-                    LiveBadge()
-                    Text("departure · scheduled ride")
+                    Text("live departure · scheduled ride")
                         .font(.system(size: 9, design: .rounded))
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("Scheduled departure and ride")
-                        .font(.system(size: 9, design: .rounded))
-                        .foregroundStyle(.secondary)
+                    ScheduledBadge()
                 }
             }
             .padding(.horizontal, 16)
@@ -954,17 +991,19 @@ private struct TimingChip: View {
     }
 }
 
-private struct LiveBadge: View {
+/// Realtime departures are the expected case and carry no marker. Only the
+/// exception — an estimate from the static schedule — earns a flag, so the
+/// badge means something when it appears.
+private struct ScheduledBadge: View {
     var body: some View {
         HStack(spacing: 3) {
-            Circle()
-                .fill(Color.green)
-                .frame(width: 5, height: 5)
-            Text("Live")
+            Image(systemName: "clock")
+                .font(.system(size: 8, weight: .semibold))
+            Text("Sched")
                 .font(.system(size: 9.5, weight: .bold, design: .monospaced))
         }
-        .foregroundStyle(WayboundPalette.ink.opacity(0.72))
-        .accessibilityLabel("Live departure estimate")
+        .foregroundStyle(WayboundPalette.ink.opacity(0.55))
+        .accessibilityLabel("Scheduled estimate, no live data")
     }
 }
 

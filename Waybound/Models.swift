@@ -112,6 +112,40 @@ struct RouteJourney: Identifiable, Equatable {
         stops.first(where: \.isFlagship)
     }
 
+    /// When the rider steps off at the flagship stop. Riders plan around clock
+    /// time ("arrives 8:09"), not durations they must add to "now" themselves.
+    var arrivalDate: Date {
+        departureDate.addingTimeInterval(TimeInterval(rideMinutes * 60))
+    }
+
+    /// Map destination tags have one job: name the place in ~150 points. Prefer
+    /// the landmark token over a full "CrossStreet & Landmark Somethingplace"
+    /// stop name, and drop directional qualifiers that carry no spatial
+    /// information when the line itself is visible.
+    var compactDestinationName: String {
+        var name = destinationName
+        let directionalSuffixes = [
+            "Outbound", "Inbound", "Northbound", "Southbound",
+            "Eastbound", "Westbound",
+        ]
+        for suffix in directionalSuffixes where name.hasSuffix(" " + suffix) {
+            name = String(name.dropLast(suffix.count + 1))
+                .trimmingCharacters(in: .whitespaces)
+        }
+        guard name.count > 20 else { return name }
+        // The most specific token usually follows the last separator:
+        // "Hollister & Camino Real Marketplace" → "Camino Real Marketplace",
+        // "Hollister/State, Downtown SB" → "Downtown SB".
+        for separator in [", ", " & ", " - ", " @ "] {
+            guard let range = name.range(of: separator, options: .backwards)
+            else { continue }
+            let candidate = String(name[range.upperBound...])
+                .trimmingCharacters(in: .whitespaces)
+            if candidate.count >= 4 { return candidate }
+        }
+        return name
+    }
+
     static func == (lhs: RouteJourney, rhs: RouteJourney) -> Bool {
         lhs.id == rhs.id && lhs.tripID == rhs.tripID
     }

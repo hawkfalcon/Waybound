@@ -14,7 +14,10 @@ struct WayboundCameraRequest: Equatable {
 private enum RouteMapStyle {
     static let standardLineWidth: Double = 3.4
     static let selectedLineWidth: Double = 3.65
-    static let separatorWidth: Double = 0.55
+    /// The hairline ink gap drawn between interlined lanes. Several routes in
+    /// one hue family can share a corridor; the thin dark separator — not
+    /// color — is what keeps adjacent strands countable without clutter.
+    static let separatorWidth: Double = 0.8
     static let trunkLineWidth: Double = 4.4
     static let trunkCasingExpansion: Double = 0.9
     static let laneSpacingPoints = standardLineWidth + separatorWidth
@@ -130,6 +133,8 @@ struct WayboundMapView: UIViewRepresentable {
         private var lastRouteClipRect: MKMapRect?
         private var lastEscapeDrivenRefresh = Date.distantPast
         private var lastContentSignature: Int?
+        private var lastPulsedJourneyID: Int?
+        private var pulseTimer: Timer?
         private var corridorSignature: Int?
         /// Full-polyline lane layouts, computed once per corridor-content change
         /// and only clipped per viewport tick. Recomputing these on every pan
@@ -178,6 +183,63 @@ struct WayboundMapView: UIViewRepresentable {
             }
 
             refreshViewportContent(on: mapView)
+
+            // In a dense corridor several routes share one hue family, so a
+            // color chip alone cannot say "this line right here." A brief
+            // pulse on the newly selected strand closes that gap. Added after
+            // the rebuild so the teardown above cannot remove it mid-flight.
+            if parent.selectedJourneyID != lastPulsedJourneyID {
+                lastPulsedJourneyID = parent.selectedJourneyID
+                pulseSelectedRoute(on: mapView)
+            }
+        }
+
+        /// One soft, route-colored halo sweeps the selected strand and fades.
+        /// It runs ~0.9 s and removes itself; selection state, not the pulse,
+        /// carries the persistent emphasis.
+        private func pulseSelectedRoute(on mapView: MKMapView) {
+            pulseTimer?.invalidate()
+            pulseTimer = nil
+            for overlay in mapView.overlays where overlay is RoutePulseOverlay {
+                mapView.removeOverlay(overlay)
+            }
+            guard let selectedID = parent.selectedJourneyID,
+                  let journey = parent.journeys.first(where: {
+                      $0.id == selectedID
+                  })
+            else { return }
+
+            let polylines = journey.flagshipPolylines
+                .filter { $0.count >= 2 }
+                .map { MKPolyline(coordinates: $0, count: $0.count) }
+            guard !polylines.isEmpty else { return }
+            let pulse = RoutePulseOverlay(polylines)
+            pulse.color = UIColor(journey.route.color)
+            mapView.addOverlay(pulse, level: .aboveRoads)
+
+            let pulseStart = Date()
+            let pulseDuration: TimeInterval = 0.9
+            pulseTimer = Timer.scheduledTimer(
+                withTimeInterval: 1.0 / 30.0,
+                repeats: true
+            ) { [weak self, weak mapView, weak pulse] timer in
+                guard let self, let mapView, let pulse else {
+                    timer.invalidate()
+                    return
+                }
+                let progress = Date().timeIntervalSince(pulseStart)
+                    / pulseDuration
+                guard progress < 1 else {
+                    timer.invalidate()
+                    self.pulseTimer = nil
+                    mapView.removeOverlay(pulse)
+                    return
+                }
+                if let renderer = mapView.renderer(for: pulse) {
+                    // Ease-out fade: bright at tap, gone before it can nag.
+                    renderer.alpha = CGFloat(pow(1 - progress, 1.6))
+                }
+            }
         }
 
         /// Everything the map draws is derived from these inputs. Journey IDs
@@ -1849,6 +1911,14 @@ struct WayboundMapView: UIViewRepresentable {
             _ mapView: MKMapView,
             rendererFor overlay: MKOverlay
         ) -> MKOverlayRenderer {
+            if let pulse = overlay as? RoutePulseOverlay {
+                let renderer = MKMultiPolylineRenderer(multiPolyline: pulse)
+                renderer.strokeColor = pulse.color.withAlphaComponent(0.5)
+                renderer.lineWidth = 14
+                renderer.lineCap = .round
+                renderer.lineJoin = .round
+                return renderer
+            }
             guard let routeOverlay = overlay as? RouteLaneOverlay else {
                 return MKOverlayRenderer(overlay: overlay)
             }
@@ -2076,6 +2146,13 @@ struct WayboundMapView: UIViewRepresentable {
 }
 
 // MARK: - Screen-space route lanes
+
+/// A transient wide halo over the selected route's flagship shape. Purely
+/// attentional: it exists for under a second after selection to answer
+/// "which of these strands did I just pick?"
+private final class RoutePulseOverlay: MKMultiPolyline {
+    var color: UIColor = .systemBlue
+}
 
 private final class RouteLaneOverlay: NSObject, MKOverlay {
     let coordinates: [CLLocationCoordinate2D]
@@ -2697,14 +2774,22 @@ private final class DestinationAnnotationView: MKAnnotationView {
         destinationLabel.textColor = UIColor(
             red: 0.14, green: 0.19, blue: 0.18, alpha: 1
         )
-        destinationLabel.text = routePrefix + annotation.journey.destinationName
+        // The tag's one job is naming the place. The compact landmark form
+        // ("Camino Real Marketplace") survives 134 points; the full stop name
+        // usually truncates into "Hollister & Camin…", which names nothing.
+        destinationLabel.text = routePrefix
+            + annotation.journey.compactDestinationName
         destinationLabel.lineBreakMode = .byTruncatingTail
         card.addSubview(destinationLabel)
 
         let timeLabel = UILabel(frame: CGRect(x: 10, y: 18, width: 134, height: 13))
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 9, weight: .bold)
         timeLabel.textColor = routeColor
-        timeLabel.text = "\(annotation.journey.totalMinutes) min total"
+        let arrivalTime = annotation.journey.arrivalDate.formatted(
+            date: .omitted,
+            time: .shortened
+        )
+        timeLabel.text = "Arrive \(arrivalTime) · \(annotation.journey.totalMinutes) min"
         card.addSubview(timeLabel)
 
         let pin = UIView(
