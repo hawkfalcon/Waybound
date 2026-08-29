@@ -1609,6 +1609,21 @@ struct WayboundMapView: UIViewRepresentable {
             let memberIDs = localSegmentByJourneyID.keys.sorted(
                 by: corridorLaneComesBefore
             )
+
+            // Both directions of one numbered route are one visual strand.
+            func publicRouteKey(for memberID: Int) -> String {
+                guard let geometry = corridorGeometryByJourneyID[memberID] else {
+                    return "id:\(memberID)"
+                }
+                return "\(geometry.agencyName)|\(geometry.routeNumber)"
+            }
+            var claimedRouteKeys: Set<String> = []
+            let laneMemberIDs = memberIDs.filter {
+                claimedRouteKeys.insert(publicRouteKey(for: $0)).inserted
+            }
+            let laneJourneyID = laneMemberIDs.first {
+                publicRouteKey(for: $0) == publicRouteKey(for: journeyID)
+            } ?? journeyID
             let dominanceCandidates: [Int]
             if let selectedID = parent.selectedJourneyID,
                memberIDs.contains(selectedID) {
@@ -1644,14 +1659,14 @@ struct WayboundMapView: UIViewRepresentable {
             // both directions are present they start in adjacent fixed-width lanes
             // on opposite sides of the GTFS centerline; additional same-direction
             // routes stack outward rather than crossing through the other group.
-            let alignedIDs = memberIDs.filter { memberID in
+            let alignedIDs = laneMemberIDs.filter { memberID in
                 guard let member = localSegmentByJourneyID[memberID] else {
                     return false
                 }
                 return member.unitX * referenceSegment.unitX
                     + member.unitY * referenceSegment.unitY >= 0
             }
-            let reverseIDs = memberIDs.filter { !alignedIDs.contains($0) }
+            let reverseIDs = laneMemberIDs.filter { !alignedIDs.contains($0) }
 
             let laneSpacing = RouteMapStyle.laneSpacingPoints
             let physicalOffset: Double
