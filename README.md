@@ -20,8 +20,19 @@ A missing key no longer crashes the app. You get an alert asking you to add the 
 
 ## Architecture
 
-- `TransitViewModel` owns location, Transitland fetching, and published map/sheet state.
-- Pure decision rules live in their own files so they can be unit-tested without a network:
+Swift sources are grouped under `Waybound/` so the Xcode synchronized folder matches the layers:
+
+```
+Waybound/
+  WayboundApp.swift          app entry
+  Config.swift               Secrets.plist
+  Models/                    stops, routes, journeys, GTFS decode
+  Transit/                   fetch, score, cluster, draw-ready geometry
+  Views/                     sheet chrome + MKMapView representable
+```
+
+- `Transit/TransitViewModel` owns location, Transitland fetching, and published map/sheet state.
+- Pure decision rules in `Transit/` can be unit-tested without a network:
   - `TransitText` — identity folding for agencies, routes, and stop names
   - `StopClustering` — same-place merge of operator records
   - `TripPathGeometry` — spike cleanup, jump splits, radius clips, stop-to-shape alignment
@@ -29,8 +40,8 @@ A missing key no longer crashes the app. You get an alert asking you to add the 
   - `RouteIdentity` — stable public route key and fallback color
   - `JourneyScoring` — overview ranking and duplicate-journey detection
   - `TransitHTTP` — concurrency cap (8 in-flight) and one retry with backoff
-- `WayboundMapView` is an `MKMapView` representable: screen-space corridor lanes, clustered route pills, destination callouts.
-- `ContentView` is the cream/ink sheet chrome on top of the map.
+- `Views/WayboundMapView` is an `MKMapView` representable: screen-space corridor lanes, clustered route pills, destination callouts.
+- `Views/ContentView` is the cream/ink sheet chrome on top of the map.
 
 ## Tests
 
