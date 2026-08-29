@@ -48,6 +48,14 @@ points* (~8.1 per meter in Santa Barbara); every threshold that crosses that
 boundary goes through `TripPathGeometry.metersPerMapPoint(atLatitude:)`, and
 the unit tests pin the conversion.
 
+Shared-street rendering keeps two distance gates apart. Corridor *membership*
+(who gets a lane in the ribbon) accepts partners up to 20 m of centerline
+separation, but centerline *adoption* — projecting a member's vertices onto
+the dominant route's shape — is capped at 6 m. Divided carriageways
+(Hollister, El Colegio, Calle Real) and freeway ramp braids sit 12–20 m apart,
+and snapping across that gap rendered the 9 loop and the 12x/24x expresses as
+tapered sideways detours onto the wrong side of the street.
+
 ## Tests
 
 The `WayboundTests` target hosts the app and exercises the pure logic above. In Xcode: **Product → Test** (⌘U).

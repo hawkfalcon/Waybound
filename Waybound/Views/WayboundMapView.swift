@@ -1834,9 +1834,17 @@ struct WayboundMapView: UIViewRepresentable {
                 x: reference.start.x + progress * deltaX,
                 y: reference.start.y + progress * deltaY
             )
-            // Alignment only corrects small feed-to-feed centerline drift. Larger
-            // moves are a different street, bay, or branch and stay authoritative.
-            return point.distance(to: projection) * metersPerMapPoint <= 20
+            // Alignment corrects only small feed-to-feed centerline drift on
+            // the same roadway — two publishers sampling the same street a few
+            // meters apart. Santa Barbara's shared transit streets are largely
+            // divided carriageways 12–20 m apart (Hollister, El Colegio, Calle
+            // Real), and freeway ramps braid just as close to their frontage
+            // roads. Adopting a "reference" centerline across that gap is what
+            // drew the 9 loop, 12x, and 24x onto the wrong side of the street
+            // as tapered sideways detours. Partners that far apart still share
+            // the corridor and its lanes; they just keep their own
+            // authoritative centerline instead of snapping to their neighbor's.
+            return point.distance(to: projection) * metersPerMapPoint <= 6
                 ? projection
                 : point
         }
@@ -1864,6 +1872,9 @@ struct WayboundMapView: UIViewRepresentable {
             // Two feeds can publish centerlines on different parts of the same
             // street. Twenty meters still covers that drift without treating a
             // nearby terminal bay or parallel downtown street as one corridor.
+            // This gate decides corridor *membership* (lanes) only — centerline
+            // adoption is far stricter, since divided carriageways and ramp
+            // braids also sit inside twenty meters of each other.
             let maximumSeparation: CLLocationDistance = 20
             let minimumParallelDot = 0.93
             return candidates
