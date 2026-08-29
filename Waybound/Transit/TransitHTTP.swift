@@ -7,9 +7,6 @@ import Foundation
 /// connections, 429/5xx) instead of surfacing the error alert.
 enum TransitHTTP {
 
-    /// Maximum simultaneous in-flight requests across a whole fetch.
-    static let defaultMaxConcurrentRequests = 8
-
     static let retryDelay: Duration = .seconds(1)
 
     /// One request, one retry for transient failures.
@@ -21,7 +18,7 @@ enum TransitHTTP {
     /// flight. Result order is not guaranteed; callers key results by ID.
     static func parallel<T: Sendable, R: Sendable>(
         _ items: [T],
-        maxConcurrent: Int = defaultMaxConcurrentRequests,
+        maxConcurrent: Int = 8,
         _ operation: @escaping @Sendable (T) async -> R
     ) async -> [R] {
         guard !items.isEmpty else { return [] }

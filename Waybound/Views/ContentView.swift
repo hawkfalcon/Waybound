@@ -436,7 +436,7 @@ private struct PlanningSettingsSheet: View {
     }
 
     private static func tomorrowMorning(from date: Date = Date()) -> Date {
-        var calendar = Calendar.autoupdatingCurrent
+        let calendar = Calendar.autoupdatingCurrent
         let tomorrow = calendar.date(byAdding: .day, value: 1, to: date) ?? date
         return calendar.date(
             bySettingHour: 8,

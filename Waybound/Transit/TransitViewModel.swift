@@ -1043,10 +1043,11 @@ final class TransitViewModel: NSObject, ObservableObject {
         return payloads.reduce(into: [Int: [APIDeparture]]()) {
             result, payload in
             let (stopID, data) = payload
-            guard let response = try? JSONDecoder().decode(
-                StopDeparturesResponse.self,
-                from: data
-            ) else {
+            guard let data,
+                  let response = try? JSONDecoder().decode(
+                      StopDeparturesResponse.self,
+                      from: data
+                  ) else {
                 result[stopID] = []
                 return
             }

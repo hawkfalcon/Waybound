@@ -30,7 +30,7 @@ enum StopClustering {
         }
         var parents = Array(stops.indices)
         var clusterAgencyNames = stops.map { stop in
-            Set(stop.agencyNames.map(TransitText.normalizedAgencyName))
+            Set(stop.agencyNames.map { TransitText.normalizedAgencyName($0) })
         }
 
         func root(of index: Int) -> Int {
@@ -88,8 +88,8 @@ enum StopClustering {
         _ first: TransitStop,
         _ second: TransitStop
     ) -> Bool {
-        let firstAgencies = Set(first.agencyNames.map(TransitText.normalizedAgencyName))
-        let secondAgencies = Set(second.agencyNames.map(TransitText.normalizedAgencyName))
+        let firstAgencies = Set(first.agencyNames.map { TransitText.normalizedAgencyName($0) })
+        let secondAgencies = Set(second.agencyNames.map { TransitText.normalizedAgencyName($0) })
         guard !firstAgencies.isEmpty,
               !secondAgencies.isEmpty,
               firstAgencies.isDisjoint(with: secondAgencies)
