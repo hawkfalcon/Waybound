@@ -4,6 +4,17 @@ import XCTest
 
 final class TripPathGeometryTests: XCTestCase {
 
+    func testMetersPerMapPointMatchesTheMercatorProjection() {
+        // One map point spans ~0.149 m at the equator and ~0.123 m in Santa
+        // Barbara. Skipping this conversion made every meter threshold in the
+        // app roughly eight times stricter than written.
+        let equator = TripPathGeometry.metersPerMapPoint(atLatitude: 0)
+        let santaBarbara = TripPathGeometry.metersPerMapPoint(atLatitude: 34.4208)
+        XCTAssertEqual(equator, 0.149, accuracy: 0.01)
+        XCTAssertEqual(santaBarbara, 0.123, accuracy: 0.01)
+        XCTAssertLessThan(santaBarbara, equator)
+    }
+
     func testMaximumGeometryJumpFavorsIntercityAndFerry() {
         XCTAssertEqual(TripPathGeometry.maximumGeometryJump(for: 4), 200_000)
         XCTAssertEqual(TripPathGeometry.maximumGeometryJump(for: 2), 100_000)
@@ -54,6 +65,92 @@ final class TripPathGeometryTests: XCTestCase {
         }
         let cleaned = TripPathGeometry.removingSinglePointSpikes(from: coordinates)
         XCTAssertEqual(cleaned.count, 4)
+    }
+
+    func testRemovingSinglePointSpikesUsesTrueMeterThresholds() {
+        // 350 m out, 320 m back to within 30 m of the start: unmistakable in
+        // meters, but invisible to the old map-point comparison, where a
+        // 30 m bypass read as 244 map points against a 75 threshold.
+        let coordinates = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 350),
+            TestFixtures.coordinate(north: 0, east: 30),
+        ]
+        let cleaned = TripPathGeometry.removingSinglePointSpikes(from: coordinates)
+        XCTAssertEqual(cleaned.count, 2)
+    }
+
+    func testRemovingOutAndBackSpursDropsAStrayDetour() {
+        // A stray coordinate spliced 20 m off the centerline: the shape leaves
+        // the street, touches the stray point, and returns.
+        let coordinates = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 80),
+            TestFixtures.coordinate(north: 20, east: 88),
+            TestFixtures.coordinate(north: 0, east: 82),
+            TestFixtures.coordinate(north: 0, east: 200),
+        ]
+        let cleaned = TripPathGeometry.removingOutAndBackSpurs(from: coordinates)
+        XCTAssertEqual(cleaned.count, 4)
+        let strayLatitude = TestFixtures.coordinate(north: 20, east: 88).latitude
+        XCTAssertFalse(cleaned.contains { abs($0.latitude - strayLatitude) < 0.00005 })
+    }
+
+    func testRemovingOutAndBackSpursKeepsTurnaroundsAndLoops() {
+        // A dead-end turnaround comes back facing the other way; the heading
+        // gate must keep it.
+        let turnaround = [0, 40, 60, 40, -60].map {
+            TestFixtures.coordinate(north: 0, east: $0)
+        }
+        XCTAssertEqual(
+            TripPathGeometry.removingOutAndBackSpurs(from: turnaround).count,
+            5
+        )
+
+        // A loop around a block returns home but travels too far to be a spur.
+        let blockLoop = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 60, east: 0),
+            TestFixtures.coordinate(north: 60, east: 50),
+            TestFixtures.coordinate(north: 0, east: 50),
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: -80, east: 0),
+        ]
+        XCTAssertEqual(
+            TripPathGeometry.removingOutAndBackSpurs(from: blockLoop).count,
+            6
+        )
+    }
+
+    func testCleanedShapeChainsSpikeAndSpurRemoval() {
+        // One stray single-vertex reversal near the start, plus one short
+        // multi-vertex returning detour mid-line, both disappear in one pass.
+        let coordinates = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 20),   // out-and-back spike
+            TestFixtures.coordinate(north: 1, east: 0),
+            TestFixtures.coordinate(north: 1, east: 100),
+            TestFixtures.coordinate(north: 18, east: 104), // detour out...
+            TestFixtures.coordinate(north: 26, east: 108), // ...and back
+            TestFixtures.coordinate(north: 3, east: 102),
+            TestFixtures.coordinate(north: 3, east: 220),
+        ]
+        let cleaned = TripPathGeometry.cleanedShape(from: coordinates)
+        XCTAssertEqual(cleaned.count, 5)
+    }
+
+    func testSplitPolylineKeepsLegitimateIntercityLegs() {
+        // A 20 km rural leg is legitimate intercity service at the documented
+        // 50 km bus threshold; the map-point comparison used to cut it in two.
+        let line = [0, 100, 20_000, 20_100].map {
+            TestFixtures.coordinate(north: 0, east: $0)
+        }
+        let segments = TripPathGeometry.splitPolyline(
+            line,
+            atJumpsLongerThan: 50_000
+        )
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEqual(segments[0].count, 4)
     }
 
     func testMonotonicShapeAlignmentIsStrictlyIncreasing() {

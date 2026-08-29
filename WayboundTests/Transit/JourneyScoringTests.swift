@@ -91,4 +91,34 @@ final class JourneyScoringTests: XCTestCase {
             JourneyScoring.representsSamePublicJourney(first, second)
         )
     }
+
+    func testDuplicateMergingUsesMeterThresholds() {
+        // Platforms 120 m apart with flagship stops 800 m apart are still one
+        // rider-facing journey at the documented 200 m / 2 km gates. The old
+        // map-point comparison read those distances ~8x larger and kept both
+        // records, drawing the same route twice with different shapes.
+        let first = TestFixtures.makeJourney(
+            tripID: 1,
+            directionID: nil,
+            boarding: TestFixtures.coordinate(north: 0, east: 0),
+            destination: TestFixtures.coordinate(north: 0, east: 1_000),
+            flagshipPolylines: [[
+                TestFixtures.coordinate(north: 0, east: 0),
+                TestFixtures.coordinate(north: 0, east: 1_000),
+            ]]
+        )
+        let second = TestFixtures.makeJourney(
+            tripID: 2,
+            directionID: nil,
+            boarding: TestFixtures.coordinate(north: 120, east: 0),
+            destination: TestFixtures.coordinate(north: 0, east: 1_800),
+            flagshipPolylines: [[
+                TestFixtures.coordinate(north: 120, east: 0),
+                TestFixtures.coordinate(north: 0, east: 1_800),
+            ]]
+        )
+        XCTAssertTrue(
+            JourneyScoring.representsSamePublicJourney(first, second)
+        )
+    }
 }

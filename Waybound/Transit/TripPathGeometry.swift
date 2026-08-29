@@ -19,6 +19,16 @@ enum TripPathGeometry {
         var maximumBoardingShapeDistanceMeters: Double = 120
     }
 
+    /// `MKMapPoint` distances are projected map points, not meters. At Santa
+    /// Barbara's latitude one meter spans roughly 8.1 map points, so comparing
+    /// a map-point distance against a meter threshold silently tightens the
+    /// threshold eightfold — which is how corridor detection, lane tapers, and
+    /// spike cleanup all briefly became far stricter than designed. Every
+    /// physical distance in the app is converted through this helper.
+    static func metersPerMapPoint(atLatitude latitude: CLLocationDegrees) -> Double {
+        1.0 / MKMapPointsPerMeterAtLatitude(latitude)
+    }
+
     /// Very large jumps are almost always malformed coordinates. These high
     /// thresholds intentionally favor retaining legitimate intercity service.
     static func maximumGeometryJump(for routeType: Int) -> CLLocationDistance {
@@ -32,12 +42,27 @@ enum TripPathGeometry {
         }
     }
 
+    /// The complete cleanup applied to every GTFS shape before it is aligned,
+    /// clipped, or drawn: unmistakable one-vertex spikes first (so spur
+    /// detection sees clean legs), then short out-and-back spurs.
+    static func cleanedShape(
+        from coordinates: [CLLocationCoordinate2D]
+    ) -> [CLLocationCoordinate2D] {
+        removingOutAndBackSpurs(
+            from: removingSinglePointSpikes(from: coordinates)
+        )
+    }
+
     /// Removes only an unmistakable one-vertex out-and-back excursion. Broader
     /// simplification could erase a legitimate route loop, so it is avoided.
+    /// Distances are true meters: the "spike" gates require the line to return
+    /// to within 75 m of where it left after traveling 300 m or more, which no
+    /// legitimate street geometry does in three points.
     static func removingSinglePointSpikes(
         from coordinates: [CLLocationCoordinate2D]
     ) -> [CLLocationCoordinate2D] {
         guard coordinates.count >= 3 else { return coordinates }
+        let metersPerPoint = metersPerMapPoint(atLatitude: coordinates[0].latitude)
 
         var result = coordinates
         var index = 1
@@ -45,9 +70,9 @@ enum TripPathGeometry {
             let previous = MKMapPoint(result[index - 1])
             let candidate = MKMapPoint(result[index])
             let next = MKMapPoint(result[index + 1])
-            let incomingDistance = previous.distance(to: candidate)
-            let outgoingDistance = candidate.distance(to: next)
-            let bypassDistance = previous.distance(to: next)
+            let incomingDistance = previous.distance(to: candidate) * metersPerPoint
+            let outgoingDistance = candidate.distance(to: next) * metersPerPoint
+            let bypassDistance = previous.distance(to: next) * metersPerPoint
             let isLargeSpike = incomingDistance > 300
                 && outgoingDistance > 300
                 && bypassDistance < 75
@@ -74,6 +99,135 @@ enum TripPathGeometry {
         return result
     }
 
+    /// Removes short out-and-back spurs: a handful of vertices that leave the
+    /// line, travel tens of meters, and return to almost the same place before
+    /// continuing in the same direction. Feed artifacts — a misplaced stop
+    /// coordinate spliced into the shape, a stray survey point — look exactly
+    /// like this, and they render as a jagged detour off the street.
+    ///
+    /// Genuine routing never matches all the gates at once: a terminal loop
+    /// around a block travels farther than these bounds, a cul-de-sac or
+    /// hairpin comes back facing the other way (the heading gate rejects it),
+    /// and ordinary curves never bring their endpoints back together.
+    static func removingOutAndBackSpurs(
+        from coordinates: [CLLocationCoordinate2D]
+    ) -> [CLLocationCoordinate2D] {
+        guard coordinates.count >= 4 else { return coordinates }
+        let metersPerPoint = metersPerMapPoint(atLatitude: coordinates[0].latitude)
+
+        var result = coordinates
+        var passes = 0
+        while passes < 4 {
+            passes += 1
+            guard let spurRange = firstOutAndBackSpurRange(
+                in: result,
+                metersPerPoint: metersPerPoint
+            ) else { break }
+            result.removeSubrange(spurRange)
+        }
+        return result
+    }
+
+    /// Finds the first interior sub-path that leaves a vertex and returns to
+    /// it. Returns the interior index range to delete, keeping both anchor
+    /// vertices (they are a few meters apart at most, and later stages
+    /// deduplicate near-coincident samples).
+    private static func firstOutAndBackSpurRange(
+        in coordinates: [CLLocationCoordinate2D],
+        metersPerPoint: Double
+    ) -> Range<Int>? {
+        let points = coordinates.map { MKMapPoint($0) }
+        // Below ~20 m a wobble is invisible; above ~150 m a returning path is
+        // far more likely a legitimate loop around a small block.
+        let minimumSpurLength: CLLocationDistance = 20
+        let maximumSpurLength: CLLocationDistance = 150
+        // The spur must actually leave the street it belongs to.
+        let minimumSpurDepth: CLLocationDistance = 12
+
+        for anchorIndex in 1..<(points.count - 1) {
+            var spurLength: CLLocationDistance = 0
+            for returnIndex in (anchorIndex + 1)..<points.count - 1 {
+                spurLength += points[returnIndex - 1].distance(
+                    to: points[returnIndex]
+                ) * metersPerPoint
+                if spurLength > maximumSpurLength { break }
+                guard spurLength >= minimumSpurLength else { continue }
+
+                // The path must come back to almost exactly where it left.
+                let returnDistance = points[anchorIndex].distance(
+                    to: points[returnIndex]
+                ) * metersPerPoint
+                guard returnDistance <= min(12, max(6, spurLength * 0.08))
+                else { continue }
+
+                // …and then continue onward in the same direction it arrived.
+                // A turnaround that comes back facing the other way is real
+                // service, not an artifact.
+                guard let incomingHeading = unitHeading(
+                    from: points[anchorIndex - 1],
+                    to: points[anchorIndex]
+                ),
+                    let outgoingHeading = unitHeading(
+                        from: points[returnIndex],
+                        to: points[returnIndex + 1]
+                    ),
+                    incomingHeading.x * outgoingHeading.x
+                        + incomingHeading.y * outgoingHeading.y >= 0.5
+                else { continue }
+
+                var spurDepth: CLLocationDistance = 0
+                for index in (anchorIndex + 1)..<returnIndex {
+                    spurDepth = max(
+                        spurDepth,
+                        perpendicularDistance(
+                            of: points[index],
+                            from: points[anchorIndex],
+                            to: points[returnIndex]
+                        ) * metersPerPoint
+                    )
+                }
+                guard spurDepth >= minimumSpurDepth else { continue }
+
+                return (anchorIndex + 1)..<returnIndex
+            }
+        }
+        return nil
+    }
+
+    private static func unitHeading(
+        from start: MKMapPoint,
+        to end: MKMapPoint
+    ) -> (x: Double, y: Double)? {
+        let deltaX = end.x - start.x
+        let deltaY = end.y - start.y
+        let length = hypot(deltaX, deltaY)
+        guard length > 0.000_001 else { return nil }
+        return (deltaX / length, deltaY / length)
+    }
+
+    private static func perpendicularDistance(
+        of point: MKMapPoint,
+        from start: MKMapPoint,
+        to end: MKMapPoint
+    ) -> Double {
+        let deltaX = end.x - start.x
+        let deltaY = end.y - start.y
+        let lengthSquared = deltaX * deltaX + deltaY * deltaY
+        guard lengthSquared > 0 else {
+            return point.distance(to: start)
+        }
+        let progress = max(
+            0,
+            min(1, ((point.x - start.x) * deltaX
+                + (point.y - start.y) * deltaY) / lengthSquared)
+        )
+        let projection = MKMapPoint(
+            x: start.x + progress * deltaX,
+            y: start.y + progress * deltaY
+        )
+        return point.distance(to: projection)
+    }
+
     /// Breaks a polyline wherever a consecutive jump is implausibly large, so
     /// a single bad vertex can no longer draw a line across the map.
     static func splitPolyline(
@@ -81,6 +235,7 @@ enum TripPathGeometry {
         atJumpsLongerThan maximumJump: CLLocationDistance
     ) -> [[CLLocationCoordinate2D]] {
         guard let first = coordinates.first else { return [] }
+        let metersPerPoint = metersPerMapPoint(atLatitude: first.latitude)
 
         var result: [[CLLocationCoordinate2D]] = []
         var current = [first]
@@ -92,7 +247,7 @@ enum TripPathGeometry {
             }
             let distance = MKMapPoint(previous).distance(
                 to: MKMapPoint(coordinate)
-            )
+            ) * metersPerPoint
 
             if distance < 0.05 {
                 continue
@@ -136,7 +291,7 @@ enum TripPathGeometry {
                 from: coordinates[index],
                 to: coordinates[index + 1],
                 toRadius: radius,
-                around: origin
+                around origin
             ) else {
                 finishCurrentSegment()
                 continue
@@ -254,7 +409,7 @@ enum TripPathGeometry {
         )?
 
         for rawLine in coordinateLines {
-            let cleanedLine = removingSinglePointSpikes(from: rawLine)
+            let cleanedLine = cleanedShape(from: rawLine)
             guard cleanedLine.count >= 2 else { continue }
 
             // GTFS shapes should already follow trip order, but evaluating
@@ -283,9 +438,12 @@ enum TripPathGeometry {
               let boardingIndex = best.indices.first,
               let finalIndex = best.indices.last
         else { return nil }
+        let metersPerPoint = metersPerMapPoint(
+            atLatitude: orderedStops[0].latitude
+        )
         let boardingShapeDistance = MKMapPoint(orderedStops[0]).distance(
             to: MKMapPoint(best.line[boardingIndex])
-        )
+        ) * metersPerPoint
         let flagshipIndex = best.indices[flagshipStopIndex]
         guard boardingShapeDistance <= options.maximumBoardingShapeDistanceMeters,
               flagshipIndex > boardingIndex,
@@ -313,7 +471,10 @@ enum TripPathGeometry {
     /// Dynamic programming finds the lowest-error stop-to-shape assignment
     /// while preserving stop order. Shapes with enough samples require forward
     /// progress at every stop; sparse shapes fall back to nondecreasing
-    /// assignments.
+    /// assignments. All distances are true meters: the objective is the sum of
+    /// squared stop-to-shape errors (m²) plus one unit of shape length per
+    /// meter of separation between consecutive stops, so a detour always has
+    /// to pay for itself in improved stop fit.
     static func monotonicShapeAlignment(
         stops: [CLLocationCoordinate2D],
         line: [CLLocationCoordinate2D]
@@ -324,6 +485,7 @@ enum TripPathGeometry {
         maximumDistance: Double
     )? {
         guard stops.count >= 2, line.count >= 2 else { return nil }
+        let metersPerPoint = metersPerMapPoint(atLatitude: stops[0].latitude)
         let stopPoints = stops.map { MKMapPoint($0) }
         let linePoints = line.map { MKMapPoint($0) }
         let requiresForwardProgress = linePoints.count >= stopPoints.count
@@ -333,10 +495,11 @@ enum TripPathGeometry {
         for index in 1..<linePoints.count {
             cumulativeDistances[index] = cumulativeDistances[index - 1]
                 + linePoints[index - 1].distance(to: linePoints[index])
+                    * metersPerPoint
         }
 
         var previousCosts = linePoints.map { point -> Double in
-            let distance = stopPoints[0].distance(to: point)
+            let distance = stopPoints[0].distance(to: point) * metersPerPoint
             return distance * distance
         }
         var backPointers = Array(
@@ -364,7 +527,7 @@ enum TripPathGeometry {
 
                 let distance = stopPoints[stopIndex].distance(
                     to: linePoints[lineIndex]
-                )
+                ) * metersPerPoint
                 currentCosts[lineIndex] = bestPreviousCost
                     + progressPenalty * cumulativeDistances[lineIndex]
                     + distance * distance
@@ -394,7 +557,7 @@ enum TripPathGeometry {
         }
 
         let distances = zip(stopPoints, indices).map { pair in
-            pair.0.distance(to: linePoints[pair.1])
+            pair.0.distance(to: linePoints[pair.1]) * metersPerPoint
         }
         let squaredError = distances.reduce(0) { $0 + $1 * $1 }
         return (

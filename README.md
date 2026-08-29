@@ -35,13 +35,18 @@ Waybound/
 - Pure decision rules in `Transit/` can be unit-tested without a network:
   - `TransitText` — identity folding for agencies, routes, and stop names
   - `StopClustering` — same-place merge of operator records
-  - `TripPathGeometry` — spike cleanup, jump splits, radius clips, stop-to-shape alignment
+  - `TripPathGeometry` — spike and out-and-back-spur cleanup, jump splits, radius clips, stop-to-shape alignment
   - `FlagshipSelection` — which downstream stop the journey is actually *for*
   - `RouteIdentity` — stable public route key and fallback color
   - `JourneyScoring` — overview ranking and duplicate-journey detection
   - `TransitHTTP` — concurrency cap (8 in-flight) and one retry with backoff
 - `Views/WayboundMapView` is an `MKMapView` representable: screen-space corridor lanes, clustered route pills, destination callouts.
 - `Views/ContentView` is the cream/ink sheet chrome on top of the map.
+
+Distances everywhere are meters. `MKMapPoint.distance` is *projected map
+points* (~8.1 per meter in Santa Barbara); every threshold that crosses that
+boundary goes through `TripPathGeometry.metersPerMapPoint(atLatitude:)`, and
+the unit tests pin the conversion.
 
 ## Tests
 

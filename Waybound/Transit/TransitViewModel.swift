@@ -1359,7 +1359,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         let maximumJump = TripPathGeometry.maximumGeometryJump(for: route.routeType)
         let visiblePolylines: [[CLLocationCoordinate2D]] = route.polylines.flatMap {
             coordinates in
-            let cleanedCoordinates = TripPathGeometry.removingSinglePointSpikes(from: coordinates)
+            let cleanedCoordinates = TripPathGeometry.cleanedShape(from: coordinates)
             return TripPathGeometry.splitPolyline(
                 cleanedCoordinates,
                 atJumpsLongerThan: maximumJump
