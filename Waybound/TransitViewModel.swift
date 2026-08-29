@@ -4,16 +4,6 @@ import CoreLocation
 import MapKit
 import SwiftUI
 
-private func transitData(for request: URLRequest) async throws -> Data {
-    let (data, response) = try await URLSession.shared.data(for: request)
-    guard let httpResponse = response as? HTTPURLResponse,
-          (200...299).contains(httpResponse.statusCode)
-    else {
-        throw URLError(.badServerResponse)
-    }
-    return data
-}
-
 private struct JourneyBoardingOption {
     let route: TransitRoute
     let stop: TransitStop
@@ -28,16 +18,6 @@ private struct JourneyDepartureSelection {
     let trip: APITrip
     let departureDate: Date
     let departureIsRealtime: Bool
-}
-
-/// Typed rider-facing identities keep discovery, deduplication, and the final
-/// route budget from quietly using different string formats for the same route.
-private struct PublicRouteIdentity: Hashable {
-    let agency: String
-    let routeNumber: String
-
-    var isUsable: Bool { !routeNumber.isEmpty }
-    var stableText: String { "\(agency)|\(routeNumber)" }
 }
 
 private enum JourneyDirectionIdentity: Hashable {
@@ -81,6 +61,9 @@ final class TransitViewModel: NSObject, ObservableObject {
     /// Nil means live departures from the current moment. A value switches every
     /// schedule query and rider-facing duration to that future planning instant.
     @Published private(set) var planningDate: Date?
+    /// The departure window the current overview actually answers. Usually the
+    /// full three hours, narrowed to the near term when the network is busy.
+    @Published private(set) var journeyWindowMinutes = 180
     @Published var isLoading = false
     @Published var isLoadingJourneys = false
     @Published var showError = false
@@ -101,10 +84,6 @@ final class TransitViewModel: NSObject, ObservableObject {
     private let apiKey = Config.transitLandAPIKey
     private let radiusMeters: Double = 804.672 // 0.5 mile
     private let routeDisplayRadiusMeters: Double = 1_207.008 // 0.75 mile
-    private let duplicateStopDistanceMeters: Double = 1.524 // 5 feet
-    /// Cross-agency stop coordinates can differ slightly even when they mark the
-    /// same pole. Name matching keeps this deliberately small radius conservative.
-    private let samePlaceStopDistanceMeters: Double = 15
     /// Thirty clusters are normally enough for the UI, but route discovery also
     /// retains the three nearest boarding candidates for every numbered route.
     /// This prevents dense downtown records from hiding an opposite-direction
@@ -114,8 +93,9 @@ final class TransitViewModel: NSObject, ObservableObject {
     /// Trip geometry is sampled per route so payloads stay bounded. Generated
     /// stop-to-stop shapes are discarded rather than drawn as real alignments.
     private let maximumTripGeometriesPerRoute = 12
-    /// Keep eight distinct numbered public routes when they are genuinely
-    /// boardable. Each retained route may contribute one trip per direction.
+    /// Keep up to twenty distinct numbered public routes when they are
+    /// genuinely boardable. Each retained route may contribute up to two
+    /// directional answers (both ways of one numbered route).
     private let maximumVisiblePublicRoutes = 20
     private let upcomingDepartureWindowSeconds = 10_800 // 3 hours
     /// A bus ride short enough that nobody would board for it. This hardens the
@@ -130,15 +110,9 @@ final class TransitViewModel: NSObject, ObservableObject {
     /// Frequency is deliberately local to the decision a rider is making now.
     /// A route earns a utility bonus only for catchable trips in the next 90 min.
     private let frequencyObservationWindowSeconds = 5_400
-    private let maximumFrequencyBonusMinutes = 18
     private let maximumFlagshipRideMinutes = 180
     private let minimumBoardingBufferMinutes = 2
     private let walkingMetersPerMinute: Double = 80
-    private let duplicateJourneyBoardingDistanceMeters: Double = 200
-    private let duplicateJourneyDestinationDistanceMeters: Double = 2_000
-    private let maximumShapeStopDistanceMeters: Double = 250
-    private let maximumShapeStopRMSMeters: Double = 100
-    private let maximumBoardingShapeDistanceMeters: Double = 120
     // Transitland's REST endpoint filters by radius but does not guarantee
     // distance ordering, so the complete half-mile result is sorted locally.
     private let stopCandidateLimit = 1_000
@@ -190,6 +164,11 @@ final class TransitViewModel: NSObject, ObservableObject {
     // MARK: - Fetch data
 
     func fetchTransitData(lat: Double, lon: Double) {
+        guard let apiKey, !apiKey.isEmpty else {
+            errorMessage = "Missing TRANSITLAND_API_KEY in Secrets.plist. Add your Transitland API key, then relaunch."
+            showError = true
+            return
+        }
         let fetchID = UUID()
         activeFetchID = fetchID
         let origin = CLLocationCoordinate2D(latitude: lat, longitude: lon)
@@ -234,8 +213,9 @@ final class TransitViewModel: NSObject, ObservableObject {
                     // Only boardable journeys survive to the render model. Do
                     // not briefly publish every route in the half-mile search
                     // area while schedule details are still loading.
-                    self.journeys = fetchedJourneys
-                    self.routes = fetchedJourneys.map(\.route)
+                    self.journeys = fetchedJourneys.journeys
+                    self.routes = fetchedJourneys.journeys.map(\.route)
+                    self.journeyWindowMinutes = fetchedJourneys.windowMinutes
                     self.isLoadingJourneys = false
                 } catch {
                     errors.append("Routes: \(error.localizedDescription)")
@@ -265,7 +245,7 @@ final class TransitViewModel: NSObject, ObservableObject {
             lon: lon,
             radius: radiusMeters
         )
-        let clusters = clusterNearbyStops(candidates)
+        let clusters = StopClustering.cluster(stops: candidates)
         let origin = CLLocation(latitude: lat, longitude: lon)
         let rankedClusters = clusters
             .map { cluster in
@@ -341,7 +321,7 @@ final class TransitViewModel: NSObject, ObservableObject {
 
         var request = URLRequest(url: url)
         request.setValue(apiKey, forHTTPHeaderField: "apikey")
-        let data = try await transitData(for: request)
+        let data = try await TransitHTTP.data(for: request)
         let response = try JSONDecoder().decode(StopsResponse.self, from: data)
 
         return response.stops.compactMap { apiStop -> TransitStop? in
@@ -390,153 +370,6 @@ final class TransitViewModel: NSObject, ObservableObject {
                 sourceStopCoordinates: [apiStop.id: coordinate]
             )
         }
-    }
-
-    private func clusterNearbyStops(_ stops: [TransitStop]) -> [[TransitStop]] {
-        guard !stops.isEmpty else { return [] }
-
-        let locations = stops.map {
-            CLLocation(
-                latitude: $0.coordinate.latitude,
-                longitude: $0.coordinate.longitude
-            )
-        }
-        var parents = Array(stops.indices)
-        var clusterAgencyNames = stops.map { stop in
-            Set(stop.agencyNames.map(normalizedAgencyName))
-        }
-
-        func root(of index: Int) -> Int {
-            var current = index
-            while parents[current] != current {
-                current = parents[current]
-            }
-            return current
-        }
-
-        // The candidate set is capped at 1,000, making this pairwise pass
-        // inexpensive. Exact coordinate duplicates use the strict five-foot
-        // rule. A second, conservative rule joins differently named agency
-        // records only when their normalized place names and directions agree.
-        for first in stops.indices {
-            for second in stops.indices where second > first {
-                let distance = locations[first].distance(from: locations[second])
-                let isCoordinateDuplicate = distance <= duplicateStopDistanceMeters
-                let isSameNamedPlace = distance <= samePlaceStopDistanceMeters
-                    && representsSameNamedPlace(stops[first], stops[second])
-                guard isCoordinateDuplicate || isSameNamedPlace else { continue }
-
-                let firstRoot = root(of: first)
-                let secondRoot = root(of: second)
-                guard firstRoot != secondRoot else { continue }
-
-                // A same-place cluster may contain only one record from a given
-                // operator. This prevents transitive merging of two directional
-                // platforms through a third agency's record.
-                if !isCoordinateDuplicate,
-                   !clusterAgencyNames[firstRoot].isDisjoint(
-                       with: clusterAgencyNames[secondRoot]
-                   ) {
-                    continue
-                }
-
-                parents[secondRoot] = firstRoot
-                clusterAgencyNames[firstRoot].formUnion(
-                    clusterAgencyNames[secondRoot]
-                )
-            }
-        }
-
-        var grouped: [Int: [TransitStop]] = [:]
-        for index in stops.indices {
-            grouped[root(of: index), default: []].append(stops[index])
-        }
-        return grouped.keys.sorted().compactMap { grouped[$0] }
-    }
-
-    private func representsSameNamedPlace(
-        _ first: TransitStop,
-        _ second: TransitStop
-    ) -> Bool {
-        let firstAgencies = Set(first.agencyNames.map(normalizedAgencyName))
-        let secondAgencies = Set(second.agencyNames.map(normalizedAgencyName))
-        guard !firstAgencies.isEmpty,
-              !secondAgencies.isEmpty,
-              firstAgencies.isDisjoint(with: secondAgencies)
-        else { return false }
-
-        let firstName = normalizedStopPlaceName(first.name)
-        let secondName = normalizedStopPlaceName(second.name)
-        return !firstName.isEmpty
-            && firstName == secondName
-            && stopDirectionTerms(in: first.name) == stopDirectionTerms(in: second.name)
-    }
-
-    private func normalizedStopPlaceName(_ name: String) -> String {
-        let landmarkFreeName = name.components(separatedBy: "(").first ?? name
-        let foldedName = landmarkFreeName.folding(
-            options: [.caseInsensitive, .diacriticInsensitive],
-            locale: Locale(identifier: "en_US_POSIX")
-        ).lowercased()
-        let connectorWords: Set<String> = ["at", "and", "near"]
-        return foldedName
-            .split { !$0.isLetter && !$0.isNumber }
-            .map(String.init)
-            .filter { !connectorWords.contains($0) }
-            .joined(separator: " ")
-    }
-
-    private func stopDirectionTerms(in name: String) -> Set<String> {
-        // Avoid ambiguous two-letter forms: "SB" often means Santa Barbara,
-        // as in the landmark qualifier "(SB Library)".
-        let directionWords: Set<String> = [
-            "northbound", "southbound", "eastbound", "westbound",
-            "inbound", "outbound",
-        ]
-        let foldedName = name.folding(
-            options: [.caseInsensitive, .diacriticInsensitive],
-            locale: Locale(identifier: "en_US_POSIX")
-        ).lowercased()
-        return Set(
-            foldedName
-                .split { !$0.isLetter && !$0.isNumber }
-                .map(String.init)
-                .filter { directionWords.contains($0) }
-        )
-    }
-
-    private func normalizedAgencyName(_ name: String) -> String {
-        normalizedIdentityText(name)
-    }
-
-    private func normalizedIdentityText(_ value: String) -> String {
-        value.folding(
-            options: [.caseInsensitive, .diacriticInsensitive],
-            locale: Locale(identifier: "en_US_POSIX")
-        )
-        .lowercased()
-        .filter { $0.isLetter || $0.isNumber }
-    }
-
-    private func publicRouteIdentity(
-        for route: TransitRoute
-    ) -> PublicRouteIdentity {
-        PublicRouteIdentity(
-            agency: normalizedAgencyName(route.agencyName),
-            routeNumber: normalizedIdentityText(route.routeNumber ?? "")
-        )
-    }
-
-    private func stableRouteColor(for route: TransitRoute) -> Color {
-        let publicIdentity = publicRouteIdentity(for: route)
-        var hash: UInt64 = 1_469_598_103_934_665_603
-        for scalar in publicIdentity.stableText.unicodeScalars {
-            hash ^= UInt64(scalar.value)
-            hash = hash &* 1_099_511_628_211
-        }
-        return WayboundPalette.routeColor(
-            at: Int(hash % UInt64(WayboundPalette.routeColors.count))
-        )
     }
 
     private func mergeNearbyStopClusters(
@@ -632,30 +465,21 @@ final class TransitViewModel: NSObject, ObservableObject {
             return (stopID, request)
         }
 
-        let loadedCounts = await withTaskGroup(of: (Int, Int?).self) { group in
-            for (stopID, request) in requests {
-                group.addTask {
-                    do {
-                        let data = try await transitData(for: request)
-                        let response = try JSONDecoder().decode(
-                            StopDeparturesResponse.self,
-                            from: data
-                        )
-                        let count = response.stops
-                            .first { $0.id == stopID }?
-                            .departures.count
-                        return (stopID, count)
-                    } catch {
-                        return (stopID, nil)
-                    }
-                }
+        let loadedCounts = await TransitHTTP.parallel(requests) { pair in
+            let stopID = pair.0
+            do {
+                let data = try await TransitHTTP.data(for: pair.1)
+                let response = try JSONDecoder().decode(
+                    StopDeparturesResponse.self,
+                    from: data
+                )
+                let count = response.stops
+                    .first { $0.id == stopID }?
+                    .departures.count
+                return (stopID, count)
+            } catch {
+                return (stopID, nil)
             }
-
-            var counts: [(Int, Int?)] = []
-            for await result in group {
-                counts.append(result)
-            }
-            return counts
         }
 
         for (stopID, count) in loadedCounts {
@@ -707,22 +531,11 @@ final class TransitViewModel: NSObject, ObservableObject {
             return (routeID, routeRequest, tripRequest)
         }
 
-        let payloads = await withTaskGroup(
-            of: (Int, Data?, Data?).self
-        ) { group in
-            for (routeID, routeRequest, tripRequest) in requests {
-                group.addTask {
-                    let routePayload = try? await transitData(for: routeRequest)
-                    let tripPayload = try? await transitData(for: tripRequest)
-                    return (routeID, routePayload, tripPayload)
-                }
-            }
-
-            var loaded: [(Int, Data?, Data?)] = []
-            for await payload in group {
-                loaded.append(payload)
-            }
-            return loaded
+        let payloads = await TransitHTTP.parallel(requests) { pair in
+            let routeID = pair.0
+            let routePayload = try? await TransitHTTP.data(for: pair.1)
+            let tripPayload = try? await TransitHTTP.data(for: pair.2)
+            return (routeID, routePayload, tripPayload)
         }
 
         for (routeID, routePayload, tripPayload) in payloads {
@@ -762,7 +575,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         // colorless public route uses the deterministic fallback palette.
         let officialColorsByPublicRoute = Dictionary(
             grouping: sortedRoutes,
-            by: { publicRouteIdentity(for: $0) }
+            by: { RouteIdentity.identity(for: $0) }
         ).compactMapValues { matchingRoutes in
             matchingRoutes
                 .filter { $0.officialColorHex != nil }
@@ -771,7 +584,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         }
         return sortedRoutes.map { route in
             let officialColorHex = officialColorsByPublicRoute[
-                publicRouteIdentity(for: route)
+                RouteIdentity.identity(for: route)
             ]
             return TransitRoute(
                 id: route.id,
@@ -782,7 +595,7 @@ final class TransitViewModel: NSObject, ObservableObject {
                 routeType: route.routeType,
                 officialColorHex: officialColorHex,
                 color: officialColorHex.map { Color(hex: $0) }
-                    ?? stableRouteColor(for: route),
+                    ?? RouteIdentity.stableColor(for: route),
                 polylines: route.polylines
             )
         }
@@ -799,7 +612,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         from origin: CLLocationCoordinate2D,
         scheduleReferenceDate: Date,
         isLiveSearch: Bool
-    ) async -> [RouteJourney] {
+    ) async -> (journeys: [RouteJourney], windowMinutes: Int) {
         let originLocation = CLLocation(
             latitude: origin.latitude,
             longitude: origin.longitude
@@ -986,18 +799,11 @@ final class TransitViewModel: NSObject, ObservableObject {
             return (tripID, request)
         }
 
-        let loadedTrips = await withTaskGroup(of: (Int, Data?).self) { group in
-            for (tripID, request) in tripRequests {
-                group.addTask {
-                    (tripID, try? await transitData(for: request))
-                }
-            }
-
-            var result: [Int: Data] = [:]
-            for await (tripID, data) in group {
-                if let data { result[tripID] = data }
-            }
-            return result
+        let tripPayloads = await TransitHTTP.parallel(tripRequests) { pair in
+            (pair.0, try? await TransitHTTP.data(for: pair.1))
+        }
+        let loadedTrips = tripPayloads.reduce(into: [Int: Data]()) { result, item in
+            if let data = item.1 { result[item.0] = data }
         }
 
         let observedDepartureCountByTripID = patternIdentityByTripID.reduce(
@@ -1036,7 +842,7 @@ final class TransitViewModel: NSObject, ObservableObject {
             let usefulCandidates = candidates.filter { $0.rideMinutes >= 8 }
             let pool = usefulCandidates.isEmpty ? candidates : usefulCandidates
             return pool.min {
-                journeyRanksAhead(
+                JourneyScoring.ranksAhead(
                     $0,
                     of: $1,
                     observedDepartureCounts: observedDepartureCountByTripID,
@@ -1049,7 +855,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         // departure. Physical direction and endpoints, not Transitland source IDs,
         // define whether two records are the same rider-facing journey.
         let utilityOrderedJourneys = directionalJourneys.sorted {
-            journeyRanksAhead(
+            JourneyScoring.ranksAhead(
                 $0,
                 of: $1,
                 observedDepartureCounts: observedDepartureCountByTripID,
@@ -1059,15 +865,15 @@ final class TransitViewModel: NSObject, ObservableObject {
         var logicalJourneys: [RouteJourney] = []
         for candidate in utilityOrderedJourneys {
             guard !logicalJourneys.contains(where: {
-                representsSamePublicJourney($0, candidate)
+                JourneyScoring.representsSamePublicJourney($0, candidate)
             }) else { continue }
             logicalJourneys.append(candidate)
         }
 
         // The map budget counts numbered public routes, not directions. Operator
         // identity keeps unrelated services with the same badge separate. Retain
-        // up to two directional answers for each of the eight best routes and keep
-        // both directions adjacent in the compact sheet.
+        // up to two directional answers per route, keep both directions adjacent
+        // in the compact sheet, and admit routes until the budget is full.
         var retainedRouteKeys: [PublicRouteIdentity] = []
         var journeysByRouteKey: [PublicRouteIdentity: [RouteJourney]] = [:]
         var directionKeysByRouteKey: [
@@ -1075,7 +881,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         ] = [:]
         for candidate in logicalJourneys {
             guard candidate.route.routeNumber != nil else { continue }
-            let routeKey = publicRouteIdentity(for: candidate.route)
+            let routeKey = RouteIdentity.identity(for: candidate.route)
             guard routeKey.isUsable else { continue }
             let directionKey = journeyDirectionIdentity(for: candidate)
 
@@ -1091,9 +897,10 @@ final class TransitViewModel: NSObject, ObservableObject {
             else { continue }
             journeysByRouteKey[routeKey, default: []].append(candidate)
         }
-        return filteredJourneys(
+        let filtered = filteredJourneys(
             retainedRouteKeys.flatMap { journeysByRouteKey[$0] ?? [] }
         )
+        return (filtered.journeys, filtered.windowMinutes)
     }
 
     /// Rider-facing filtering applied to the final boardable journey set.
@@ -1102,16 +909,23 @@ final class TransitViewModel: NSObject, ObservableObject {
     ///    narrow it to only departures leaving within the near-term window so
     ///    it reads as choices, not a full timetable. Quiet areas keep every
     ///    far-future bus, because that is the rider's only option there.
-    private func filteredJourneys(_ journeys: [RouteJourney]) -> [RouteJourney] {
+    /// The reported window must match the filter actually applied, because the
+    /// UI promises it ("no boardable trip in the next 3 hours").
+    private func filteredJourneys(
+        _ journeys: [RouteJourney]
+    ) -> (journeys: [RouteJourney], windowMinutes: Int) {
         let substantiveRides = journeys.filter {
             $0.rideMinutes >= minimumUsefulRideMinutes
         }
         guard substantiveRides.count > busyJourneyThreshold else {
-            return substantiveRides
+            return (substantiveRides, upcomingDepartureWindowSeconds / 60)
         }
-        return substantiveRides.filter {
-            $0.departureMinutesFromNow <= busyDepartureWindowMinutes
-        }
+        return (
+            substantiveRides.filter {
+                $0.departureMinutesFromNow <= busyDepartureWindowMinutes
+            },
+            busyDepartureWindowMinutes
+        )
     }
 
     private func journeyDirectionIdentity(
@@ -1119,7 +933,7 @@ final class TransitViewModel: NSObject, ObservableObject {
         destination: String?
     ) -> JourneyDirectionIdentity {
         if let directionID { return .gtfs(directionID) }
-        return .destination(normalizedIdentityText(destination ?? ""))
+        return .destination(TransitText.normalizedIdentityText(destination ?? ""))
     }
 
     private func journeyDirectionIdentity(
@@ -1147,121 +961,8 @@ final class TransitViewModel: NSObject, ObservableObject {
         JourneyPatternIdentity(
             routeID: routeID,
             direction: journeyDirectionIdentity(for: trip),
-            headsign: normalizedIdentityText(trip.tripHeadsign ?? "")
+            headsign: TransitText.normalizedIdentityText(trip.tripHeadsign ?? "")
         )
-    }
-
-    private func journeyUtilityScore(
-        _ journey: RouteJourney,
-        observedDepartureCount: Int
-    ) -> Int {
-        // Overview admission answers which useful service is easiest to board:
-        // how soon it leaves, how far the rider walks, and how often it returns.
-        // Do not penalize a route for reaching a farther flagship destination;
-        // complete walk + wait + ride timing remains intact in RouteJourney and UI.
-        // Each additional catchable trip in the next 90 minutes offsets four
-        // minutes, capped so frequency never hides a very late bus.
-        let frequencyBonus = min(
-            maximumFrequencyBonusMinutes,
-            max(0, observedDepartureCount - 1) * 4
-        )
-        return journey.departureMinutesFromNow * 2
-            + journey.walkMinutes * 3
-            - frequencyBonus * 2
-    }
-
-    private func journeyRanksAhead(
-        _ lhs: RouteJourney,
-        of rhs: RouteJourney,
-        observedDepartureCounts: [Int: Int],
-        origin: CLLocation
-    ) -> Bool {
-        let lhsScore = journeyUtilityScore(
-            lhs,
-            observedDepartureCount: observedDepartureCounts[lhs.tripID] ?? 0
-        )
-        let rhsScore = journeyUtilityScore(
-            rhs,
-            observedDepartureCount: observedDepartureCounts[rhs.tripID] ?? 0
-        )
-        if lhsScore != rhsScore { return lhsScore < rhsScore }
-        if lhs.departureDate != rhs.departureDate {
-            return lhs.departureDate < rhs.departureDate
-        }
-
-        let lhsDistance = origin.distance(from: CLLocation(
-            latitude: lhs.boardingStop.coordinate.latitude,
-            longitude: lhs.boardingStop.coordinate.longitude
-        ))
-        let rhsDistance = origin.distance(from: CLLocation(
-            latitude: rhs.boardingStop.coordinate.latitude,
-            longitude: rhs.boardingStop.coordinate.longitude
-        ))
-        if abs(lhsDistance - rhsDistance) > 1 {
-            return lhsDistance < rhsDistance
-        }
-        if lhs.departureIsRealtime != rhs.departureIsRealtime {
-            return lhs.departureIsRealtime
-        }
-        return lhs.route.fullDisplayName.localizedStandardCompare(
-            rhs.route.fullDisplayName
-        ) == .orderedAscending
-    }
-
-    private func representsSamePublicJourney(
-        _ first: RouteJourney,
-        _ second: RouteJourney
-    ) -> Bool {
-        guard let firstNumber = first.route.routeNumber,
-              let secondNumber = second.route.routeNumber,
-              normalizedIdentityText(firstNumber)
-                == normalizedIdentityText(secondNumber),
-              normalizedAgencyName(first.route.agencyName)
-                == normalizedAgencyName(second.route.agencyName)
-        else { return false }
-
-        // Opposite directions of one authoritative route are intentionally two
-        // answers, even when their platforms and flagship stops are close.
-        if first.route.transitlandID == second.route.transitlandID,
-           let firstDirection = first.directionID,
-           let secondDirection = second.directionID,
-           firstDirection != secondDirection {
-            return false
-        }
-
-        if let firstVector = initialTravelVector(for: first),
-           let secondVector = initialTravelVector(for: second),
-           firstVector.x * secondVector.x + firstVector.y * secondVector.y < 0.72 {
-            return false
-        }
-
-        let boardingDistance = MKMapPoint(first.boardingStop.coordinate).distance(
-            to: MKMapPoint(second.boardingStop.coordinate)
-        )
-        let destinationDistance = MKMapPoint(first.destinationCoordinate).distance(
-            to: MKMapPoint(second.destinationCoordinate)
-        )
-        return boardingDistance <= duplicateJourneyBoardingDistanceMeters
-            && destinationDistance <= duplicateJourneyDestinationDistanceMeters
-    }
-
-    private func initialTravelVector(
-        for journey: RouteJourney
-    ) -> (x: Double, y: Double)? {
-        for polyline in journey.flagshipPolylines {
-            guard let firstCoordinate = polyline.first else { continue }
-            let first = MKMapPoint(firstCoordinate)
-            for coordinate in polyline.dropFirst() {
-                let next = MKMapPoint(coordinate)
-                let deltaX = next.x - first.x
-                let deltaY = next.y - first.y
-                let length = hypot(deltaX, deltaY)
-                if length > 2 {
-                    return (deltaX / length, deltaY / length)
-                }
-            }
-        }
-        return nil
     }
 
     /// Transitland's service-window fallback returns a trip from its representative
@@ -1335,18 +1036,8 @@ final class TransitViewModel: NSObject, ObservableObject {
             return (stopID, request)
         }
 
-        let payloads = await withTaskGroup(of: (Int, Data?).self) { group in
-            for (stopID, request) in requests {
-                group.addTask {
-                    (stopID, try? await transitData(for: request))
-                }
-            }
-
-            var result: [Int: Data] = [:]
-            for await (stopID, data) in group {
-                if let data { result[stopID] = data }
-            }
-            return result
+        let payloads = await TransitHTTP.parallel(requests) { pair in
+            (pair.0, try? await TransitHTTP.data(for: pair.1))
         }
 
         return payloads.reduce(into: [Int: [APIDeparture]]()) {
@@ -1507,9 +1198,10 @@ final class TransitViewModel: NSObject, ObservableObject {
         }
         guard downstream.count >= 2 else { return nil }
 
-        guard let flagshipIndex = selectFlagshipIndex(
+        guard let flagshipIndex = FlagshipSelection.selectIndex(
             in: downstream,
-            headsign: trip.tripHeadsign
+            headsign: trip.tripHeadsign,
+            maximumRideMinutes: maximumFlagshipRideMinutes
         ) else { return nil }
         let flagship = downstream[flagshipIndex]
         guard flagship.offset > 0,
@@ -1521,14 +1213,14 @@ final class TransitViewModel: NSObject, ObservableObject {
             coordinate(for: $0.stopTime.stop)
         }
         guard downstreamCoordinates.count == downstream.count,
-              let path = tripPath(
+              let path = TripPathGeometry.tripPath(
                 in: geometry.coordinateLines,
                 alignedTo: downstreamCoordinates,
                 flagshipStopIndex: flagshipIndex
               )
         else { return nil }
 
-        let tripHeadsign = cleanedDestinationName(trip.tripHeadsign)
+        let tripHeadsign = FlagshipSelection.cleanedName(trip.tripHeadsign)
         let isFinalStop = flagshipIndex == downstream.count - 1
         let destinationName = isFinalStop
             ? (tripHeadsign ?? flagship.stopTime.stop.stopName ?? "Route destination")
@@ -1598,267 +1290,11 @@ final class TransitViewModel: NSObject, ObservableObject {
         )
     }
 
-    /// Prefers an official terminus/headsign, a named civic destination, or a
-    /// useful medium-length ride. This is semantic scoring, not a hardcoded list
-    /// of local places, so it works wherever Transitland has stop data.
-    private func selectFlagshipIndex(
-        in stops: [(stopTime: APITripStopTime, offset: Int)],
-        headsign: String?
-    ) -> Int? {
-        let landmarkTerms = [
-            "airport", "beach", "campus", "center", "college", "courthouse",
-            "downtown", "harbor", "hospital", "library", "mall", "museum",
-            "park", "station", "terminal", "transit", "university",
-        ]
-        let headsignTerms = (headsign ?? "")
-            .folding(
-                options: [.caseInsensitive, .diacriticInsensitive],
-                locale: Locale(identifier: "en_US_POSIX")
-            )
-            .lowercased()
-            .split { !$0.isLetter && !$0.isNumber }
-            .map(String.init)
-            .filter { $0.count >= 3 }
-        let finalIndex = stops.count - 1
-        let reachable = stops.indices.filter {
-            stops[$0].offset > 0
-                && stops[$0].offset <= maximumFlagshipRideMinutes
-        }
-        guard !reachable.isEmpty else { return nil }
-
-        // Prefer a substantial destination, but do not erase a legitimate return
-        // direction merely because the rider is already near its terminus. A short
-        // remaining trip can still answer where that side of the line goes.
-        let usefulDestinations = reachable.filter { stops[$0].offset >= 8 }
-        let eligible = usefulDestinations.isEmpty ? reachable : usefulDestinations
-        return eligible.max { lhs, rhs in
-                func score(_ index: Int) -> Int {
-                    let item = stops[index]
-                    let name = (item.stopTime.stop.stopName ?? "")
-                        .folding(
-                            options: [.caseInsensitive, .diacriticInsensitive],
-                            locale: Locale(identifier: "en_US_POSIX")
-                        )
-                        .lowercased()
-                    let matchedHeadsignTerms = headsignTerms.filter {
-                        name.contains($0)
-                    }.count
-                    let headsignBonus: Int
-                    if !headsignTerms.isEmpty
-                        && matchedHeadsignTerms == headsignTerms.count {
-                        headsignBonus = 90 + matchedHeadsignTerms * 15
-                    } else if matchedHeadsignTerms > 0 {
-                        headsignBonus = matchedHeadsignTerms * 45
-                    } else {
-                        headsignBonus = 0
-                    }
-                    let landmarkBonus = landmarkTerms.contains {
-                        name.contains($0)
-                    } ? 35 : 0
-                    let terminusBonus = index == finalIndex ? 45 : 0
-                    let usefulRideScore = max(0, 30 - abs(item.offset - 35))
-                    let progressScore = Int(
-                        (Double(index) / Double(max(1, finalIndex))) * 20
-                    )
-                    let veryLongPenalty = max(0, item.offset - 120) / 2
-                    return headsignBonus + landmarkBonus + terminusBonus
-                        + usefulRideScore + progressScore - veryLongPenalty
-                }
-                return score(lhs) < score(rhs)
-            }
-    }
-
     private func coordinate(for stop: APITripStop) -> CLLocationCoordinate2D? {
         guard stop.geometry.coordinates.count >= 2 else { return nil }
         return CLLocationCoordinate2D(
             latitude: stop.geometry.coordinates[1],
             longitude: stop.geometry.coordinates[0]
-        )
-    }
-
-    private func cleanedDestinationName(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        let generic = ["inbound", "outbound", "northbound", "southbound"]
-        guard !cleaned.isEmpty,
-              !generic.contains(cleaned.lowercased())
-        else { return nil }
-        return cleaned
-    }
-
-    /// Align every downstream stop to one monotonic occurrence on the trip shape.
-    /// Matching only the boarding and destination coordinates is ambiguous on a
-    /// loop or repeated corridor and can select endpoints from different passes,
-    /// which produces a plausible-looking but rider-impossible local diagonal.
-    private func tripPath(
-        in coordinateLines: [[CLLocationCoordinate2D]],
-        alignedTo orderedStops: [CLLocationCoordinate2D],
-        flagshipStopIndex: Int
-    ) -> (
-        approach: [[CLLocationCoordinate2D]],
-        flagship: [[CLLocationCoordinate2D]],
-        continuation: [[CLLocationCoordinate2D]]
-    )? {
-        guard orderedStops.count >= 2,
-              flagshipStopIndex > 0,
-              flagshipStopIndex < orderedStops.count
-        else { return nil }
-
-        var best: (
-            line: [CLLocationCoordinate2D],
-            indices: [Int],
-            objective: Double,
-            fitScore: Double,
-            maximumDistance: Double
-        )?
-
-        for rawLine in coordinateLines {
-            let cleanedLine = removingSinglePointSpikes(from: rawLine)
-            guard cleanedLine.count >= 2 else { continue }
-
-            // GTFS shapes should already follow trip order, but evaluating both
-            // orientations lets stop progression—not endpoint proximity—decide.
-            for line in [cleanedLine, Array(cleanedLine.reversed())] {
-                guard let alignment = monotonicShapeAlignment(
-                    stops: orderedStops,
-                    line: line
-                ) else { continue }
-                if best.map({ alignment.objective < $0.objective }) ?? true {
-                    best = (
-                        line,
-                        alignment.indices,
-                        alignment.objective,
-                        alignment.fitScore,
-                        alignment.maximumDistance
-                    )
-                }
-            }
-        }
-
-        guard let best,
-              best.maximumDistance <= maximumShapeStopDistanceMeters,
-              best.fitScore <= maximumShapeStopRMSMeters,
-              let boardingIndex = best.indices.first,
-              let finalIndex = best.indices.last
-        else { return nil }
-        let boardingShapeDistance = MKMapPoint(orderedStops[0]).distance(
-            to: MKMapPoint(best.line[boardingIndex])
-        )
-        let flagshipIndex = best.indices[flagshipStopIndex]
-        guard boardingShapeDistance <= maximumBoardingShapeDistanceMeters,
-              flagshipIndex > boardingIndex,
-              finalIndex >= flagshipIndex
-        else { return nil }
-
-        let approachLine = boardingIndex > 0
-            ? Array(best.line[...boardingIndex]) : []
-        let flagshipLine = Array(best.line[boardingIndex...flagshipIndex])
-        let continuationLine = finalIndex > flagshipIndex
-            ? Array(best.line[flagshipIndex...finalIndex]) : []
-        let maximumJump = maximumGeometryJump(for: 3)
-        let approachSegments = approachLine.count >= 2
-            ? splitPolyline(approachLine, atJumpsLongerThan: maximumJump) : []
-        let flagshipSegments = splitPolyline(
-            flagshipLine,
-            atJumpsLongerThan: maximumJump
-        )
-        let continuationSegments = continuationLine.count >= 2
-            ? splitPolyline(continuationLine, atJumpsLongerThan: maximumJump) : []
-        guard !flagshipSegments.isEmpty else { return nil }
-        return (approachSegments, flagshipSegments, continuationSegments)
-    }
-
-    /// Dynamic programming finds the lowest-error stop-to-shape assignment while
-    /// preserving stop order. Shapes with enough samples require forward progress
-    /// at every stop; sparse shapes fall back to nondecreasing assignments.
-    private func monotonicShapeAlignment(
-        stops: [CLLocationCoordinate2D],
-        line: [CLLocationCoordinate2D]
-    ) -> (
-        indices: [Int],
-        objective: Double,
-        fitScore: Double,
-        maximumDistance: Double
-    )? {
-        guard stops.count >= 2, line.count >= 2 else { return nil }
-        let stopPoints = stops.map { MKMapPoint($0) }
-        let linePoints = line.map { MKMapPoint($0) }
-        let requiresForwardProgress = linePoints.count >= stopPoints.count
-        let infinity = Double.greatestFiniteMagnitude
-        let progressPenalty = 1.0
-        var cumulativeDistances = Array(repeating: 0.0, count: linePoints.count)
-        for index in 1..<linePoints.count {
-            cumulativeDistances[index] = cumulativeDistances[index - 1]
-                + linePoints[index - 1].distance(to: linePoints[index])
-        }
-
-        var previousCosts = linePoints.map { point -> Double in
-            let distance = stopPoints[0].distance(to: point)
-            return distance * distance
-        }
-        var backPointers = Array(
-            repeating: Array(repeating: -1, count: linePoints.count),
-            count: stopPoints.count
-        )
-
-        for stopIndex in 1..<stopPoints.count {
-            var currentCosts = Array(repeating: infinity, count: linePoints.count)
-            var bestPreviousCost = infinity
-            var bestPreviousIndex = -1
-
-            for lineIndex in linePoints.indices {
-                let eligibleIndex = requiresForwardProgress
-                    ? lineIndex - 1 : lineIndex
-                if eligibleIndex >= 0 {
-                    let adjustedCost = previousCosts[eligibleIndex]
-                        - progressPenalty * cumulativeDistances[eligibleIndex]
-                    if adjustedCost < bestPreviousCost {
-                        bestPreviousCost = adjustedCost
-                        bestPreviousIndex = eligibleIndex
-                    }
-                }
-                guard bestPreviousIndex >= 0 else { continue }
-
-                let distance = stopPoints[stopIndex].distance(
-                    to: linePoints[lineIndex]
-                )
-                currentCosts[lineIndex] = bestPreviousCost
-                    + progressPenalty * cumulativeDistances[lineIndex]
-                    + distance * distance
-                backPointers[stopIndex][lineIndex] = bestPreviousIndex
-            }
-            previousCosts = currentCosts
-        }
-
-        guard let finalIndex = previousCosts.indices.min(by: {
-            previousCosts[$0] < previousCosts[$1]
-        }),
-              previousCosts[finalIndex] < infinity
-        else { return nil }
-
-        var indices = Array(repeating: 0, count: stopPoints.count)
-        indices[indices.count - 1] = finalIndex
-        if indices.count > 1 {
-            for stopIndex in stride(
-                from: indices.count - 1,
-                through: 1,
-                by: -1
-            ) {
-                let previousIndex = backPointers[stopIndex][indices[stopIndex]]
-                guard previousIndex >= 0 else { return nil }
-                indices[stopIndex - 1] = previousIndex
-            }
-        }
-
-        let distances = zip(stopPoints, indices).map { pair in
-            pair.0.distance(to: linePoints[pair.1])
-        }
-        let squaredError = distances.reduce(0) { $0 + $1 * $1 }
-        return (
-            indices,
-            previousCosts[finalIndex],
-            sqrt(squaredError / Double(distances.count)),
-            distances.max() ?? infinity
         )
     }
 
@@ -1919,15 +1355,15 @@ final class TransitViewModel: NSObject, ObservableObject {
         from route: TransitRoute,
         near origin: CLLocationCoordinate2D
     ) -> TransitRoute {
-        let maximumJump = maximumGeometryJump(for: route.routeType)
+        let maximumJump = TripPathGeometry.maximumGeometryJump(for: route.routeType)
         let visiblePolylines: [[CLLocationCoordinate2D]] = route.polylines.flatMap {
             coordinates in
-            let cleanedCoordinates = removingSinglePointSpikes(from: coordinates)
-            return splitPolyline(
+            let cleanedCoordinates = TripPathGeometry.removingSinglePointSpikes(from: coordinates)
+            return TripPathGeometry.splitPolyline(
                 cleanedCoordinates,
                 atJumpsLongerThan: maximumJump
             ).flatMap {
-                clipPolyline($0, toRadius: routeDisplayRadiusMeters, around: origin)
+                TripPathGeometry.clipPolyline($0, toRadius: routeDisplayRadiusMeters, around: origin)
             }
         }
 
@@ -1941,205 +1377,6 @@ final class TransitViewModel: NSObject, ObservableObject {
             officialColorHex: route.officialColorHex,
             color: route.color,
             polylines: visiblePolylines
-        )
-    }
-
-    /// Very large jumps are almost always malformed coordinates. These high
-    /// thresholds intentionally favor retaining legitimate intercity service.
-    private func maximumGeometryJump(for routeType: Int) -> CLLocationDistance {
-        switch routeType {
-        case 4: // ferry
-            return 200_000
-        case 2: // intercity or commuter rail
-            return 100_000
-        default:
-            return 50_000
-        }
-    }
-
-    /// Removes only an unmistakable one-vertex out-and-back excursion. Broader
-    /// simplification could erase a legitimate route loop, so it is avoided.
-    private func removingSinglePointSpikes(
-        from coordinates: [CLLocationCoordinate2D]
-    ) -> [CLLocationCoordinate2D] {
-        guard coordinates.count >= 3 else { return coordinates }
-
-        var result = coordinates
-        var index = 1
-        while index < result.count - 1 {
-            let previous = MKMapPoint(result[index - 1])
-            let candidate = MKMapPoint(result[index])
-            let next = MKMapPoint(result[index + 1])
-            let incomingDistance = previous.distance(to: candidate)
-            let outgoingDistance = candidate.distance(to: next)
-            let bypassDistance = previous.distance(to: next)
-            let isLargeSpike = incomingDistance > 300
-                && outgoingDistance > 300
-                && bypassDistance < 75
-                && bypassDistance * 8 < incomingDistance + outgoingDistance
-            // Some official shapes insert a stop coordinate as a tiny A→B→A
-            // spur even though the vehicle remains on the street centerline.
-            // Remove only an almost-exact, short reversal; do not generalize this
-            // to loops, triangles, or ordinary turns. MTD shape shp-2-51 has
-            // exactly this seven-meter artifact at Anapamu & Santa Barbara.
-            let isTinyExactReversal = incomingDistance >= 2
-                && outgoingDistance >= 2
-                && incomingDistance <= 40
-                && outgoingDistance <= 40
-                && bypassDistance <= 2
-
-            if isLargeSpike || isTinyExactReversal {
-                result.remove(at: index)
-                if index > 1 { index -= 1 }
-            } else {
-                index += 1
-            }
-        }
-        return result
-    }
-
-    private func splitPolyline(
-        _ coordinates: [CLLocationCoordinate2D],
-        atJumpsLongerThan maximumJump: CLLocationDistance
-    ) -> [[CLLocationCoordinate2D]] {
-        guard let first = coordinates.first else { return [] }
-
-        var result: [[CLLocationCoordinate2D]] = []
-        var current = [first]
-
-        for coordinate in coordinates.dropFirst() {
-            guard let previous = current.last else {
-                current = [coordinate]
-                continue
-            }
-            let distance = MKMapPoint(previous).distance(
-                to: MKMapPoint(coordinate)
-            )
-
-            if distance < 0.05 {
-                continue
-            } else if distance > maximumJump {
-                if current.count >= 2 {
-                    result.append(current)
-                }
-                current = [coordinate]
-            } else {
-                current.append(coordinate)
-            }
-        }
-
-        if current.count >= 2 {
-            result.append(current)
-        }
-        return result
-    }
-
-    private func clipPolyline(
-        _ coordinates: [CLLocationCoordinate2D],
-        toRadius radius: CLLocationDistance,
-        around origin: CLLocationCoordinate2D
-    ) -> [[CLLocationCoordinate2D]] {
-        guard coordinates.count >= 2 else { return [] }
-
-        var result: [[CLLocationCoordinate2D]] = []
-        var current: [CLLocationCoordinate2D] = []
-
-        func finishCurrentSegment() {
-            if current.count >= 2 {
-                result.append(current)
-            }
-            current = []
-        }
-
-        for index in 0..<(coordinates.count - 1) {
-            guard let clipped = clipLineSegment(
-                from: coordinates[index],
-                to: coordinates[index + 1],
-                toRadius: radius,
-                around: origin
-            ) else {
-                finishCurrentSegment()
-                continue
-            }
-
-            if let previous = current.last {
-                let gap = MKMapPoint(previous).distance(
-                    to: MKMapPoint(clipped.start)
-                )
-                if gap > 0.5 {
-                    finishCurrentSegment()
-                    current = [clipped.start, clipped.end]
-                } else {
-                    let segmentLength = MKMapPoint(previous).distance(
-                        to: MKMapPoint(clipped.end)
-                    )
-                    if segmentLength > 0.05 {
-                        current.append(clipped.end)
-                    }
-                }
-            } else {
-                current = [clipped.start, clipped.end]
-            }
-        }
-
-        finishCurrentSegment()
-        return result
-    }
-
-    private func clipLineSegment(
-        from start: CLLocationCoordinate2D,
-        to end: CLLocationCoordinate2D,
-        toRadius radius: CLLocationDistance,
-        around origin: CLLocationCoordinate2D
-    ) -> (start: CLLocationCoordinate2D, end: CLLocationCoordinate2D)? {
-        let earthRadius = 6_371_008.8
-        let radiansPerDegree = Double.pi / 180
-        let longitudeScale = cos(origin.latitude * radiansPerDegree)
-
-        func localPoint(for coordinate: CLLocationCoordinate2D) -> (x: Double, y: Double) {
-            var longitudeDelta = coordinate.longitude - origin.longitude
-            if longitudeDelta > 180 { longitudeDelta -= 360 }
-            if longitudeDelta < -180 { longitudeDelta += 360 }
-            return (
-                x: longitudeDelta * radiansPerDegree * earthRadius * longitudeScale,
-                y: (coordinate.latitude - origin.latitude)
-                    * radiansPerDegree * earthRadius
-            )
-        }
-
-        let localStart = localPoint(for: start)
-        let localEnd = localPoint(for: end)
-        let deltaX = localEnd.x - localStart.x
-        let deltaY = localEnd.y - localStart.y
-        let quadraticA = deltaX * deltaX + deltaY * deltaY
-        guard quadraticA > 0 else { return nil }
-
-        let quadraticB = 2 * (localStart.x * deltaX + localStart.y * deltaY)
-        let quadraticC = localStart.x * localStart.x
-            + localStart.y * localStart.y
-            - radius * radius
-        let discriminant = quadraticB * quadraticB - 4 * quadraticA * quadraticC
-        guard discriminant >= 0 else { return nil }
-
-        let squareRoot = sqrt(discriminant)
-        let firstRoot = (-quadraticB - squareRoot) / (2 * quadraticA)
-        let secondRoot = (-quadraticB + squareRoot) / (2 * quadraticA)
-        let lowerBound = max(0, min(firstRoot, secondRoot))
-        let upperBound = min(1, max(firstRoot, secondRoot))
-        guard upperBound - lowerBound > 0.000_000_001 else { return nil }
-
-        func coordinate(at progress: Double) -> CLLocationCoordinate2D {
-            CLLocationCoordinate2D(
-                latitude: start.latitude
-                    + (end.latitude - start.latitude) * progress,
-                longitude: start.longitude
-                    + (end.longitude - start.longitude) * progress
-            )
-        }
-
-        return (
-            start: coordinate(at: lowerBound),
-            end: coordinate(at: upperBound)
         )
     }
 
