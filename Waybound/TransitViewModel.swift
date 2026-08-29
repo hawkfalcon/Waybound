@@ -118,6 +118,15 @@ final class TransitViewModel: NSObject, ObservableObject {
     /// boardable. Each retained route may contribute one trip per direction.
     private let maximumVisiblePublicRoutes = 20
     private let upcomingDepartureWindowSeconds = 10_800 // 3 hours
+    /// A bus ride short enough that nobody would board for it. This hardens the
+    /// soft "useful ride" preference already used when picking a representative
+    /// trip, so the overview never surfaces block-hop trips as destinations.
+    private let minimumUsefulRideMinutes = 8
+    /// When many buses compete for the sheet, far-future departures turn the
+    /// overview into a timetable of hours-away rides. Past this many boardable
+    /// journeys only departures leaving within this window are shown.
+    private let busyJourneyThreshold = 10
+    private let busyDepartureWindowMinutes = 60
     /// Frequency is deliberately local to the decision a rider is making now.
     /// A route earns a utility bonus only for catchable trips in the next 90 min.
     private let frequencyObservationWindowSeconds = 5_400
@@ -1082,7 +1091,27 @@ final class TransitViewModel: NSObject, ObservableObject {
             else { continue }
             journeysByRouteKey[routeKey, default: []].append(candidate)
         }
-        return retainedRouteKeys.flatMap { journeysByRouteKey[$0] ?? [] }
+        return filteredJourneys(
+            retainedRouteKeys.flatMap { journeysByRouteKey[$0] ?? [] }
+        )
+    }
+
+    /// Rider-facing filtering applied to the final boardable journey set.
+    /// 1. Drop rides too short for anyone to bother boarding a bus.
+    /// 2. When the network is busy enough to crowd the sheet (>10 journeys),
+    ///    narrow it to only departures leaving within the near-term window so
+    ///    it reads as choices, not a full timetable. Quiet areas keep every
+    ///    far-future bus, because that is the rider's only option there.
+    private func filteredJourneys(_ journeys: [RouteJourney]) -> [RouteJourney] {
+        let substantiveRides = journeys.filter {
+            $0.rideMinutes >= minimumUsefulRideMinutes
+        }
+        guard substantiveRides.count > busyJourneyThreshold else {
+            return substantiveRides
+        }
+        return substantiveRides.filter {
+            $0.departureMinutesFromNow <= busyDepartureWindowMinutes
+        }
     }
 
     private func journeyDirectionIdentity(

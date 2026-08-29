@@ -295,7 +295,9 @@ struct WayboundMapView: UIViewRepresentable {
                             observedDepartureCount: journey.observedDepartureCount,
                             segmentIndex: CorridorSegmentIndex(
                                 segments: routeSegments(
-                                    for: journey.flagshipPolylines
+                                    for: journey.flagshipPolylines.map {
+                                        densifiedRouteCoordinates($0)
+                                    }
                                 )
                             )
                         )
@@ -1242,36 +1244,65 @@ struct WayboundMapView: UIViewRepresentable {
             // diagonal connector where a shared corridor starts or ends.
             let taperDistance: CLLocationDistance = 58
             if offsets.count > 1 {
-                for index in 1..<offsets.count where !explicitlyStacked[index] {
-                    let factor = max(
-                        0,
-                        1 - points[index - 1].distance(to: points[index])
-                            / taperDistance
-                    )
-                    applyTaperedLayout(
-                        from: index - 1,
-                        to: index,
-                        factor: factor,
-                        offsets: &offsets,
-                        deltaX: &alignmentDeltaX,
-                        deltaY: &alignmentDeltaY
-                    )
-                }
-                for index in stride(from: offsets.count - 2, through: 0, by: -1)
-                where !explicitlyStacked[index] {
-                    let factor = max(
-                        0,
-                        1 - points[index].distance(to: points[index + 1])
-                            / taperDistance
-                    )
-                    applyTaperedLayout(
-                        from: index + 1,
-                        to: index,
-                        factor: factor,
-                        offsets: &offsets,
-                        deltaX: &alignmentDeltaX,
-                        deltaY: &alignmentDeltaY
-                    )
+                var i = 0
+                while i < offsets.count {
+                    while i < offsets.count && !explicitlyStacked[i] {
+                        i += 1
+                    }
+                    guard i < offsets.count else { break }
+                    let runStart = i
+                    while i < offsets.count && explicitlyStacked[i] {
+                        i += 1
+                    }
+                    let runEnd = i - 1
+
+                    // Backward taper before runStart
+                    var backwardAccumulated: CLLocationDistance = 0
+                    let startOffset = offsets[runStart]
+                    let startDeltaX = alignmentDeltaX[runStart]
+                    let startDeltaY = alignmentDeltaY[runStart]
+                    for backIndex in stride(from: runStart - 1, through: 0, by: -1) {
+                        if explicitlyStacked[backIndex] { break }
+                        backwardAccumulated += points[backIndex].distance(
+                            to: points[backIndex + 1]
+                        )
+                        if backwardAccumulated >= taperDistance { break }
+                        let factor = 1.0 - (backwardAccumulated / taperDistance)
+                        applyTaperedLayout(
+                            factor: factor,
+                            sourceOffset: startOffset,
+                            sourceDeltaX: startDeltaX,
+                            sourceDeltaY: startDeltaY,
+                            destinationIndex: backIndex,
+                            offsets: &offsets,
+                            deltaX: &alignmentDeltaX,
+                            deltaY: &alignmentDeltaY
+                        )
+                    }
+
+                    // Forward taper after runEnd
+                    var forwardAccumulated: CLLocationDistance = 0
+                    let endOffset = offsets[runEnd]
+                    let endDeltaX = alignmentDeltaX[runEnd]
+                    let endDeltaY = alignmentDeltaY[runEnd]
+                    for forwardIndex in (runEnd + 1)..<offsets.count {
+                        if explicitlyStacked[forwardIndex] { break }
+                        forwardAccumulated += points[forwardIndex - 1].distance(
+                            to: points[forwardIndex]
+                        )
+                        if forwardAccumulated >= taperDistance { break }
+                        let factor = 1.0 - (forwardAccumulated / taperDistance)
+                        applyTaperedLayout(
+                            factor: factor,
+                            sourceOffset: endOffset,
+                            sourceDeltaX: endDeltaX,
+                            sourceDeltaY: endDeltaY,
+                            destinationIndex: forwardIndex,
+                            offsets: &offsets,
+                            deltaX: &alignmentDeltaX,
+                            deltaY: &alignmentDeltaY
+                        )
+                    }
                 }
             }
 
@@ -1453,57 +1484,45 @@ struct WayboundMapView: UIViewRepresentable {
             deltaX: inout [Double],
             deltaY: inout [Double]
         ) {
-            let alignmentTransitionDistance: CLLocationDistance = 54
-            guard points.count > 1,
-                  points.count == explicitlyStacked.count
+            guard points.count > 2,
+                  points.count == explicitlyStacked.count,
+                  points.count == deltaX.count,
+                  points.count == deltaY.count
             else { return }
 
-            for index in 1..<points.count {
+            let originalDeltaX = deltaX
+            let originalDeltaY = deltaY
+            for index in 1..<(points.count - 1) {
                 guard explicitlyStacked[index - 1],
-                      explicitlyStacked[index]
-                else { continue }
-                let distance = points[index - 1].distance(to: points[index])
-                let alignmentProgress = max(
-                    0.05,
-                    min(1, distance / alignmentTransitionDistance)
-                )
-                deltaX[index] = deltaX[index - 1]
-                    + (deltaX[index] - deltaX[index - 1]) * alignmentProgress
-                deltaY[index] = deltaY[index - 1]
-                    + (deltaY[index] - deltaY[index - 1]) * alignmentProgress
-            }
-
-            for index in stride(from: points.count - 2, through: 0, by: -1) {
-                guard explicitlyStacked[index],
+                      explicitlyStacked[index],
                       explicitlyStacked[index + 1]
                 else { continue }
-                let distance = points[index].distance(to: points[index + 1])
-                let alignmentProgress = max(
-                    0.05,
-                    min(1, distance / alignmentTransitionDistance)
-                )
-                deltaX[index] = deltaX[index + 1]
-                    + (deltaX[index] - deltaX[index + 1]) * alignmentProgress
-                deltaY[index] = deltaY[index + 1]
-                    + (deltaY[index] - deltaY[index + 1]) * alignmentProgress
+                deltaX[index] = 0.25 * originalDeltaX[index - 1]
+                    + 0.50 * originalDeltaX[index]
+                    + 0.25 * originalDeltaX[index + 1]
+                deltaY[index] = 0.25 * originalDeltaY[index - 1]
+                    + 0.50 * originalDeltaY[index]
+                    + 0.25 * originalDeltaY[index + 1]
             }
         }
 
         private func applyTaperedLayout(
-            from sourceIndex: Int,
-            to destinationIndex: Int,
             factor: Double,
+            sourceOffset: Double,
+            sourceDeltaX: Double,
+            sourceDeltaY: Double,
+            destinationIndex: Int,
             offsets: inout [Double],
             deltaX: inout [Double],
             deltaY: inout [Double]
         ) {
-            let candidateOffset = offsets[sourceIndex] * factor
+            let candidateOffset = sourceOffset * factor
             if abs(candidateOffset) > abs(offsets[destinationIndex]) {
                 offsets[destinationIndex] = candidateOffset
             }
 
-            let candidateX = deltaX[sourceIndex] * factor
-            let candidateY = deltaY[sourceIndex] * factor
+            let candidateX = sourceDeltaX * factor
+            let candidateY = sourceDeltaY * factor
             if hypot(candidateX, candidateY) > hypot(
                 deltaX[destinationIndex],
                 deltaY[destinationIndex]
@@ -1712,8 +1731,14 @@ struct WayboundMapView: UIViewRepresentable {
             let deltaY = reference.end.y - reference.start.y
             let lengthSquared = deltaX * deltaX + deltaY * deltaY
             guard lengthSquared > 0 else { return point }
-            let progress = ((point.x - reference.start.x) * deltaX
-                + (point.y - reference.start.y) * deltaY) / lengthSquared
+            let progress = max(
+                0,
+                min(
+                    1,
+                    ((point.x - reference.start.x) * deltaX
+                        + (point.y - reference.start.y) * deltaY) / lengthSquared
+                )
+            )
             let projection = MKMapPoint(
                 x: reference.start.x + progress * deltaX,
                 y: reference.start.y + progress * deltaY
@@ -2017,6 +2042,8 @@ struct WayboundMapView: UIViewRepresentable {
                     cluster.journeyIDs
                 )
                 mapView.deselectAnnotation(cluster, animated: false)
+            } else if let ladder = view.annotation as? LadderStopMapAnnotation {
+                mapView.deselectAnnotation(ladder, animated: false)
             }
         }
 
@@ -2579,12 +2606,16 @@ private func stableRouteOffsetPoints(
         if sumLength > 0.001 {
             normal = CGPoint(x: sumX / sumLength, y: sumY / sumLength)
             let denominator = normal.x * nextNormal.x + normal.y * nextNormal.y
-            if abs(denominator) > 0.25 {
+            if denominator > 0.25 {
                 scale = localOffset / denominator
             }
         }
         let maximumMiter = abs(localOffset) * 1.75
-        scale = max(-maximumMiter, min(maximumMiter, scale))
+        if localOffset >= 0 {
+            scale = max(0, min(maximumMiter, scale))
+        } else {
+            scale = min(0, max(-maximumMiter, scale))
+        }
         return CGPoint(
             x: points[index].x + normal.x * scale,
             y: points[index].y + normal.y * scale
@@ -2982,7 +3013,7 @@ private final class LadderStopAnnotationView: MKAnnotationView {
     func configure(with annotation: LadderStopMapAnnotation) {
         subviews.forEach { $0.removeFromSuperview() }
         frame = CGRect(x: 0, y: 0, width: 170, height: 28)
-        centerOffset = CGPoint(x: 76, y: -14)
+        centerOffset = CGPoint(x: 80, y: 0)
 
         let dot = UIView(frame: CGRect(x: 0, y: 9, width: 10, height: 10))
         dot.backgroundColor = UIColor(annotation.journey.route.color)
