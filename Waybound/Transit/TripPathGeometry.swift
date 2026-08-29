@@ -291,7 +291,7 @@ enum TripPathGeometry {
                 from: coordinates[index],
                 to: coordinates[index + 1],
                 toRadius: radius,
-                around origin
+                around: origin
             ) else {
                 finishCurrentSegment()
                 continue
