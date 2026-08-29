@@ -8,6 +8,7 @@
 
 /* Begin PBXFileReference section */
 		625C1C46303129C700F8E02D /* Waybound.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Waybound.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		62AA00020000000000000001 /* WayboundTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WayboundTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -29,10 +30,22 @@
 			path = Waybound;
 			sourceTree = "<group>";
 		};
+		62AA0002000000000000000B /* WayboundTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = WayboundTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		625C1C43303129C700F8E02D /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		62AA00020000000000000004 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -46,6 +59,7 @@
 			isa = PBXGroup;
 			children = (
 				625C1C48303129C700F8E02D /* Waybound */,
+				62AA0002000000000000000B /* WayboundTests */,
 				625C1C47303129C700F8E02D /* Products */,
 			);
 			sourceTree = "<group>";
@@ -54,6 +68,7 @@
 			isa = PBXGroup;
 			children = (
 				625C1C46303129C700F8E02D /* Waybound.app */,
+				62AA00020000000000000001 /* WayboundTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -83,6 +98,29 @@
 			productReference = 625C1C46303129C700F8E02D /* Waybound.app */;
 			productType = "com.apple.product-type.application";
 		};
+		62AA00020000000000000002 /* WayboundTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 62AA00020000000000000008 /* Build configuration list for PBXNativeTarget "WayboundTests" */;
+			buildPhases = (
+				62AA00020000000000000003 /* Sources */,
+				62AA00020000000000000004 /* Frameworks */,
+				62AA00020000000000000005 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				62AA00020000000000000007 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				62AA0002000000000000000B /* WayboundTests */,
+			);
+			name = WayboundTests;
+			packageProductDependencies = (
+			);
+			productName = WayboundTests;
+			productReference = 62AA00020000000000000001 /* WayboundTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -95,6 +133,10 @@
 				TargetAttributes = {
 					625C1C45303129C700F8E02D = {
 						CreatedOnToolsVersion = 26.3;
+					};
+					62AA00020000000000000002 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = 625C1C45303129C700F8E02D;
 					};
 				};
 			};
@@ -113,12 +155,20 @@
 			projectRoot = "";
 			targets = (
 				625C1C45303129C700F8E02D /* Waybound */,
+				62AA00020000000000000002 /* WayboundTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		625C1C44303129C700F8E02D /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		62AA00020000000000000005 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -135,7 +185,32 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		62AA00020000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXContainerItemProxy section */
+		62AA00020000000000000006 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 625C1C3E303129C700F8E02D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 625C1C45303129C700F8E02D;
+			remoteInfo = Waybound;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXTargetDependency section */
+		62AA00020000000000000007 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 625C1C45303129C700F8E02D /* Waybound */;
+			targetProxy = 62AA00020000000000000006 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		625C1C55303129C800F8E02D /* Debug */ = {
@@ -331,6 +406,58 @@
 			};
 			name = Release;
 		};
+		62AA00020000000000000009 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = RT8YM7LNZF;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.hawkfalcon.WayboundTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Waybound.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Waybound";
+			};
+			name = Debug;
+		};
+		62AA0002000000000000000A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = RT8YM7LNZF;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.hawkfalcon.WayboundTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Waybound.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Waybound";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -348,6 +475,15 @@
 			buildConfigurations = (
 				625C1C55303129C800F8E02D /* Debug */,
 				625C1C56303129C800F8E02D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		62AA00020000000000000008 /* Build configuration list for PBXNativeTarget "WayboundTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				62AA00020000000000000009 /* Debug */,
+				62AA0002000000000000000A /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

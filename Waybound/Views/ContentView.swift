@@ -151,6 +151,7 @@ struct ContentView: View {
                     highlightedJourneyIDs: highlightedJourneyIDs,
                     selectedStopName: selectedStop?.name,
                     planningDate: viewModel.planningDate,
+                    journeyWindowMinutes: viewModel.journeyWindowMinutes,
                     onSelect: selectJourney,
                     onClearStop: clearStopSelection,
                     onSettings: { isShowingPlanningSettings = true },
@@ -455,6 +456,7 @@ private struct JourneyOverviewSheet: View {
     let highlightedJourneyIDs: Set<Int>?
     let selectedStopName: String?
     let planningDate: Date?
+    let journeyWindowMinutes: Int
     let onSelect: (Int) -> Void
     let onClearStop: () -> Void
     let onSettings: () -> Void
@@ -465,6 +467,16 @@ private struct JourneyOverviewSheet: View {
             ?? "Buses you can catch nearby"
         guard let planningDate else { return routeScope }
         return "\(planningDate.formatted(date: .abbreviated, time: .shortened)) · \(routeScope)"
+    }
+
+    private var journeyWindowText: String {
+        if journeyWindowMinutes >= 60 {
+            let hours = journeyWindowMinutes / 60
+            return hours == 1 ? "1 hour" : "\(hours) hours"
+        }
+        return journeyWindowMinutes == 1
+            ? "1 minute"
+            : "\(journeyWindowMinutes) minutes"
     }
 
     /// Both useful directions of one route are a single mental object ("the
@@ -554,7 +566,7 @@ private struct JourneyOverviewSheet: View {
                 ContentUnavailableView {
                     Label("No boardable trips", systemImage: "bus")
                 } description: {
-                    Text("No real trip with a trusted street shape departs in the next 3 hours.")
+                    Text("No real trip with a trusted street shape departs in the next \(journeyWindowText).")
                 }
                 .fontDesign(.rounded)
             } else {
@@ -576,7 +588,7 @@ private struct JourneyOverviewSheet: View {
 
                         if !unavailableRoutes.isEmpty && !isLoading {
                             HStack {
-                                Text("No boardable trip in the next 3 hours")
+                                Text("No boardable trip in the next \(journeyWindowText)")
                                     .font(
                                         .system(
                                             size: 13,
