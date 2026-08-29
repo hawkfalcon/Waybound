@@ -1356,54 +1356,56 @@ struct WayboundMapView: UIViewRepresentable {
             offsets: inout [Double]
         ) {
             guard offsets.count == layouts.count + 1,
-                  points.count == offsets.count
+                  points.count == offsets.count,
+                  points.count > 1
             else { return }
-            // A brief detection dropout — a bend dipping under the parallel
-            // threshold, a crossing street — splits one physical corridor into
-            // two runs. Reissuing the outside "entering" lane to the second run
-            // made strands jog sideways and back for no visible reason. Only a
-            // genuinely long departure from the corridor counts as leaving it.
-            let corridorContinuationDistance: CLLocationDistance = 150
-            var runStart = 0
-            var previousRun: (endIndex: Int, offset: Double, referenceID: Int)?
 
-            while runStart < layouts.count {
-                while runStart < layouts.count, layouts[runStart] == nil {
-                    runStart += 1
-                }
-                guard runStart < layouts.count,
-                      let firstLayout = layouts[runStart]
-                else { break }
-                var runEnd = runStart + 1
-                while runEnd < layouts.count, layouts[runEnd] != nil {
-                    runEnd += 1
+            // `offsets` already holds the compact local stack at each vertex.
+            // Freezing the first shared lane for the whole run is what left
+            // ribbons on the sidewalk after companions turned off — the lane
+            // never moved back. Blend only among still-shared vertices so a
+            // shrinking stack slides onto the street, while run edges still
+            // hand off to the existing centerline taper.
+            func vertexIsShared(_ index: Int) -> Bool {
+                (index < layouts.count && layouts[index] != nil)
+                    || (index > 0 && layouts[index - 1] != nil)
+            }
+
+            let transitionDistance: CLLocationDistance = 72
+            let original = offsets
+            for index in original.indices {
+                guard vertexIsShared(index) else { continue }
+                var weightedSum = original[index]
+                var weightTotal = 1.0
+
+                var distance: CLLocationDistance = 0
+                var back = index
+                while back > 0 {
+                    distance += points[back - 1].distance(to: points[back])
+                    if distance > transitionDistance { break }
+                    guard vertexIsShared(back - 1) else { break }
+                    let weight = 1.0 - distance / transitionDistance
+                    weightedSum += original[back - 1] * weight
+                    weightTotal += weight
+                    back -= 1
                 }
 
-                let stableOffset: Double
-                if let previousRun,
-                   previousRun.referenceID == firstLayout.referenceID,
-                   (previousRun.endIndex..<runStart).reduce(0.0, {
-                       $0 + points[$1].distance(to: points[$1 + 1])
-                   }) <= corridorContinuationDistance {
-                    // Same corridor, short dropout: hold the lane already won.
-                    stableOffset = previousRun.offset
-                } else if runStart == 0 {
-                    // The route begins already inside the corridor, so there is
-                    // no topology history: use the compact local stack.
-                    stableOffset = firstLayout.offset
-                } else {
-                    // A genuine mid-shape join takes the precomputed outside
-                    // lane and leaves incumbents untouched.
-                    stableOffset = firstLayout.enteringOffset
+                distance = 0
+                var forward = index
+                while forward < original.count - 1 {
+                    distance += points[forward].distance(to: points[forward + 1])
+                    if distance > transitionDistance { break }
+                    guard vertexIsShared(forward + 1) else { break }
+                    let weight = 1.0 - distance / transitionDistance
+                    weightedSum += original[forward + 1] * weight
+                    weightTotal += weight
+                    forward += 1
                 }
-                for vertexIndex in runStart...runEnd {
-                    offsets[vertexIndex] = stableOffset
-                }
-                previousRun = (runEnd, stableOffset, firstLayout.referenceID)
-                runStart = runEnd
+
+                offsets[index] = weightedSum / weightTotal
             }
         }
-
+        
         private func bridgeShortCorridorGaps(
             points: [MKMapPoint],
             explicitlyStacked: inout [Bool],
