@@ -1,8 +1,26 @@
 import CoreLocation
+import MapKit
 import XCTest
 @testable import Waybound
 
 final class TripPathGeometryTests: XCTestCase {
+
+    func testDiagnosticsMapKitScalePrints() {
+        // Temporary instrument, no assertions: prints what this binary
+        // actually computes for a known 500 m east-west segment at the
+        // fixture latitude. Reference values from the Python mirror:
+        // ppm 8.1176, mpm 0.12317, point distance 4058.8, meters 500.08.
+        let a = TestFixtures.coordinate(north: 0, east: 0)
+        let b = TestFixtures.coordinate(north: 0, east: 500)
+        let pa = MKMapPoint(a)
+        let pb = MKMapPoint(b)
+        let mpm = TripPathGeometry.metersPerMapPoint(atLatitude: a.latitude)
+        let pointDistance = pa.distance(to: pb)
+        print("DIAG ppm=\(1.0 / mpm) mpm=\(mpm) pointDistance=\(pointDistance) meters=\(pointDistance * mpm)")
+        let spikeIn = pa.distance(to: MKMapPoint(TestFixtures.coordinate(north: 0, east: 500))) * mpm
+        let spikeBypass = pa.distance(to: MKMapPoint(TestFixtures.coordinate(north: 0, east: 10))) * mpm
+        print("DIAG spikeIncoming=\(spikeIn) spikeBypass=\(spikeBypass)")
+    }
 
     func testMetersPerMapPointMatchesTheMercatorProjection() {
         // One map point spans ~0.149 m at the equator and ~0.123 m in Santa
