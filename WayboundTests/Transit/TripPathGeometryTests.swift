@@ -410,6 +410,71 @@ final class TripPathGeometryTests: XCTestCase {
         XCTAssertEqual(cleaned.count, crest.count)
     }
 
+    func testRemovingStopConnectorNotchesDropsVerySparseConnectors() {
+        // The lowest-frequency routes (20, 14) sample their shapes so
+        // sparsely that a connector's re-entry vertex sits two hundred
+        // meters past the stop. The structural gates — street-through and
+        // the steep leg — make the longer span safe.
+        let stop = TestFixtures.coordinate(north: 9, east: 300)
+        let sparse = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 150),
+            TestFixtures.coordinate(north: 0, east: 300),
+            stop,
+            TestFixtures.coordinate(north: 0, east: 500),
+            TestFixtures.coordinate(north: 0, east: 650),
+        ]
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: sparse,
+            nearStops: [stop]
+        )
+        XCTAssertEqual(cleaned.count, 5)
+        XCTAssertFalse(cleaned.contains { $0.latitude == stop.latitude })
+    }
+
+    func testRemovingStopConnectorNotchesTrimsMultiVertexTerminalTails() {
+        // A connector with two baked points at the stop: the trim drops the
+        // terminal stop, then the midpoint beside it. The street heading is
+        // measured from outside the connector, so the tail's own direction
+        // cannot masquerade as the street.
+        let stop = TestFixtures.coordinate(north: 16, east: 290)
+        let tail = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 100),
+            TestFixtures.coordinate(north: 0, east: 200),
+            TestFixtures.coordinate(north: 0, east: 290),
+            TestFixtures.coordinate(north: 8, east: 290),
+            stop,
+        ]
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: tail,
+            nearStops: [stop]
+        )
+        XCTAssertEqual(cleaned.count, 4)
+        XCTAssertTrue(
+            cleaned.allSatisfy { $0.latitude == tail[0].latitude },
+            "a surviving vertex is off the street"
+        )
+    }
+
+    func testRemovingStopConnectorNotchesKeepsParallelTerminalEntries() {
+        // A bay or terminal entry that runs alongside the street into the
+        // stop is geometrically indistinguishable from service and stays.
+        let stop = TestFixtures.coordinate(north: 10, east: 320)
+        let bay = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 100),
+            TestFixtures.coordinate(north: 0, east: 200),
+            TestFixtures.coordinate(north: 10, east: 260),
+            stop,
+        ]
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: bay,
+            nearStops: [stop]
+        )
+        XCTAssertEqual(cleaned.count, bay.count)
+    }
+
     func testSplitPolylineKeepsLegitimateIntercityLegs() {
         // A 20 km rural leg is legitimate intercity service at the documented
         // 50 km bus threshold; the map-point comparison used to cut it in two.

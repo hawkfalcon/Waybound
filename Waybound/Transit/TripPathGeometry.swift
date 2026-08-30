@@ -143,8 +143,8 @@ enum TripPathGeometry {
 
     /// Removes short lateral excursions that touch a known stop: the shape
     /// leaves the street, visits a stop coordinate, and resumes on the street
-    /// — including the sparse-shape form whose re-entry vertex sits a hundred
-    /// meters ahead, and a terminal coordinate that is nothing but the stop
+    /// — including the sparse-shape form whose re-entry vertex sits far down
+    /// the street, and a terminal coordinate that is nothing but the stop
     /// itself reached sideways. The spur stage alone catches only the deepest
     /// of these; the V-shaped variant never returns to its anchor at all.
     ///
@@ -177,26 +177,24 @@ enum TripPathGeometry {
         }
 
         // A journey endpoint that is just the stop coordinate reached
-        // sideways is the same artifact with no interior span to scan.
-        if let last = result.indices.last {
-            var points = result.map { MKMapPoint($0) }
-            if isTerminalStopConnector(
-                in: points,
-                stopPoints: stopPoints,
-                metersPerPoint: metersPerPoint,
-                atEnd: .last
-            ) {
-                result.remove(at: last)
-                points = result.map { MKMapPoint($0) }
-            }
-            guard result.count >= 4 else { return result }
-            if isTerminalStopConnector(
-                in: points,
-                stopPoints: stopPoints,
-                metersPerPoint: metersPerPoint,
-                atEnd: .first
-            ) {
-                result.remove(at: result.indices.lowerBound)
+        // sideways is the same artifact with no interior span to scan. A
+        // connector can carry more than one baked vertex, so each end is
+        // trimmed repeatedly while every gate keeps holding.
+        for end in [ShapeEnd.last, .first] {
+            var drops = 0
+            while drops < 3, result.count >= 4 {
+                let points = result.map { MKMapPoint($0) }
+                guard isTerminalStopConnector(
+                    in: points,
+                    stopPoints: stopPoints,
+                    metersPerPoint: metersPerPoint,
+                    atEnd: end
+                ) else { break }
+                switch end {
+                case .last: result.removeLast()
+                case .first: result.removeFirst()
+                }
+                drops += 1
             }
         }
         return result
@@ -209,8 +207,10 @@ enum TripPathGeometry {
 
     /// True when the polyline's terminal vertex is a stop coordinate reached
     /// steeply off the street line the shape was traveling — the one-segment
-    /// form of a stop connector. A genuine terminal turn or a stop straight
-    /// down the street is kept.
+    /// form of a stop connector. The street line is measured from *outside*
+    /// the connector, so a tail of several baked vertices cannot supply its
+    /// own direction as the street. A genuine terminal turn or a stop
+    /// straight down the street is kept.
     private static func isTerminalStopConnector(
         in points: [MKMapPoint],
         stopPoints: [MKMapPoint],
@@ -219,37 +219,52 @@ enum TripPathGeometry {
     ) -> Bool {
         let maximumStopDistance: CLLocationDistance = 12
         let maximumDepartureDot = 0.34  // at least 70 degrees off the street
+        let maximumConnectorNeighborhood: CLLocationDistance = 25
+        let maximumSkippedVertices = 8
 
         guard points.count >= 3 else { return false }
         let vertex: MKMapPoint
         let approach: MKMapPoint
-        let streetHeading: (x: Double, y: Double)?
+        let approachIndex: Int
+        let step: Int
         switch end {
         case .last:
             vertex = points[points.count - 1]
             approach = points[points.count - 2]
-            streetHeading = travelHeading(
-                in: points,
-                at: points.count - 2,
-                backward: true,
-                metersPerPoint: metersPerPoint
-            )
+            approachIndex = points.count - 2
+            step = -1
         case .first:
             vertex = points[0]
             approach = points[1]
-            streetHeading = travelHeading(
-                in: points,
-                at: 1,
-                backward: false,
-                metersPerPoint: metersPerPoint
-            )
+            approachIndex = 1
+            step = 1
         }
-        guard let streetHeading,
-              let departureHeading = unitHeading(from: approach, to: vertex)
-        else { return false }
         guard stopPoints.contains(where: { stop in
             stop.distance(to: vertex) * metersPerPoint <= maximumStopDistance
         }) else { return false }
+
+        // Walk inward past vertices within one notch depth of the terminal
+        // vertex — the connector and its baked points live in that
+        // neighborhood — and measure the street at the first vertex beyond
+        // it.
+        var baselineIndex = approachIndex
+        var skippedVertices = 0
+        while baselineIndex >= 0, baselineIndex < points.count,
+              points[baselineIndex].distance(to: vertex) * metersPerPoint
+                <= maximumConnectorNeighborhood,
+              skippedVertices < maximumSkippedVertices {
+            baselineIndex += step
+            skippedVertices += 1
+        }
+        guard baselineIndex >= 0, baselineIndex < points.count,
+              let streetHeading = travelHeading(
+                in: points,
+                at: baselineIndex,
+                backward: end == .last,
+                metersPerPoint: metersPerPoint
+              ),
+              let departureHeading = unitHeading(from: approach, to: vertex)
+        else { return false }
         let departureDot = abs(
             departureHeading.x * streetHeading.x
                 + departureHeading.y * streetHeading.y
@@ -259,26 +274,29 @@ enum TripPathGeometry {
 
     /// Finds the first interior excursion that enters a stop connector-side
     /// and returns to the same street. All gates are true meters. The
-    /// excursion is bounded by how far it travels (160 m — a sparse shape's
-    /// re-entry vertex can be a hundred meters ahead), how little street it
-    /// skips (a 120 m chord), and how deep it goes (3–25 m); its apex must
-    /// sit within 12 m of a trip stop. The street must continue straight
-    /// through: the return vertex stays within 8 m of the incoming line, the
-    /// anchor within 8 m of the outgoing line, and travel keeps its heading
-    /// (dot ≥ 0.9) — feed sampling noise between those vertices is tolerated,
-    /// a jogged or curving street is not. Finally the excursion must reach
-    /// its stop steeply (at least one leg ≥ 40° off the street), which is
-    /// what separates a connector from a gradual crest that happens to peak
-    /// at a stop. Every deletion is street-aligned by construction; redundant
-    /// collinear street vertices inside a deleted span go with it, leaving
-    /// the drawn line unchanged.
+    /// excursion is bounded by how far it travels (260 m — a sparsely
+    /// sampled shape's re-entry vertex can be two hundred meters ahead) and
+    /// how deep it goes (3–25 m); its apex must sit within 12 m of a trip
+    /// stop. The street must continue straight: the return vertex
+    /// stays within 8 m of the incoming line, the anchor within 8 m of the
+    /// outgoing line, and travel keeps its heading (dot ≥ 0.9) — feed
+    /// sampling noise between those vertices is tolerated, a jogged or
+    /// curving street is not. Finally the excursion must reach its stop
+    /// steeply (at least one leg ≥ 40° off the street), which is what
+    /// separates a connector from a gradual crest that happens to peak at a
+    /// stop. The 240 m chord is a backstop, not the load-bearing gate: with
+    /// both span ends gated onto the street's lines, a long chord is the
+    /// street itself, and a street that curves inside the span fails the
+    /// depth or heading gates first. Every deletion is street-aligned by
+    /// construction; redundant collinear street vertices inside a deleted
+    /// span go with it, leaving the drawn line unchanged.
     private static func firstStopConnectorNotchRange(
         in points: [MKMapPoint],
         stopPoints: [MKMapPoint],
         metersPerPoint: Double
     ) -> Range<Int>? {
-        let maximumNotchPathDistance: CLLocationDistance = 160
-        let maximumNotchChordDistance: CLLocationDistance = 120
+        let maximumNotchPathDistance: CLLocationDistance = 260
+        let maximumNotchChordDistance: CLLocationDistance = 240
         let minimumNotchDepth: CLLocationDistance = 3
         let maximumNotchDepth: CLLocationDistance = 25
         let maximumStopDistance: CLLocationDistance = 12

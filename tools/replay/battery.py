@@ -104,6 +104,12 @@ must_delete(
     expect_count=5,
 )
 must_delete(
+    "very sparse V (re-entry vertex 200 m on; route-20/14 form)",
+    [C(0, 0), C(0, 150), C(0, 300), C(9, 300), C(0, 500), C(0, 650)],
+    [C(9, 300)],
+    expect_count=5,
+)
+must_delete(
     "noisy V (re-entry drifts 4 m sideways)",
     [C(0, 0), C(0, 100), C(10, 106), C(4, 132), C(4, 230), C(4, 330)],
     [C(12, 112)],
@@ -118,6 +124,12 @@ must_delete(
     "terminal connector at the start",
     [C(10, 0), C(0, 0), C(0, 100), C(0, 200), C(0, 300)],
     [C(10, 0)],
+    expect_count=4,
+)
+must_delete(
+    "two-vertex terminal tail (perpendicular, both points at the stop)",
+    [C(0, 0), C(0, 100), C(0, 200), C(0, 290), C(8, 290), C(16, 290)],
+    [C(16, 290)],
     expect_count=4,
 )
 
@@ -191,6 +203,11 @@ must_keep(
     "straight-in terminal stop",
     [C(0, 0), C(0, 120), C(0, 240), C(0, 300)],
     [C(0, 300)],
+)
+must_keep(
+    "parallel bay/terminal entry (indistinguishable from service)",
+    [C(0, 0), C(0, 100), C(0, 200), C(10, 260), C(10, 320)],
+    [C(10, 320)],
 )
 
 # ------------------------------------------------------- PROPERTY ON REAL DATA

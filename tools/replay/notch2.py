@@ -1,8 +1,8 @@
 """Notch-stage harness matching the UPDATED Swift gates:
-  path <= 160 m, chord <= 120 m, depth 3-25 m, apex <= 12 m from a stop,
+  path <= 260 m, chord <= 240 m, depth 3-25 m, apex <= 12 m from a stop,
   street continues straight through (anchor and return each within 8 m of the
   other leg's line, heading-through dot >= 0.9), plus terminal-connector
-  trimming (drop a final/first vertex that is a stop reached >= 70 degrees
+  trimming (drop up to 3 vertices per end, each a stop reached >= 70 degrees
   off the street line)."""
 import math
 from geo import to_map_point, to_coord, dist, perp_distance, mpm
@@ -28,7 +28,7 @@ def heading_over(pts, i, step, m, max_len=60.0, max_steps=3):
     a, b = (pts[i], pts[j]) if step > 0 else (pts[j], pts[i])
     return unit(a, b)
 
-def first_notch(pts, m, stop_pts, max_path=160.0, max_chord=120.0,
+def first_notch(pts, m, stop_pts, max_path=260.0, max_chord=240.0,
                 min_depth=3.0, max_depth=25.0, max_stop_dist=12.0,
                 max_line_offset=8.0, min_dot=0.9, max_leg_angle_deg=40.0):
     n = len(pts)
@@ -70,19 +70,42 @@ def first_notch(pts, m, stop_pts, max_path=160.0, max_chord=120.0,
             return (a + 1, r)
     return None
 
-def trim_terminal(pts, m, stop_pts, end, max_stop_dist=12.0, max_depart_dot=0.34):
+def trim_terminal(pts, m, stop_pts, end, max_stop_dist=12.0, max_depart_dot=0.34,
+                  skip_radius=25.0, max_skip_steps=8):
     """end='last' or 'first'. Drops a terminal vertex that is a stop reached
-    steeply off the street line the shape was traveling."""
+    steeply off the street line the shape was traveling.
+
+    The street line is measured from OUTSIDE the connector: walk inward past
+    vertices within skip_radius of the terminal vertex (the connector and its
+    baked points live inside one notch depth of it) and take the travel
+    heading there. Otherwise a two-point perpendicular tail would measure its
+    own connector leg as the 'street'."""
     n = len(pts)
     if end == 'last':
-        v, u, h = pts[n-1], pts[n-2], heading_over(pts, n-2, -1, m)
+        v = pts[n-1]
+        start, step = n - 2, -1
     else:
-        v, u, h = pts[0], pts[1], heading_over(pts, 1, +1, m)
-    if h is None: return False
-    if min(dist(v, s) * m for s in stop_pts) > max_stop_dist: return False
+        v = pts[0]
+        start, step = 1, 1
+    if min(dist(v, s) * m for s in stop_pts) > max_stop_dist:
+        return False
+    # First vertex beyond the connector's neighborhood.
+    i = start
+    skipped = 0
+    while 0 <= i < n and dist(pts[i], v) * m <= skip_radius and skipped < max_skip_steps:
+        i += step
+        skipped += 1
+    if not (0 <= i < n):
+        return False
+    h = heading_over(pts, i, -1 if end == 'last' else 1, m)
+    if h is None:
+        return False
+    u = pts[start]
     hv = unit(u, v)
-    if hv is None: return False
-    return (hv[0]*h[0] + hv[1]*h[1]) <= max_depart_dot
+    if hv is None:
+        return False
+    # abs(): matches Swift — a reversal is not a sideways departure.
+    return abs(hv[0]*h[0] + hv[1]*h[1]) <= max_depart_dot
 
 def removing_stop_connector_notches(coords, stops, max_passes=64):
     if len(coords) < 4 or not stops: return list(coords)
@@ -95,9 +118,16 @@ def removing_stop_connector_notches(coords, stops, max_passes=64):
         if rng is None: break
         del result[rng[0]:rng[1]]
     pts = [to_map_point(*c) for c in result]
-    if trim_terminal(pts, m, stop_pts, 'last'):
-        result.pop()
-        pts = [to_map_point(*c) for c in result]
-    if trim_terminal(pts, m, stop_pts, 'first'):
-        result.pop(0)
+    for _ in range(3):
+        if trim_terminal(pts, m, stop_pts, 'last'):
+            result.pop()
+            pts = [to_map_point(*c) for c in result]
+        else:
+            break
+    for _ in range(3):
+        if trim_terminal(pts, m, stop_pts, 'first'):
+            result.pop(0)
+            pts = [to_map_point(*c) for c in result]
+        else:
+            break
     return result
