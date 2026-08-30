@@ -73,6 +73,12 @@ itself; it can never draw a diagonal across real geography.
 
 The `WayboundTests` target hosts the app and exercises the pure logic above. In Xcode: **Product → Test** (⌘U).
 
+`tools/replay/` holds the Python replay harness used to prototype and
+validate the geometry stages before porting them to Swift — algorithm
+mirrors, regression batteries, and the real downtown traces they run on.
+`python3 tools/replay/battery.py` and `python3 tools/replay/corridor_check.py`
+are the ground truth for any change to the notch or corridor passes.
+
 ## Deployment target
 
 The project still ships with `IPHONEOS_DEPLOYMENT_TARGET = 26.2` (unchanged).
