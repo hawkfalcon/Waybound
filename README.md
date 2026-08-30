@@ -54,7 +54,20 @@ separation, but centerline *adoption* — projecting a member's vertices onto
 the dominant route's shape — is capped at 6 m. Divided carriageways
 (Hollister, El Colegio, Calle Real) and freeway ramp braids sit 12–20 m apart,
 and snapping across that gap rendered the 9 loop and the 12x/24x expresses as
-tapered sideways detours onto the wrong side of the street.
+tapered sideways detours onto the wrong side of the street. The correction a
+lane adopts is also *rate*-limited (0.08 m per meter of street, smoothed from
+both ends): where the corridor's preferred reference changes — route 6 turns
+off Chapala at Sola, so the 12x/24x lane re-references there — the bounded
+correction used to arrive within a vertex or two as a one-sided diagonal jog.
+
+Stop-connector cleanup deletes an excursion only when the street provably
+continues straight through it: both span ends sit on each other's line of
+travel, travel keeps its heading, and the excursion reaches its stop steeply
+(≥ 40° off the street) — so sparse downtown shapes (re-entry vertex a hundred
+meters on) and sideways terminal coordinates are cleaned, while jogs,
+corners, curves, crests, and hairpins are kept even when a stop sits on them.
+A deletion that passes those gates replaces the span with the street chord
+itself; it can never draw a diagonal across real geography.
 
 ## Tests
 

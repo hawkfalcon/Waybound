@@ -1344,6 +1344,51 @@ struct WayboundMapView: UIViewRepresentable {
                 }
             }
 
+            // The locally preferred reference shape can change where a
+            // companion route turns off (route 6 leaves Chapala at Sola, so
+            // the 12x/24x corridor re-references there). The correction
+            // itself is bounded to six meters, but without a rate limit it
+            // steps by that full amount within a vertex or two — a one-sided
+            // diagonal jog at the corner. Limit the correction to a gentle
+            // ramp; a sustained feed-drift correction is unaffected because
+            // only the rate of change is clamped. Two passes (forward, then
+            // backward) make the limiter symmetric.
+            let maximumAlignmentRamp = 0.08  // meters of correction per meter
+            if points.count > 2 {
+                for index in 1..<points.count {
+                    let segmentMeters = points[index - 1].distance(
+                        to: points[index]
+                    ) * metersPerMapPoint
+                    let budget = maximumAlignmentRamp * segmentMeters
+                    let stepX = alignmentDeltaX[index] - alignmentDeltaX[index - 1]
+                    let stepY = alignmentDeltaY[index] - alignmentDeltaY[index - 1]
+                    let step = hypot(stepX, stepY)
+                    if step > budget, budget > 0 {
+                        let scale = budget / step
+                        alignmentDeltaX[index] = alignmentDeltaX[index - 1]
+                            + stepX * scale
+                        alignmentDeltaY[index] = alignmentDeltaY[index - 1]
+                            + stepY * scale
+                    }
+                }
+                for index in stride(from: points.count - 2, through: 0, by: -1) {
+                    let segmentMeters = points[index].distance(
+                        to: points[index + 1]
+                    ) * metersPerMapPoint
+                    let budget = maximumAlignmentRamp * segmentMeters
+                    let stepX = alignmentDeltaX[index] - alignmentDeltaX[index + 1]
+                    let stepY = alignmentDeltaY[index] - alignmentDeltaY[index + 1]
+                    let step = hypot(stepX, stepY)
+                    if step > budget, budget > 0 {
+                        let scale = budget / step
+                        alignmentDeltaX[index] = alignmentDeltaX[index + 1]
+                            + stepX * scale
+                        alignmentDeltaY[index] = alignmentDeltaY[index + 1]
+                            + stepY * scale
+                    }
+                }
+            }
+
             let alignedCoordinates = points.indices.map { index in
                 MKMapPoint(
                     x: points[index].x + alignmentDeltaX[index],

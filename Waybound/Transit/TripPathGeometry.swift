@@ -143,21 +143,18 @@ enum TripPathGeometry {
 
     /// Removes short lateral excursions that touch a known stop: the shape
     /// leaves the street, visits a stop coordinate, and resumes on the street
-    /// within a few tens of meters. The spur stage alone catches only the
-    /// deepest of these — a connector to a stop ten meters off the roadway is
-    /// both shallower and shorter than a recognizable spur, and the V-shaped
-    /// variant (resuming down the street instead of retracing) never returns
-    /// to its anchor at all.
+    /// — including the sparse-shape form whose re-entry vertex sits a hundred
+    /// meters ahead, and a terminal coordinate that is nothing but the stop
+    /// itself reached sideways. The spur stage alone catches only the deepest
+    /// of these; the V-shaped variant never returns to its anchor at all.
     ///
-    /// The decisive gates are that the excursion *returns to the street it
-    /// left*: the return vertex must sit on the line the route was already
-    /// traveling and travel must keep its heading, so the chord replacing the
-    /// deleted span lies on the street itself and a deletion can never draw a
-    /// diagonal across real geography. Real turns, block jogs, curves, hair-
-    /// pins, and terminal loops all resume on a different line or reverse
-    /// travel, and are kept — even when a stop sits right on the corner. A
-    /// connector at a sharp corner can survive those gates; that is the
-    /// accepted residue, safer than any aggressive guess.
+    /// The decisive gates are that the street continues straight through the
+    /// span — anchor and return each sit on the other leg's line of travel —
+    /// and that the excursion reaches its stop steeply off that line, the way
+    /// a connector does and a gradual curve does not. The chord replacing a
+    /// deleted span therefore lies on the street itself: a deletion cannot
+    /// draw a diagonal across real turns, jogs, crests, hairpins, or loops,
+    /// even when a stop sits exactly on that geometry.
     static func removingStopConnectorNotches(
         from coordinates: [CLLocationCoordinate2D],
         nearStops stops: [CLLocationCoordinate2D]
@@ -178,30 +175,116 @@ enum TripPathGeometry {
             ) else { break }
             result.removeSubrange(notchRange)
         }
+
+        // A journey endpoint that is just the stop coordinate reached
+        // sideways is the same artifact with no interior span to scan.
+        if let last = result.indices.last {
+            var points = result.map { MKMapPoint($0) }
+            if isTerminalStopConnector(
+                in: points,
+                stopPoints: stopPoints,
+                metersPerPoint: metersPerPoint,
+                atEnd: .last
+            ) {
+                result.remove(at: last)
+                points = result.map { MKMapPoint($0) }
+            }
+            guard result.count >= 4 else { return result }
+            if isTerminalStopConnector(
+                in: points,
+                stopPoints: stopPoints,
+                metersPerPoint: metersPerPoint,
+                atEnd: .first
+            ) {
+                result.remove(at: result.indices.lowerBound)
+            }
+        }
         return result
+    }
+
+    private enum ShapeEnd {
+        case first
+        case last
+    }
+
+    /// True when the polyline's terminal vertex is a stop coordinate reached
+    /// steeply off the street line the shape was traveling — the one-segment
+    /// form of a stop connector. A genuine terminal turn or a stop straight
+    /// down the street is kept.
+    private static func isTerminalStopConnector(
+        in points: [MKMapPoint],
+        stopPoints: [MKMapPoint],
+        metersPerPoint: Double,
+        atEnd end: ShapeEnd
+    ) -> Bool {
+        let maximumStopDistance: CLLocationDistance = 12
+        let maximumDepartureDot = 0.34  // at least 70 degrees off the street
+
+        guard points.count >= 3 else { return false }
+        let vertex: MKMapPoint
+        let approach: MKMapPoint
+        let streetHeading: (x: Double, y: Double)?
+        switch end {
+        case .last:
+            vertex = points[points.count - 1]
+            approach = points[points.count - 2]
+            streetHeading = travelHeading(
+                in: points,
+                at: points.count - 2,
+                backward: true,
+                metersPerPoint: metersPerPoint
+            )
+        case .first:
+            vertex = points[0]
+            approach = points[1]
+            streetHeading = travelHeading(
+                in: points,
+                at: 1,
+                backward: false,
+                metersPerPoint: metersPerPoint
+            )
+        }
+        guard let streetHeading,
+              let departureHeading = unitHeading(from: approach, to: vertex)
+        else { return false }
+        guard stopPoints.contains(where: { stop in
+            stop.distance(to: vertex) * metersPerPoint <= maximumStopDistance
+        }) else { return false }
+        let departureDot = abs(
+            departureHeading.x * streetHeading.x
+                + departureHeading.y * streetHeading.y
+        )
+        return departureDot <= maximumDepartureDot
     }
 
     /// Finds the first interior excursion that enters a stop connector-side
     /// and returns to the same street. All gates are true meters. The
-    /// excursion is bounded by how far it travels (70 m), how little street
-    /// it skips (a 45 m chord), and how deep it goes (3–25 m — bay dives,
-    /// bulbs, and loops are larger); its apex must sit within 12 m of a trip
-    /// stop; and the street must continue straight through: the return
-    /// vertex stays within 4 m of the route's incoming line and travel keeps
-    /// its heading (dot ≥ 0.9), which is what makes every deletion
-    /// street-aligned by construction.
+    /// excursion is bounded by how far it travels (160 m — a sparse shape's
+    /// re-entry vertex can be a hundred meters ahead), how little street it
+    /// skips (a 120 m chord), and how deep it goes (3–25 m); its apex must
+    /// sit within 12 m of a trip stop. The street must continue straight
+    /// through: the return vertex stays within 8 m of the incoming line, the
+    /// anchor within 8 m of the outgoing line, and travel keeps its heading
+    /// (dot ≥ 0.9) — feed sampling noise between those vertices is tolerated,
+    /// a jogged or curving street is not. Finally the excursion must reach
+    /// its stop steeply (at least one leg ≥ 40° off the street), which is
+    /// what separates a connector from a gradual crest that happens to peak
+    /// at a stop. Every deletion is street-aligned by construction; redundant
+    /// collinear street vertices inside a deleted span go with it, leaving
+    /// the drawn line unchanged.
     private static func firstStopConnectorNotchRange(
         in points: [MKMapPoint],
         stopPoints: [MKMapPoint],
         metersPerPoint: Double
     ) -> Range<Int>? {
-        let maximumNotchPathDistance: CLLocationDistance = 70
-        let maximumNotchChordDistance: CLLocationDistance = 45
+        let maximumNotchPathDistance: CLLocationDistance = 160
+        let maximumNotchChordDistance: CLLocationDistance = 120
         let minimumNotchDepth: CLLocationDistance = 3
         let maximumNotchDepth: CLLocationDistance = 25
         let maximumStopDistance: CLLocationDistance = 12
-        let maximumStreetLineOffset: CLLocationDistance = 4
+        let maximumStreetLineOffset: CLLocationDistance = 8
         let minimumStraightThroughDot = 0.9
+        let maximumLegAlongStreetDot = 0.766  // cos(40°)
 
         for anchorIndex in 1..<(points.count - 1) {
             guard let incomingHeading = travelHeading(
@@ -244,28 +327,53 @@ enum TripPathGeometry {
                         <= maximumStopDistance
                 }) else { continue }
 
-                // The street itself must continue straight through the span:
-                // the return vertex sits on the line the route was already
-                // traveling, so the chord that replaces the deleted span is
-                // the street. Real turns, jogs, and curves resume on a
-                // different line and are kept.
-                let returnDeltaX = points[returnIndex].x - points[anchorIndex].x
-                let returnDeltaY = points[returnIndex].y - points[anchorIndex].y
-                let streetLineOffset = abs(
-                    returnDeltaX * incomingHeading.y
-                        - returnDeltaY * incomingHeading.x
-                ) * metersPerPoint
-                guard streetLineOffset <= maximumStreetLineOffset else { continue }
-
                 guard let outgoingHeading = travelHeading(
                     in: points,
                     at: returnIndex,
                     backward: false,
                     metersPerPoint: metersPerPoint
+                ) else { continue }
+
+                // The street itself continues straight through the span,
+                // tested against both legs: the return sits on the incoming
+                // line and the anchor sits on the outgoing line. The stop
+                // itself cannot qualify as the return point.
+                let returnDeltaX = points[returnIndex].x - points[anchorIndex].x
+                let returnDeltaY = points[returnIndex].y - points[anchorIndex].y
+                guard abs(
+                    returnDeltaX * incomingHeading.y
+                        - returnDeltaY * incomingHeading.x
+                ) * metersPerPoint <= maximumStreetLineOffset else { continue }
+                guard abs(
+                    returnDeltaX * outgoingHeading.y
+                        - returnDeltaY * outgoingHeading.x
+                ) * metersPerPoint <= maximumStreetLineOffset else { continue }
+                guard incomingHeading.x * outgoingHeading.x
+                    + incomingHeading.y * outgoingHeading.y
+                    >= minimumStraightThroughDot
+                else { continue }
+
+                // A connector reaches its stop steeply off the street; a
+                // curve's legs diverge from the chord gradually.
+                guard let inboundLeg = unitHeading(
+                    from: points[anchorIndex],
+                    to: points[apexIndex]
                 ),
-                    incomingHeading.x * outgoingHeading.x
-                        + incomingHeading.y * outgoingHeading.y
-                        >= minimumStraightThroughDot
+                    let outboundLeg = unitHeading(
+                        from: points[apexIndex],
+                        to: points[returnIndex]
+                    )
+                else { continue }
+                let inboundAlongStreet = abs(
+                    inboundLeg.x * incomingHeading.x
+                        + inboundLeg.y * incomingHeading.y
+                )
+                let outboundAlongStreet = abs(
+                    outboundLeg.x * incomingHeading.x
+                        + outboundLeg.y * incomingHeading.y
+                )
+                guard inboundAlongStreet <= maximumLegAlongStreetDot
+                    || outboundAlongStreet <= maximumLegAlongStreetDot
                 else { continue }
 
                 return (anchorIndex + 1)..<returnIndex

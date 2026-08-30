@@ -219,7 +219,10 @@ final class TripPathGeometryTests: XCTestCase {
             from: comb,
             nearStops: [stop]
         )
-        XCTAssertEqual(cleaned.count, 5)
+        // The connector's street-side anchor stays and the stop vertex goes;
+        // redundant collinear street vertices inside the span go with it —
+        // the drawn line is the street either way.
+        XCTAssertEqual(cleaned.count, 4)
         XCTAssertFalse(cleaned.contains { $0.latitude == stop.latitude })
     }
 
@@ -241,7 +244,15 @@ final class TripPathGeometryTests: XCTestCase {
             from: comb,
             nearStops: stops
         )
-        XCTAssertEqual(cleaned.count, 12)
+        // Connectors whose spans reach past the next street vertex absorb
+        // the collinear ones (both span ends are gated onto the street
+        // lines), so the count lands below the strict minimum — but every
+        // stop coordinate is gone and every survivor is on the street.
+        XCTAssertEqual(cleaned.count, 8)
+        XCTAssertTrue(
+            cleaned.allSatisfy { $0.latitude == comb[0].latitude },
+            "a surviving vertex is off the street"
+        )
         for stop in stops {
             XCTAssertFalse(
                 cleaned.contains { $0.latitude == stop.latitude },
@@ -307,8 +318,96 @@ final class TripPathGeometryTests: XCTestCase {
         )
         XCTAssertEqual(
             TripPathGeometry.cleanedShape(from: comb, nearStops: [stop]).count,
-            5
+            4
         )
+    }
+
+    func testRemovingStopConnectorNotchesDropsSparseShapeConnectors() {
+        // A feed that samples sparsely draws the connector as: street,
+        // stop, next street vertex a hundred meters on. The span gates must
+        // tolerate the long re-entry, not just the dense downtown form.
+        let stop = TestFixtures.coordinate(north: 9, east: 200)
+        let sparse = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 100),
+            TestFixtures.coordinate(north: 0, east: 200),
+            stop,
+            TestFixtures.coordinate(north: 0, east: 300),
+            TestFixtures.coordinate(north: 0, east: 420),
+        ]
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: sparse,
+            nearStops: [stop]
+        )
+        XCTAssertEqual(cleaned.count, 5)
+        XCTAssertFalse(cleaned.contains { $0.latitude == stop.latitude })
+    }
+
+    func testRemovingStopConnectorNotchesDropsTerminalStopConnectors() {
+        // At the end of a journey the connector has no return span at all:
+        // the shape simply ends on the stop coordinate, reached sideways
+        // off the street line. Both ends are trimmed the same way.
+        let endStop = TestFixtures.coordinate(north: 10, east: 300)
+        let startStop = TestFixtures.coordinate(north: 10, east: 0)
+        let outbound = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 100),
+            TestFixtures.coordinate(north: 0, east: 200),
+            TestFixtures.coordinate(north: 0, east: 300),
+            endStop,
+        ]
+        let trimmedEnd = TripPathGeometry.removingStopConnectorNotches(
+            from: outbound,
+            nearStops: [endStop]
+        )
+        XCTAssertEqual(trimmedEnd.count, 4)
+        XCTAssertFalse(trimmedEnd.contains { $0.latitude == endStop.latitude })
+
+        let inbound = [startStop] + Array(outbound.dropLast())
+        let trimmedStart = TripPathGeometry.removingStopConnectorNotches(
+            from: inbound,
+            nearStops: [startStop]
+        )
+        XCTAssertEqual(trimmedStart.count, 4)
+        XCTAssertFalse(trimmedStart.contains { $0.latitude == startStop.latitude })
+    }
+
+    func testRemovingStopConnectorNotchesKeepsAngledTerminalApproaches() {
+        // A route that genuinely leaves the street to end at its terminal
+        // stop at 45 degrees is service, not an artifact — only sideways
+        // (≥70° off the street) terminal coordinates are trimmed.
+        let terminalStop = TestFixtures.coordinate(north: 60, east: 240)
+        let approach = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 120),
+            TestFixtures.coordinate(north: 0, east: 180),
+            terminalStop,
+        ]
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: approach,
+            nearStops: [terminalStop]
+        )
+        XCTAssertEqual(cleaned.count, approach.count)
+    }
+
+    func testRemovingStopConnectorNotchesKeepsCrestsWithStopsAtTheApex() {
+        // A gentle vertical curve (R = 250 m) whose highest point sits beside
+        // a stop: both legs diverge from the street gradually, so the
+        // steep-leg gate must keep the whole curve.
+        let crest = (0..<15).map { step in
+            let angle = Double(step - 7) * 2.0
+            let radians = angle * .pi / 180
+            return TestFixtures.coordinate(
+                north: 60 - 250 * (1 - cos(radians)),
+                east: 250 * sin(radians)
+            )
+        }
+        let stopAtApex = TestFixtures.coordinate(north: 68, east: 0)
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: crest,
+            nearStops: [stopAtApex]
+        )
+        XCTAssertEqual(cleaned.count, crest.count)
     }
 
     func testSplitPolylineKeepsLegitimateIntercityLegs() {
