@@ -562,8 +562,32 @@ final class TransitViewModel: NSObject, ObservableObject {
             throw URLError(.resourceUnavailable)
         }
 
+        // Stop-connector cleanup is inert without stop coordinates, and the
+        // shapes baking a connector to a platform use that platform's exact
+        // record — so hand each route the coordinates of the stops it
+        // serves, not the cluster winners.
+        let servedCoordinates = stops.reduce(
+            into: [Int: [CLLocationCoordinate2D]]()
+        ) { partial, stop in
+            for (routeID, sourceIDs) in stop.sourceStopIDsByRoute {
+                var coordinates = [stop.coordinate]
+                for sourceID in sourceIDs {
+                    if let coordinate = stop.sourceStopCoordinates[sourceID] {
+                        coordinates.append(coordinate)
+                    }
+                }
+                partial[routeID, default: []].append(contentsOf: coordinates)
+            }
+        }
+
         let sortedRoutes = matchingRoutes
-            .map { makeDisplayRoute(from: $0, near: origin) }
+            .map {
+                makeDisplayRoute(
+                    from: $0,
+                    near: origin,
+                    servedStopCoordinates: servedCoordinates[$0.transitlandID] ?? []
+                )
+            }
             .sorted {
                 $0.fullDisplayName.localizedStandardCompare($1.fullDisplayName)
                     == .orderedAscending
@@ -1354,12 +1378,19 @@ final class TransitViewModel: NSObject, ObservableObject {
 
     private func makeDisplayRoute(
         from route: TransitRoute,
-        near origin: CLLocationCoordinate2D
+        near origin: CLLocationCoordinate2D,
+        servedStopCoordinates: [CLLocationCoordinate2D]
     ) -> TransitRoute {
         let maximumJump = TripPathGeometry.maximumGeometryJump(for: route.routeType)
         let visiblePolylines: [[CLLocationCoordinate2D]] = route.polylines.flatMap {
             coordinates in
-            let cleanedCoordinates = TripPathGeometry.cleanedShape(from: coordinates)
+            // The route's own stops drive the connector-notch stage; without
+            // them (an unknown route) the stage is inert, matching the
+            // trip-path behavior.
+            let cleanedCoordinates = TripPathGeometry.cleanedShape(
+                from: coordinates,
+                nearStops: servedStopCoordinates
+            )
             return TripPathGeometry.splitPolyline(
                 cleanedCoordinates,
                 atJumpsLongerThan: maximumJump
