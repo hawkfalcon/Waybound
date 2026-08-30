@@ -37,7 +37,7 @@ Notch stage (`notch2.py` ↔ `Waybound/Transit/TripPathGeometry.swift`):
 path ≤ 260 m, chord ≤ 240 m, depth 3–25 m, apex ≤ 12 m from a trip stop,
 anchor and return each ≤ 8 m off the other leg's line of travel,
 heading-through dot ≥ 0.9, at least one leg ≥ 40° off the street
-(cos 40° ≈ 0.766), ≤ 64 interior passes. Terminal trim: up to 3 vertices
+(cos 40° ≈ 0.766), ≤ 128 interior passes. Terminal trim: up to 3 vertices
 per end, each within 12 m of a stop and ≥ 70° off the street (dot ≤ 0.34),
 with the street line measured from outside the connector — the first
 vertex beyond 25 m of the terminal.

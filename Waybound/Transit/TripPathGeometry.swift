@@ -165,7 +165,7 @@ enum TripPathGeometry {
 
         var result = coordinates
         var passes = 0
-        while passes < 64 {
+        while passes < 128 {
             passes += 1
             let points = result.map { MKMapPoint($0) }
             guard let notchRange = firstStopConnectorNotchRange(
@@ -246,14 +246,18 @@ enum TripPathGeometry {
         // Walk inward past vertices within one notch depth of the terminal
         // vertex — the connector and its baked points live in that
         // neighborhood — and measure the street at the first vertex beyond
-        // it.
+        // it, always leaving at least one vertex ahead of the baseline: a
+        // short terminal stretch can sit entirely within that neighborhood.
         var baselineIndex = approachIndex
         var skippedVertices = 0
         while baselineIndex >= 0, baselineIndex < points.count,
               points[baselineIndex].distance(to: vertex) * metersPerPoint
                 <= maximumConnectorNeighborhood,
               skippedVertices < maximumSkippedVertices {
-            baselineIndex += step
+            let nextIndex = baselineIndex + step
+            if end == .last, nextIndex < 1 { break }
+            if end == .first, nextIndex > points.count - 2 { break }
+            baselineIndex = nextIndex
             skippedVertices += 1
         }
         guard baselineIndex >= 0, baselineIndex < points.count,

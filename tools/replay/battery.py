@@ -235,6 +235,38 @@ check(
     f"worst street offset {max_street_offset(trace, touched):.2f} m",
 )
 
+# ------------------------------------------- REAL BAKED CONNECTORS (14 / 20)
+
+# Exact fragments dumped from SBMTD's own shapes.txt: the feed bakes an
+# out-and-back spike to the stop coordinate at most stops (return vertex is
+# often an exact duplicate of the departure), ~5-13 m deep - below the spur
+# stage's 12 m floor, and invisible to the notch stage without the stop.
+with open(os.path.join(HERE, "data", "baked_fragments_1420.json")) as fh:
+    for fragment in json.load(fh)["fragments"]:
+        pts = [tuple(p) for p in fragment["pts"]]
+        stop = tuple(fragment["stop"])
+        out = removing_stop_connector_notches(pts, [stop])
+        stop_gone = not any(
+            abs(p[0] - stop[0]) < 1e-12 and abs(p[1] - stop[1]) < 1e-12
+            for p in out
+        )
+        street = [to_map_point(*p) for p in pts if p != stop]
+        offset = max(
+            distance_to_polyline(to_map_point(*c), street) for c in out
+        ) * mpm(pts[0][0])
+        if fragment["expect"] == "delete":
+            ok = stop_gone and offset <= 1.0 and len(out) == len(pts) - 2
+        elif fragment["expect"] == "trim":
+            ok = stop_gone and offset <= 1.0 and len(out) == len(pts) - 1
+        else:
+            ok = len(out) == len(pts)
+        check(
+            f"SBMTD {fragment['name']}",
+            ok,
+            f"{len(pts)} -> {len(out)} pts, stop gone: {stop_gone}, "
+            f"street offset {offset:.2f} m",
+        )
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: " + ", ".join(failures))

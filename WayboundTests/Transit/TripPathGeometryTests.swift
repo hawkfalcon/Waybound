@@ -475,6 +475,27 @@ final class TripPathGeometryTests: XCTestCase {
         XCTAssertEqual(cleaned.count, bay.count)
     }
 
+    func testRemovingStopConnectorNotchesTrimsShortSidewaysTerminalStarts() {
+        // Real SBMTD route 14 geometry (shp-14-01 start, North Jameson &
+        // Sheffield): every early vertex sits within one notch depth of the
+        // stop, so the street baseline must stop walking while it still has
+        // a vertex to measure against — an unbounded walk runs off the end
+        // and the sideways start survives.
+        let stop = CLLocationCoordinate2D(latitude: 34.422348, longitude: -119.614727)
+        let start = [
+            stop,
+            CLLocationCoordinate2D(latitude: 34.422280, longitude: -119.614700),
+            CLLocationCoordinate2D(latitude: 34.422280, longitude: -119.614710),
+            CLLocationCoordinate2D(latitude: 34.422210, longitude: -119.614910),
+        ]
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: start,
+            nearStops: [stop]
+        )
+        XCTAssertEqual(cleaned.count, 3)
+        XCTAssertFalse(cleaned.contains { $0.latitude == stop.latitude })
+    }
+
     func testSplitPolylineKeepsLegitimateIntercityLegs() {
         // A 20 km rural leg is legitimate intercity service at the documented
         // 50 km bus threshold; the map-point comparison used to cut it in two.

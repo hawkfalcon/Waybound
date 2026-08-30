@@ -89,11 +89,19 @@ def trim_terminal(pts, m, stop_pts, end, max_stop_dist=12.0, max_depart_dot=0.34
         start, step = 1, 1
     if min(dist(v, s) * m for s in stop_pts) > max_stop_dist:
         return False
-    # First vertex beyond the connector's neighborhood.
+    # First vertex beyond the connector's neighborhood, but always leave at
+    # least one vertex ahead for the heading baseline — a short fragment (or
+    # a tightly-sampled terminal loop) can have every vertex within one notch
+    # depth of the stop.
     i = start
     skipped = 0
     while 0 <= i < n and dist(pts[i], v) * m <= skip_radius and skipped < max_skip_steps:
-        i += step
+        nxt = i + step
+        if end == 'last' and nxt < 1:
+            break
+        if end == 'first' and nxt > n - 2:
+            break
+        i = nxt
         skipped += 1
     if not (0 <= i < n):
         return False
@@ -107,7 +115,7 @@ def trim_terminal(pts, m, stop_pts, end, max_stop_dist=12.0, max_depart_dot=0.34
     # abs(): matches Swift — a reversal is not a sideways departure.
     return abs(hv[0]*h[0] + hv[1]*h[1]) <= max_depart_dot
 
-def removing_stop_connector_notches(coords, stops, max_passes=64):
+def removing_stop_connector_notches(coords, stops, max_passes=128):
     if len(coords) < 4 or not stops: return list(coords)
     m = mpm(coords[0][0])
     stop_pts = [to_map_point(*s) for s in stops]
