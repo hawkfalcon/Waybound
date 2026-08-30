@@ -53,6 +53,13 @@ symmetric passes.
 - `mpm(lat) = cos(lat) · 2π · 6378137 / 268435456` — map points *shrink*
   toward the poles; ≈ 8.1188 pts/m at 34.42° N. An earlier harness divided
   instead of multiplying and every threshold was 1.47× off.
+- That formula models the LEGACY 256-point MapKit world. The Xcode 26 SDKs
+  ship a meter-based `MKMapPoint` world where point distances are already
+  true meters while `MKMapPointsPerMeterAtLatitude` still answers the legacy
+  constant — the Swift helper now self-calibrates against `CLLocation`
+  instead of trusting it (this exact mismatch made every app threshold ~8×
+  too strict and is why the first full Xcode run failed while the Python
+  mirrors passed).
 - `travelHeading`-equivalents must be normalized to the direction of travel
   (a backward walk returns `unit(far → index)`), use a ≤ 3-vertex / ≤ 60 m
   baseline, and single-vertex headings are unreliable on duplicates.

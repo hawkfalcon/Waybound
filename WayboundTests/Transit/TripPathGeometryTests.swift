@@ -5,32 +5,33 @@ import XCTest
 
 final class TripPathGeometryTests: XCTestCase {
 
-    func testDiagnosticsMapKitScalePrints() {
-        // Temporary instrument, no assertions: prints what this binary
-        // actually computes for a known 500 m east-west segment at the
-        // fixture latitude. Reference values from the Python mirror:
-        // ppm 8.1176, mpm 0.12317, point distance 4058.8, meters 500.08.
+    func testMetersPerMapPointRoundTripsTrueMeters() {
+        // The conversion is calibrated against CLLocation's ellipsoid, so it
+        // holds on every MapKit world: the legacy 256-point projection
+        // (~0.123 m/point in Santa Barbara) and the meter-based world of the
+        // Xcode 26 SDKs, where MKMapPointsPerMeterAtLatitude still answers
+        // the legacy constant while MKMapPoint distances are already true
+        // meters — trusting it there made every meter threshold in the app
+        // about eight times stricter than written.
         let a = TestFixtures.coordinate(north: 0, east: 0)
         let b = TestFixtures.coordinate(north: 0, east: 500)
-        let pa = MKMapPoint(a)
-        let pb = MKMapPoint(b)
-        let mpm = TripPathGeometry.metersPerMapPoint(atLatitude: a.latitude)
-        let pointDistance = pa.distance(to: pb)
-        print("DIAG ppm=\(1.0 / mpm) mpm=\(mpm) pointDistance=\(pointDistance) meters=\(pointDistance * mpm)")
-        let spikeIn = pa.distance(to: MKMapPoint(TestFixtures.coordinate(north: 0, east: 500))) * mpm
-        let spikeBypass = pa.distance(to: MKMapPoint(TestFixtures.coordinate(north: 0, east: 10))) * mpm
-        print("DIAG spikeIncoming=\(spikeIn) spikeBypass=\(spikeBypass)")
-    }
+        let truth = CLLocation(a).distance(from: CLLocation(b))
+        let measured = MKMapPoint(a).distance(to: MKMapPoint(b))
+            * TripPathGeometry.metersPerMapPoint(atLatitude: a.latitude)
+        XCTAssertEqual(measured, truth, accuracy: truth * 0.005)
 
-    func testMetersPerMapPointMatchesTheMercatorProjection() {
-        // One map point spans ~0.149 m at the equator and ~0.123 m in Santa
-        // Barbara. Skipping this conversion made every meter threshold in the
-        // app roughly eight times stricter than written.
-        let equator = TripPathGeometry.metersPerMapPoint(atLatitude: 0)
-        let santaBarbara = TripPathGeometry.metersPerMapPoint(atLatitude: 34.4208)
-        XCTAssertEqual(equator, 0.149, accuracy: 0.01)
-        XCTAssertEqual(santaBarbara, 0.123, accuracy: 0.01)
-        XCTAssertLessThan(santaBarbara, equator)
+        // A second latitude proves the calibration is local, not a single
+        // global constant.
+        let c = CLLocationCoordinate2D(latitude: -33.8688, longitude: 151.2093)
+        let d = CLLocationCoordinate2D(latitude: -33.8688, longitude: 151.2143)
+        let southernTruth = CLLocation(c).distance(from: CLLocation(d))
+        let southernMeasured = MKMapPoint(c).distance(to: MKMapPoint(d))
+            * TripPathGeometry.metersPerMapPoint(atLatitude: c.latitude)
+        XCTAssertEqual(
+            southernMeasured,
+            southernTruth,
+            accuracy: southernTruth * 0.005
+        )
     }
 
     func testMaximumGeometryJumpFavorsIntercityAndFerry() {

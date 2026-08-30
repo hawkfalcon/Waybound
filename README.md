@@ -44,9 +44,15 @@ Waybound/
 - `Views/ContentView` is the cream/ink sheet chrome on top of the map.
 
 Distances everywhere are meters. `MKMapPoint.distance` is *projected map
-points* (~8.1 per meter in Santa Barbara); every threshold that crosses that
-boundary goes through `TripPathGeometry.metersPerMapPoint(atLatitude:)`, and
-the unit tests pin the conversion.
+points*, so every threshold that crosses that boundary goes through
+`TripPathGeometry.metersPerMapPoint(atLatitude:)` — which is **calibrated at
+runtime against CLLocation's ellipsoid**, not read from
+`MKMapPointsPerMeterAtLatitude`: on the meter-based MapKit world of the
+Xcode 26 SDKs that legacy constant no longer matches `MKMapPoint`'s scale
+(it answers ~8.1 points per meter while point distances are already true
+meters), and trusting it made every meter threshold ~8× stricter than
+written. The unit tests round-trip the calibration against true meters at
+two latitudes.
 
 Shared-street rendering keeps two distance gates apart. Corridor *membership*
 (who gets a lane in the ribbon) accepts partners up to 20 m of centerline

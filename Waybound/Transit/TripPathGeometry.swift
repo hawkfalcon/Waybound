@@ -25,8 +25,24 @@ enum TripPathGeometry {
     /// threshold eightfold — which is how corridor detection, lane tapers, and
     /// spike cleanup all briefly became far stricter than designed. Every
     /// physical distance in the app is converted through this helper.
+    /// Meters per `MKMapPoint`, calibrated at runtime against `CLLocation`'s
+    /// ellipsoidal distance rather than assumed from
+    /// `MKMapPointsPerMeterAtLatitude`: on the meter-based MapKit world of
+    /// the Xcode 26 SDKs that legacy constant no longer describes
+    /// `MKMapPoint`'s scale — it still answers ~8.1 points per meter while
+    /// point distances are already true meters — which silently made every
+    /// meter threshold in the app about eight times stricter than written.
+    /// Calibrating against the projection actually in use keeps both worlds
+    /// correct.
     static func metersPerMapPoint(atLatitude latitude: CLLocationDegrees) -> Double {
-        1.0 / MKMapPointsPerMeterAtLatitude(latitude)
+        let origin = CLLocationCoordinate2D(latitude: latitude, longitude: 0)
+        let sample = CLLocationCoordinate2D(latitude: latitude, longitude: 0.01)
+        let pointDistance = MKMapPoint(origin).distance(to: MKMapPoint(sample))
+        let meterDistance = CLLocation(origin).distance(from: CLLocation(sample))
+        guard pointDistance > 0, meterDistance > 0 else {
+            return 1.0 / MKMapPointsPerMeterAtLatitude(latitude)
+        }
+        return meterDistance / pointDistance
     }
 
     /// Very large jumps are almost always malformed coordinates. These high
