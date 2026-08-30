@@ -35,7 +35,7 @@ Waybound/
 - Pure decision rules in `Transit/` can be unit-tested without a network:
   - `TransitText` — identity folding for agencies, routes, and stop names
   - `StopClustering` — same-place merge of operator records
-  - `TripPathGeometry` — spike and out-and-back-spur cleanup, jump splits, radius clips, stop-to-shape alignment
+  - `TripPathGeometry` — spike, stop-connector-notch, and out-and-back-spur cleanup, jump splits, radius clips, stop-to-shape alignment
   - `FlagshipSelection` — which downstream stop the journey is actually *for*
   - `RouteIdentity` — stable public route key and fallback color
   - `JourneyScoring` — overview ranking and duplicate-journey detection

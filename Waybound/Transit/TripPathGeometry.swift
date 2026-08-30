@@ -43,13 +43,26 @@ enum TripPathGeometry {
     }
 
     /// The complete cleanup applied to every GTFS shape before it is aligned,
-    /// clipped, or drawn: unmistakable one-vertex spikes first (so spur
-    /// detection sees clean legs), then short out-and-back spurs.
+    /// clipped, or drawn: unmistakable one-vertex spikes first (so notch and
+    /// spur detection see clean legs), then stop-connector notches, then
+    /// short out-and-back spurs.
+    ///
+    /// Some operators publish trip shapes with a short perpendicular
+    /// connector spliced in at every stop: the line runs along the street,
+    /// steps sideways to the stop coordinate, and resumes on the street a few
+    /// meters ahead (SBMTD route 3 carries one at nearly every stop). Rendered
+    /// naively that is a comb of 90-degree jags. `nearStops` supplies the
+    /// trip's stop coordinates, which is what distinguishes those connectors
+    /// from genuine turns; without stops the notch stage is inert.
     static func cleanedShape(
-        from coordinates: [CLLocationCoordinate2D]
+        from coordinates: [CLLocationCoordinate2D],
+        nearStops stops: [CLLocationCoordinate2D] = []
     ) -> [CLLocationCoordinate2D] {
         removingOutAndBackSpurs(
-            from: removingSinglePointSpikes(from: coordinates)
+            from: removingStopConnectorNotches(
+                from: removingSinglePointSpikes(from: coordinates),
+                nearStops: stops
+            )
         )
     }
 
@@ -126,6 +139,167 @@ enum TripPathGeometry {
             result.removeSubrange(spurRange)
         }
         return result
+    }
+
+    /// Removes short lateral excursions that touch a known stop: the shape
+    /// leaves the street, visits a stop coordinate, and resumes on the street
+    /// within a couple hundred meters. The spur stage alone catches only the
+    /// deepest of these — a connector to a stop ten meters off the roadway is
+    /// both shallower and shorter than a recognizable spur, and the V-shaped
+    /// variant (resuming down the street instead of retracing) never returns
+    /// to its anchor at all.
+    ///
+    /// What makes a connector recognizable is the stop itself: the excursion
+    /// must bend away from the spine nearly perpendicular, its farthest
+    /// vertex must sit within meters of a trip stop, and travel must not
+    /// reverse (a hairpin that happens to serve a stop is real service).
+    /// Genuine corners fail the perpendicularity test — their farthest vertex
+    /// lies mostly along the chord, not beside it — so a route's real turns
+    /// survive even when a stop sits on the corner.
+    static func removingStopConnectorNotches(
+        from coordinates: [CLLocationCoordinate2D],
+        nearStops stops: [CLLocationCoordinate2D]
+    ) -> [CLLocationCoordinate2D] {
+        guard coordinates.count >= 4, !stops.isEmpty else { return coordinates }
+        let metersPerPoint = metersPerMapPoint(atLatitude: coordinates[0].latitude)
+        let stopPoints = stops.map { MKMapPoint($0) }
+
+        var result = coordinates
+        var passes = 0
+        while passes < 64 {
+            passes += 1
+            let points = result.map { MKMapPoint($0) }
+            guard let notchRange = firstStopConnectorNotchRange(
+                in: points,
+                stopPoints: stopPoints,
+                metersPerPoint: metersPerPoint
+            ) else { break }
+            result.removeSubrange(notchRange)
+        }
+        return result
+    }
+
+    /// Finds the first interior excursion that enters a stop connector-side
+    /// and returns to the street. All gates are true meters. The excursion is
+    /// bounded by how far it travels (220 m) and how little street it skips
+    /// (a 200 m chord); must leave the spine by at least 3 m; its apex must
+    /// sit within 12 m of a trip stop; it must depart the spine within about
+    /// 56 degrees of perpendicular; and the route must keep traveling the
+    /// same way afterward (no turnarounds).
+    private static func firstStopConnectorNotchRange(
+        in points: [MKMapPoint],
+        stopPoints: [MKMapPoint],
+        metersPerPoint: Double
+    ) -> Range<Int>? {
+        let maximumNotchPathDistance: CLLocationDistance = 220
+        let maximumNotchChordDistance: CLLocationDistance = 200
+        let minimumNotchDepth: CLLocationDistance = 3
+        let maximumStopDistance: CLLocationDistance = 12
+        let maximumAlongChordDot = 0.55
+        let minimumContinuationDot = -0.5
+
+        for anchorIndex in 1..<(points.count - 1) {
+            var pathDistance: CLLocationDistance = 0
+            for returnIndex in (anchorIndex + 1)..<(points.count - 1) {
+                pathDistance += points[returnIndex - 1].distance(
+                    to: points[returnIndex]
+                ) * metersPerPoint
+                if pathDistance > maximumNotchPathDistance { break }
+
+                let chordDistance = points[anchorIndex].distance(
+                    to: points[returnIndex]
+                ) * metersPerPoint
+                guard chordDistance >= 1, chordDistance <= maximumNotchChordDistance
+                else { continue }
+
+                var notchDepth: CLLocationDistance = 0
+                var apexIndex = anchorIndex + 1
+                for index in (anchorIndex + 1)..<returnIndex {
+                    let depth = perpendicularDistance(
+                        of: points[index],
+                        from: points[anchorIndex],
+                        to: points[returnIndex]
+                    ) * metersPerPoint
+                    if depth > notchDepth {
+                        notchDepth = depth
+                        apexIndex = index
+                    }
+                }
+                guard notchDepth >= minimumNotchDepth else { continue }
+                guard stopPoints.contains(where: { stop in
+                    stop.distance(to: points[apexIndex]) * metersPerPoint
+                        <= maximumStopDistance
+                }) else { continue }
+
+                // A stop connector departs the spine sideways; a genuine
+                // corner's farthest vertex lies mostly along the chord.
+                guard let chordHeading = unitHeading(
+                    from: points[anchorIndex],
+                    to: points[returnIndex]
+                ),
+                    let apexHeading = unitHeading(
+                        from: points[anchorIndex],
+                        to: points[apexIndex]
+                    )
+                else { continue }
+                let alongChordDot = abs(
+                    chordHeading.x * apexHeading.x + chordHeading.y * apexHeading.y
+                )
+                guard alongChordDot <= maximumAlongChordDot else { continue }
+
+                // Hairpins and turnarounds that serve a stop are real service:
+                // reject only a reversal of travel direction.
+                guard let incomingHeading = travelHeading(
+                    in: points,
+                    at: anchorIndex,
+                    backward: true,
+                    metersPerPoint: metersPerPoint
+                ),
+                    let outgoingHeading = travelHeading(
+                        in: points,
+                        at: returnIndex,
+                        backward: false,
+                        metersPerPoint: metersPerPoint
+                    ),
+                    incomingHeading.x * outgoingHeading.x
+                        + incomingHeading.y * outgoingHeading.y
+                        >= minimumContinuationDot
+                else { continue }
+
+                return (anchorIndex + 1)..<returnIndex
+            }
+        }
+        return nil
+    }
+
+    /// Direction of travel at a vertex, measured over up to three vertices
+    /// and 60 meters so a single duplicated survey point or lane-shift jog
+    /// cannot flip it. `backward` looks upstream, but the returned heading
+    /// always points in the direction of travel.
+    private static func travelHeading(
+        in points: [MKMapPoint],
+        at index: Int,
+        backward: Bool,
+        metersPerPoint: Double
+    ) -> (x: Double, y: Double)? {
+        let step = backward ? -1 : 1
+        var farIndex = index
+        var traveled: CLLocationDistance = 0
+        var stepsTaken = 0
+        while stepsTaken < 3 {
+            let nextIndex = farIndex + step
+            guard nextIndex >= 0, nextIndex < points.count else { break }
+            let segment = points[farIndex].distance(to: points[nextIndex])
+                * metersPerPoint
+            if traveled > 0, traveled + segment > 60 { break }
+            traveled += segment
+            farIndex = nextIndex
+            stepsTaken += 1
+        }
+        guard farIndex != index else { return nil }
+        return backward
+            ? unitHeading(from: points[farIndex], to: points[index])
+            : unitHeading(from: points[index], to: points[farIndex])
     }
 
     /// Finds the first interior sub-path that leaves a vertex and returns to
@@ -409,7 +583,12 @@ enum TripPathGeometry {
         )?
 
         for rawLine in coordinateLines {
-            let cleanedLine = cleanedShape(from: rawLine)
+            // The trip's own stops identify the perpendicular stop-connector
+            // notches baked into several feeds' shapes.
+            let cleanedLine = cleanedShape(
+                from: rawLine,
+                nearStops: orderedStops
+            )
             guard cleanedLine.count >= 2 else { continue }
 
             // GTFS shapes should already follow trip order, but evaluating

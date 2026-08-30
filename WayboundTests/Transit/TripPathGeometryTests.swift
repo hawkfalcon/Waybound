@@ -139,6 +139,140 @@ final class TripPathGeometryTests: XCTestCase {
         XCTAssertEqual(cleaned.count, 5)
     }
 
+    func testRemovingStopConnectorNotchesDropsPerpendicularConnectors() {
+        // SBMTD-style comb: the shape steps 10 m sideways to the stop
+        // coordinate and resumes down the street (a V, never retracing).
+        let street = [0, 60, 90, 150, 240, 320].map {
+            TestFixtures.coordinate(north: 0, east: $0)
+        }
+        let stop = TestFixtures.coordinate(north: 10, east: 90)
+        let comb = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 60),
+            TestFixtures.coordinate(north: 0, east: 90),
+            stop,
+            TestFixtures.coordinate(north: 0, east: 150),
+            TestFixtures.coordinate(north: 0, east: 240),
+            TestFixtures.coordinate(north: 0, east: 320),
+        ]
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: comb,
+            nearStops: [stop]
+        )
+        XCTAssertEqual(cleaned.count, street.count)
+        XCTAssertEqual(cleaned.map(\.latitude), street.map(\.latitude))
+        XCTAssertEqual(cleaned.map(\.longitude), street.map(\.longitude))
+    }
+
+    func testRemovingStopConnectorNotchesDropsShallowNearExactReturns() {
+        // The other published form: out to an 8 m-off stop and back to a
+        // point 4 m past the anchor. Too shallow and too short for the spur
+        // gates, but unmistakable with the stop known.
+        let stop = TestFixtures.coordinate(north: 8, east: 120)
+        let comb = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 60),
+            TestFixtures.coordinate(north: 0, east: 120),
+            stop,
+            TestFixtures.coordinate(north: 0, east: 124),
+            TestFixtures.coordinate(north: 0, east: 200),
+        ]
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: comb,
+            nearStops: [stop]
+        )
+        XCTAssertEqual(cleaned.count, 5)
+        XCTAssertFalse(cleaned.contains { $0.latitude == stop.latitude })
+    }
+
+    func testRemovingStopConnectorNotchesRemovesEveryStopInAComb() {
+        // One connector per stop down the whole line; the pass must iterate.
+        // Each connector leaves from the street point opposite its stop and
+        // resumes 40 m downstream, like the published route 3 shapes.
+        var comb = [TestFixtures.coordinate(north: 0, east: 0)]
+        var stops: [CLLocationCoordinate2D] = []
+        for east in stride(from: 80, through: 400, by: 80) {
+            let stop = TestFixtures.coordinate(north: 12, east: Double(east))
+            stops.append(stop)
+            comb.append(TestFixtures.coordinate(north: 0, east: Double(east)))
+            comb.append(stop)
+            comb.append(TestFixtures.coordinate(north: 0, east: Double(east + 40)))
+        }
+        comb.append(TestFixtures.coordinate(north: 0, east: 460))
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: comb,
+            nearStops: stops
+        )
+        XCTAssertEqual(cleaned.count, 12)
+        for stop in stops {
+            XCTAssertFalse(
+                cleaned.contains { $0.latitude == stop.latitude },
+                "connector at east \(stop.longitude) survived"
+            )
+        }
+    }
+
+    func testRemovingStopConnectorNotchesKeepsCornersEvenWithStops() {
+        // A genuine 90-degree corner whose apex sits right beside a stop: the
+        // corner's farthest vertex lies along the chord, not beside it, so
+        // the perpendicularity gate keeps the turn.
+        let corner = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 80),
+            TestFixtures.coordinate(north: 0, east: 160),
+            TestFixtures.coordinate(north: 80, east: 160),
+            TestFixtures.coordinate(north: 160, east: 160),
+            TestFixtures.coordinate(north: 160, east: 240),
+        ]
+        let stopAtCorner = TestFixtures.coordinate(north: 8, east: 156)
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: corner,
+            nearStops: [stopAtCorner]
+        )
+        XCTAssertEqual(cleaned.count, corner.count)
+    }
+
+    func testRemovingStopConnectorNotchesKeepsTurnaroundsAtStops() {
+        // A hairpin that serves a stop is real service: travel reverses, so
+        // the continuation gate must keep it.
+        let stop = TestFixtures.coordinate(north: 18, east: 104)
+        let turnaround = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 60),
+            TestFixtures.coordinate(north: 0, east: 100),
+            TestFixtures.coordinate(north: 18, east: 104),
+            TestFixtures.coordinate(north: 0, east: 108),
+            TestFixtures.coordinate(north: 0, east: 30),
+        ]
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: turnaround,
+            nearStops: [stop]
+        )
+        XCTAssertEqual(cleaned.count, turnaround.count)
+    }
+
+    func testCleanedShapeUsesStopsToDropNotches() {
+        // Without stops the notch stage is inert; with them the connector
+        // disappears even though it is far too shallow for the spur gates.
+        let stop = TestFixtures.coordinate(north: 8, east: 120)
+        let comb = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 60),
+            TestFixtures.coordinate(north: 0, east: 120),
+            stop,
+            TestFixtures.coordinate(north: 0, east: 124),
+            TestFixtures.coordinate(north: 0, east: 200),
+        ]
+        XCTAssertEqual(
+            TripPathGeometry.cleanedShape(from: comb).count,
+            6
+        )
+        XCTAssertEqual(
+            TripPathGeometry.cleanedShape(from: comb, nearStops: [stop]).count,
+            5
+        )
+    }
+
     func testSplitPolylineKeepsLegitimateIntercityLegs() {
         // A 20 km rural leg is legitimate intercity service at the documented
         // 50 km bus threshold; the map-point comparison used to cut it in two.
