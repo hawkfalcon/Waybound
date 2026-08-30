@@ -15,7 +15,8 @@ final class TripPathGeometryTests: XCTestCase {
         // about eight times stricter than written.
         let a = TestFixtures.coordinate(north: 0, east: 0)
         let b = TestFixtures.coordinate(north: 0, east: 500)
-        let truth = CLLocation(a).distance(from: CLLocation(b))
+        let truth = CLLocation(latitude: a.latitude, longitude: a.longitude)
+            .distance(from: CLLocation(latitude: b.latitude, longitude: b.longitude))
         let measured = MKMapPoint(a).distance(to: MKMapPoint(b))
             * TripPathGeometry.metersPerMapPoint(atLatitude: a.latitude)
         XCTAssertEqual(measured, truth, accuracy: truth * 0.005)
@@ -24,7 +25,8 @@ final class TripPathGeometryTests: XCTestCase {
         // global constant.
         let c = CLLocationCoordinate2D(latitude: -33.8688, longitude: 151.2093)
         let d = CLLocationCoordinate2D(latitude: -33.8688, longitude: 151.2143)
-        let southernTruth = CLLocation(c).distance(from: CLLocation(d))
+        let southernTruth = CLLocation(latitude: c.latitude, longitude: c.longitude)
+            .distance(from: CLLocation(latitude: d.latitude, longitude: d.longitude))
         let southernMeasured = MKMapPoint(c).distance(to: MKMapPoint(d))
             * TripPathGeometry.metersPerMapPoint(atLatitude: c.latitude)
         XCTAssertEqual(

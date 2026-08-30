@@ -38,7 +38,12 @@ enum TripPathGeometry {
         let origin = CLLocationCoordinate2D(latitude: latitude, longitude: 0)
         let sample = CLLocationCoordinate2D(latitude: latitude, longitude: 0.01)
         let pointDistance = MKMapPoint(origin).distance(to: MKMapPoint(sample))
-        let meterDistance = CLLocation(origin).distance(from: CLLocation(sample))
+        let meterDistance = CLLocation(
+            latitude: origin.latitude,
+            longitude: origin.longitude
+        ).distance(
+            from: CLLocation(latitude: sample.latitude, longitude: sample.longitude)
+        )
         guard pointDistance > 0, meterDistance > 0 else {
             return 1.0 / MKMapPointsPerMeterAtLatitude(latitude)
         }
