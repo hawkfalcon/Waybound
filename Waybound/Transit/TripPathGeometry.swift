@@ -143,19 +143,21 @@ enum TripPathGeometry {
 
     /// Removes short lateral excursions that touch a known stop: the shape
     /// leaves the street, visits a stop coordinate, and resumes on the street
-    /// within a couple hundred meters. The spur stage alone catches only the
+    /// within a few tens of meters. The spur stage alone catches only the
     /// deepest of these — a connector to a stop ten meters off the roadway is
     /// both shallower and shorter than a recognizable spur, and the V-shaped
     /// variant (resuming down the street instead of retracing) never returns
     /// to its anchor at all.
     ///
-    /// What makes a connector recognizable is the stop itself: the excursion
-    /// must bend away from the spine nearly perpendicular, its farthest
-    /// vertex must sit within meters of a trip stop, and travel must not
-    /// reverse (a hairpin that happens to serve a stop is real service).
-    /// Genuine corners fail the perpendicularity test — their farthest vertex
-    /// lies mostly along the chord, not beside it — so a route's real turns
-    /// survive even when a stop sits on the corner.
+    /// The decisive gates are that the excursion *returns to the street it
+    /// left*: the return vertex must sit on the line the route was already
+    /// traveling and travel must keep its heading, so the chord replacing the
+    /// deleted span lies on the street itself and a deletion can never draw a
+    /// diagonal across real geography. Real turns, block jogs, curves, hair-
+    /// pins, and terminal loops all resume on a different line or reverse
+    /// travel, and are kept — even when a stop sits right on the corner. A
+    /// connector at a sharp corner can survive those gates; that is the
+    /// accepted residue, safer than any aggressive guess.
     static func removingStopConnectorNotches(
         from coordinates: [CLLocationCoordinate2D],
         nearStops stops: [CLLocationCoordinate2D]
@@ -180,25 +182,34 @@ enum TripPathGeometry {
     }
 
     /// Finds the first interior excursion that enters a stop connector-side
-    /// and returns to the street. All gates are true meters. The excursion is
-    /// bounded by how far it travels (220 m) and how little street it skips
-    /// (a 200 m chord); must leave the spine by at least 3 m; its apex must
-    /// sit within 12 m of a trip stop; it must depart the spine within about
-    /// 56 degrees of perpendicular; and the route must keep traveling the
-    /// same way afterward (no turnarounds).
+    /// and returns to the same street. All gates are true meters. The
+    /// excursion is bounded by how far it travels (70 m), how little street
+    /// it skips (a 45 m chord), and how deep it goes (3–25 m — bay dives,
+    /// bulbs, and loops are larger); its apex must sit within 12 m of a trip
+    /// stop; and the street must continue straight through: the return
+    /// vertex stays within 4 m of the route's incoming line and travel keeps
+    /// its heading (dot ≥ 0.9), which is what makes every deletion
+    /// street-aligned by construction.
     private static func firstStopConnectorNotchRange(
         in points: [MKMapPoint],
         stopPoints: [MKMapPoint],
         metersPerPoint: Double
     ) -> Range<Int>? {
-        let maximumNotchPathDistance: CLLocationDistance = 220
-        let maximumNotchChordDistance: CLLocationDistance = 200
+        let maximumNotchPathDistance: CLLocationDistance = 70
+        let maximumNotchChordDistance: CLLocationDistance = 45
         let minimumNotchDepth: CLLocationDistance = 3
+        let maximumNotchDepth: CLLocationDistance = 25
         let maximumStopDistance: CLLocationDistance = 12
-        let maximumAlongChordDot = 0.55
-        let minimumContinuationDot = -0.5
+        let maximumStreetLineOffset: CLLocationDistance = 4
+        let minimumStraightThroughDot = 0.9
 
         for anchorIndex in 1..<(points.count - 1) {
+            guard let incomingHeading = travelHeading(
+                in: points,
+                at: anchorIndex,
+                backward: true,
+                metersPerPoint: metersPerPoint
+            ) else { continue }
             var pathDistance: CLLocationDistance = 0
             for returnIndex in (anchorIndex + 1)..<(points.count - 1) {
                 pathDistance += points[returnIndex - 1].distance(
@@ -225,45 +236,36 @@ enum TripPathGeometry {
                         apexIndex = index
                     }
                 }
-                guard notchDepth >= minimumNotchDepth else { continue }
+                guard notchDepth >= minimumNotchDepth,
+                      notchDepth <= maximumNotchDepth
+                else { continue }
                 guard stopPoints.contains(where: { stop in
                     stop.distance(to: points[apexIndex]) * metersPerPoint
                         <= maximumStopDistance
                 }) else { continue }
 
-                // A stop connector departs the spine sideways; a genuine
-                // corner's farthest vertex lies mostly along the chord.
-                guard let chordHeading = unitHeading(
-                    from: points[anchorIndex],
-                    to: points[returnIndex]
-                ),
-                    let apexHeading = unitHeading(
-                        from: points[anchorIndex],
-                        to: points[apexIndex]
-                    )
-                else { continue }
-                let alongChordDot = abs(
-                    chordHeading.x * apexHeading.x + chordHeading.y * apexHeading.y
-                )
-                guard alongChordDot <= maximumAlongChordDot else { continue }
+                // The street itself must continue straight through the span:
+                // the return vertex sits on the line the route was already
+                // traveling, so the chord that replaces the deleted span is
+                // the street. Real turns, jogs, and curves resume on a
+                // different line and are kept.
+                let returnDeltaX = points[returnIndex].x - points[anchorIndex].x
+                let returnDeltaY = points[returnIndex].y - points[anchorIndex].y
+                let streetLineOffset = abs(
+                    returnDeltaX * incomingHeading.y
+                        - returnDeltaY * incomingHeading.x
+                ) * metersPerPoint
+                guard streetLineOffset <= maximumStreetLineOffset else { continue }
 
-                // Hairpins and turnarounds that serve a stop are real service:
-                // reject only a reversal of travel direction.
-                guard let incomingHeading = travelHeading(
+                guard let outgoingHeading = travelHeading(
                     in: points,
-                    at: anchorIndex,
-                    backward: true,
+                    at: returnIndex,
+                    backward: false,
                     metersPerPoint: metersPerPoint
                 ),
-                    let outgoingHeading = travelHeading(
-                        in: points,
-                        at: returnIndex,
-                        backward: false,
-                        metersPerPoint: metersPerPoint
-                    ),
                     incomingHeading.x * outgoingHeading.x
                         + incomingHeading.y * outgoingHeading.y
-                        >= minimumContinuationDot
+                        >= minimumStraightThroughDot
                 else { continue }
 
                 return (anchorIndex + 1)..<returnIndex

@@ -142,18 +142,19 @@ final class TripPathGeometryTests: XCTestCase {
     func testRemovingStopConnectorNotchesDropsPerpendicularConnectors() {
         // SBMTD-style comb: the shape steps 10 m sideways to the stop
         // coordinate and resumes down the street (a V, never retracing).
-        let street = [0, 60, 90, 150, 240, 320].map {
+        let street = [0, 40, 80, 100, 128, 160, 220].map {
             TestFixtures.coordinate(north: 0, east: $0)
         }
-        let stop = TestFixtures.coordinate(north: 10, east: 90)
+        let stop = TestFixtures.coordinate(north: 10, east: 100)
         let comb = [
             TestFixtures.coordinate(north: 0, east: 0),
-            TestFixtures.coordinate(north: 0, east: 60),
-            TestFixtures.coordinate(north: 0, east: 90),
+            TestFixtures.coordinate(north: 0, east: 40),
+            TestFixtures.coordinate(north: 0, east: 80),
+            TestFixtures.coordinate(north: 0, east: 100),
             stop,
-            TestFixtures.coordinate(north: 0, east: 150),
-            TestFixtures.coordinate(north: 0, east: 240),
-            TestFixtures.coordinate(north: 0, east: 320),
+            TestFixtures.coordinate(north: 0, east: 128),
+            TestFixtures.coordinate(north: 0, east: 160),
+            TestFixtures.coordinate(north: 0, east: 220),
         ]
         let cleaned = TripPathGeometry.removingStopConnectorNotches(
             from: comb,
@@ -162,6 +163,43 @@ final class TripPathGeometryTests: XCTestCase {
         XCTAssertEqual(cleaned.count, street.count)
         XCTAssertEqual(cleaned.map(\.latitude), street.map(\.latitude))
         XCTAssertEqual(cleaned.map(\.longitude), street.map(\.longitude))
+    }
+
+    func testRemovingStopConnectorNotchesKeepsBlockJogs() {
+        // Real routing constantly jogs one block over. The first version of
+        // this stage deleted jogs like this and drew diagonals off-street;
+        // a jog resumes on a different street line and must be kept.
+        let jog = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 100, east: 0),
+            TestFixtures.coordinate(north: 100, east: 40),
+            TestFixtures.coordinate(north: 220, east: 40),
+            TestFixtures.coordinate(north: 320, east: 40),
+        ]
+        let cornerStop = TestFixtures.coordinate(north: 100, east: 40)
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: jog,
+            nearStops: [cornerStop]
+        )
+        XCTAssertEqual(cleaned.count, jog.count)
+    }
+
+    func testRemovingStopConnectorNotchesKeepsAsymmetricCorners() {
+        // A turn whose legs differ in length, with a stop at the bend: the
+        // route resumes on a different line, so it stays.
+        let corner = [
+            TestFixtures.coordinate(north: 0, east: 0),
+            TestFixtures.coordinate(north: 0, east: 60),
+            TestFixtures.coordinate(north: 0, east: 120),
+            TestFixtures.coordinate(north: 180, east: 120),
+            TestFixtures.coordinate(north: 180, east: 300),
+        ]
+        let stopAtBend = TestFixtures.coordinate(north: 4, east: 116)
+        let cleaned = TripPathGeometry.removingStopConnectorNotches(
+            from: corner,
+            nearStops: [stopAtBend]
+        )
+        XCTAssertEqual(cleaned.count, corner.count)
     }
 
     func testRemovingStopConnectorNotchesDropsShallowNearExactReturns() {
