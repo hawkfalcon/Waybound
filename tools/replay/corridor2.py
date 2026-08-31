@@ -243,17 +243,3 @@ def layout(geoms, jid, rate_clamp=None):
     return {"pts": pts, "aligned": aligned, "offsets": offsets,
             "stacked": stacked, "adx": adx, "ady": ady, "m": m}
 
-def lateral_profile(result, window_center=None, window_m=250.0):
-    """Signed lateral deviation of aligned coords from own centerline."""
-    pts, aligned, m = result["pts"], result["aligned"], result["m"]
-    out = []
-    for i in range(len(pts)):
-        dev = perp_distance(aligned[i], pts[i] if False else None, None) if False else None
-        # signed: project aligned[i] onto local segment normal
-        j = min(i, len(pts)-2)
-        dx, dy = pts[j+1][0]-pts[j][0], pts[j+1][1]-pts[j][1]
-        l = math.hypot(dx, dy) or 1
-        nx, ny = -dy/l, dx/l
-        s = (aligned[i][0]-pts[i][0])*nx + (aligned[i][1]-pts[i][1])*ny
-        out.append(s * m)
-    return out
