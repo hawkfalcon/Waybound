@@ -287,7 +287,12 @@ struct ContentView: View {
             rect = rect.union(MKMapRect(x: point.x, y: point.y, width: 1, height: 1))
         }
 
-        let minimumMapPoints = MKMapPointsPerMeterAtLatitude(first.latitude) * 450
+        // 450 m of ground, in this MapKit world's map points. Calibrated
+        // rather than MKMapPointsPerMeterAtLatitude, which no longer matches
+        // MKMapPoint's scale on the Xcode 26 SDKs' meter-based world.
+        let minimumMapPoints = 450 / TripPathGeometry.metersPerMapPoint(
+            atLatitude: first.latitude
+        )
         let contentWidth = max(rect.size.width, minimumMapPoints)
         let contentHeight = max(rect.size.height, minimumMapPoints)
         let horizontalPadding = contentWidth * 0.20

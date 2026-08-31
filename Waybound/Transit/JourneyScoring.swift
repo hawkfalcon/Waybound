@@ -104,12 +104,19 @@ enum JourneyScoring {
             return false
         }
 
+        // Map-point distances are projected units, not meters (~8.1 map
+        // points per meter in Santa Barbara); convert before comparing with
+        // the meter thresholds, or duplicate feeds never merge and the same
+        // route draws twice with slightly different shapes.
+        let metersPerMapPoint = TripPathGeometry.metersPerMapPoint(
+            atLatitude: first.boardingStop.coordinate.latitude
+        )
         let boardingDistance = MKMapPoint(first.boardingStop.coordinate).distance(
             to: MKMapPoint(second.boardingStop.coordinate)
-        )
+        ) * metersPerMapPoint
         let destinationDistance = MKMapPoint(first.destinationCoordinate).distance(
             to: MKMapPoint(second.destinationCoordinate)
-        )
+        ) * metersPerMapPoint
         return boardingDistance <= duplicateBoardingDistanceMeters
             && destinationDistance <= duplicateDestinationDistanceMeters
     }

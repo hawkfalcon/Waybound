@@ -35,7 +35,7 @@ Waybound/
 - Pure decision rules in `Transit/` can be unit-tested without a network:
   - `TransitText` — identity folding for agencies, routes, and stop names
   - `StopClustering` — same-place merge of operator records
-  - `TripPathGeometry` — spike cleanup, jump splits, radius clips, stop-to-shape alignment
+  - `TripPathGeometry` — spike, stop-connector-notch, and out-and-back-spur cleanup, jump splits, radius clips, stop-to-shape alignment
   - `FlagshipSelection` — which downstream stop the journey is actually *for*
   - `RouteIdentity` — stable public route key and fallback color
   - `JourneyScoring` — overview ranking and duplicate-journey detection
@@ -43,9 +43,47 @@ Waybound/
 - `Views/WayboundMapView` is an `MKMapView` representable: screen-space corridor lanes, clustered route pills, destination callouts.
 - `Views/ContentView` is the cream/ink sheet chrome on top of the map.
 
+Distances everywhere are meters. `MKMapPoint.distance` is *projected map
+points*, so every threshold that crosses that boundary goes through
+`TripPathGeometry.metersPerMapPoint(atLatitude:)` — which is **calibrated at
+runtime against CLLocation's ellipsoid**, not read from
+`MKMapPointsPerMeterAtLatitude`: on the meter-based MapKit world of the
+Xcode 26 SDKs that legacy constant no longer matches `MKMapPoint`'s scale
+(it answers ~8.1 points per meter while point distances are already true
+meters), and trusting it made every meter threshold ~8× stricter than
+written. The unit tests round-trip the calibration against true meters at
+two latitudes.
+
+Shared-street rendering keeps two distance gates apart. Corridor *membership*
+(who gets a lane in the ribbon) accepts partners up to 20 m of centerline
+separation, but centerline *adoption* — projecting a member's vertices onto
+the dominant route's shape — is capped at 6 m. Divided carriageways
+(Hollister, El Colegio, Calle Real) and freeway ramp braids sit 12–20 m apart,
+and snapping across that gap rendered the 9 loop and the 12x/24x expresses as
+tapered sideways detours onto the wrong side of the street. The correction a
+lane adopts is also *rate*-limited (0.08 m per meter of street, smoothed from
+both ends): where the corridor's preferred reference changes — route 6 turns
+off Chapala at Sola, so the 12x/24x lane re-references there — the bounded
+correction used to arrive within a vertex or two as a one-sided diagonal jog.
+
+Stop-connector cleanup deletes an excursion only when the street provably
+continues straight through it: both span ends sit on each other's line of
+travel, travel keeps its heading, and the excursion reaches its stop steeply
+(≥ 40° off the street) — so sparse downtown shapes (re-entry vertex a hundred
+meters on) and sideways terminal coordinates are cleaned, while jogs,
+corners, curves, crests, and hairpins are kept even when a stop sits on them.
+A deletion that passes those gates replaces the span with the street chord
+itself; it can never draw a diagonal across real geography.
+
 ## Tests
 
 The `WayboundTests` target hosts the app and exercises the pure logic above. In Xcode: **Product → Test** (⌘U).
+
+`tools/replay/` holds the Python replay harness used to prototype and
+validate the geometry stages before porting them to Swift — algorithm
+mirrors, regression batteries, and the real downtown traces they run on.
+`python3 tools/replay/battery.py` and `python3 tools/replay/corridor_check.py`
+are the ground truth for any change to the notch or corridor passes.
 
 ## Deployment target
 
