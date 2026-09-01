@@ -399,7 +399,7 @@ enum CorridorLaneOrdering {
 
     static func computeStableOrder(
         for graph: inout CorridorGraph,
-        maxIterations: Int = 0
+        maxIterations: Int = 6
     ) {
         guard !graph.edges.isEmpty else { return }
 
@@ -415,8 +415,6 @@ enum CorridorLaneOrdering {
             return map
         }
 
-        // Map journeyID -> publicKey for quick lookup, and publicKey -> representative ID per edge
-        // For barycenter we work on representative IDs (one per publicKey)
         var currentRankMap = rankMap(for: graph)
 
         for _ in 0..<maxIterations {
@@ -440,16 +438,14 @@ enum CorridorLaneOrdering {
                 var barycenters: [(routeID: Int, bary: Double)] = []
 
                 for repID in edge.orderedRouteIDs {
+                    let currentRank = Double(currentRankMap[edgeKey]?[repID] ?? 0)
                     guard let path = graph.routePaths[repID] else {
-                        // If representative path missing, try any journey with same publicKey
-                        let bary = Double(currentRankMap[edgeKey]?[repID] ?? 0)
-                        barycenters.append((repID, bary))
+                        barycenters.append((repID, currentRank))
                         continue
                     }
                     let positions = path.edgePositions[edgeKey] ?? []
                     if positions.isEmpty {
-                        let bary = Double(currentRankMap[edgeKey]?[repID] ?? 0)
-                        barycenters.append((repID, bary))
+                        barycenters.append((repID, currentRank))
                         continue
                     }
                     var neighborRanks: [Double] = []
@@ -467,21 +463,22 @@ enum CorridorLaneOrdering {
                             }
                         }
                     }
-                    let bary: Double
+                    let neighborAvg: Double
                     if neighborRanks.isEmpty {
-                        bary = Double(currentRankMap[edgeKey]?[repID] ?? 0)
+                        neighborAvg = currentRank
                     } else {
-                        bary = neighborRanks.reduce(0, +) / Double(neighborRanks.count)
+                        neighborAvg = neighborRanks.reduce(0, +) / Double(neighborRanks.count)
                     }
+                    // Damping: 60% current, 40% neighbor average – prevents large jumps that cause swapping
+                    let bary = currentRank * 0.6 + neighborAvg * 0.4
                     barycenters.append((repID, bary))
                 }
 
-                // Sort by barycenter, tie-break by stable order (agency, routeNumber, etc.)
+                // Sort by barycenter, tie-break by global stable order to minimize crossings deterministically
                 let sorted = barycenters.sorted { a, b in
-                    if abs(a.bary - b.bary) > 0.0001 {
+                    if abs(a.bary - b.bary) > 0.001 {
                         return a.bary < b.bary
                     }
-                    // stable tie-break using routeInfo
                     if let infoA = graph.routeInfo[a.routeID], let infoB = graph.routeInfo[b.routeID] {
                         if infoA.agencyName != infoB.agencyName { return infoA.agencyName < infoB.agencyName }
                         if infoA.routeNumber != infoB.routeNumber { return infoA.routeNumber < infoB.routeNumber }
@@ -499,6 +496,10 @@ enum CorridorLaneOrdering {
             for (key, ordering) in newOrderings {
                 graph.edges[key]?.orderedRouteIDs = ordering
             }
+            currentRankMap = rankMap(for: graph)
+
+            // After each iteration, stabilize long corridors to keep continuing routes from swapping
+            stabilizeLongCorridors(graph: &graph)
             currentRankMap = rankMap(for: graph)
 
             if !changed { break }
@@ -879,8 +880,8 @@ enum CorridorLaneRendering {
             segmentLengths.append(d)
         }
 
-        // Remove short shared runs (< 45m) – intersections, terminal bays
-        let minSharedRunMeters: Double = 45
+        // Remove short shared runs (< 20m) – intersections, terminal bays, not real corridors
+        let minSharedRunMeters: Double = 20
         var idx = 0
         while idx < segmentIsShared.count {
             if !segmentIsShared[idx] { idx += 1; continue }
@@ -899,8 +900,8 @@ enum CorridorLaneRendering {
             }
         }
 
-        // Bridge short gaps (< 80m) between shared runs with same offset
-        let maxGapToBridge: Double = 80
+        // Bridge short gaps (< 60m) between shared runs with same offset – keeps ribbon straight
+        let maxGapToBridge: Double = 60
         idx = 0
         while idx < segmentIsShared.count {
             // find shared run
