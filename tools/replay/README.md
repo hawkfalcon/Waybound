@@ -86,3 +86,58 @@ Arrellaga (1.4 km), standing in for the 12x/24x expresses where they share
 Chapala with route 6 south of Sola. Feed drift (the two agencies'/routes'
 centerlines disagreeing by a few meters) is injected synthetically in
 `corridor_check.py` because both traces come from the same router.
+
+## Lane metrics (corridor3.pair_metrics, bundle_wobble, min_lane_separation)
+
+All lane-quality numbers are measured on the DRAWN ribbons (ribbon() applies
+stableRouteOffsetPoints verbatim) against a COMMON street spine, so no
+travel-frame convention can fake or hide a result:
+
+- `project_onto_spine(layout, geoms, spine)` — screen-space projection of a
+  ribbon onto one spine polyline. The spine's direction chain is *held*
+  through its own 180° reversals (held_directions), so lateral sign is
+  stable along the street. The cursor full-searches the first sample and
+  re-anchors when a windowed hit is > 40 pts away (approach stubs).
+- `pair_metrics(a, b, ...)` — orientation-stable wrapper (tries both
+  observers' dominant spines, keeps the one with more matched pairs).
+  Samples are paired by spine arc (bisect, either direction of travel).
+  Excluded per sample: spine corners (miter pinch is renderer physics,
+  not a lane change — the whole segment touching a turn is flagged),
+  |lateral| > 50 pts (that ribbon is on another street), and samples
+  within 3 of a stacked/ref boundary on either side (tapered join/leave).
+  The sequence is split into monotone passes (a U-turn's two legs are never
+  compared to each other); each pass is trimmed 20% at both ends (a merge
+  from an adjacent lane sweeps while it converges — a join, not drift).
+  Drift = robust p5–p95 range of (lat_a − lat_b); gap = p5 of |lat_a −
+  lat_b|. Both in lanes (LS = laneSpacingPoints = 4.2 screen pts).
+- `bundle_wobble` = worst pair drift over the bundle; `min_lane_separation`
+  = worst pair gap. Same-public-key pairs share a lane by design: skipped.
+
+Gate semantics (lane_check, lane_fuzz): comparative against main run on the
+same scenario — wobble_sched ≤ max(0.05, wobble_main)·1.10 + 0.05,
+sep_sched ≥ min(0.75, sep_main) − 0.02 (− per-scenario sep_slack).
+Structurally forced crossings are gated by per-scenario max_bundle.
+
+Known scheduler gap (next fix): slots are stored and applied along each
+journey's OWN path normals, so a journey whose own polyline runs ~half a
+lane inside the street draws ~half a lane inside its slot (fuzz seeds 35/
+42/46/68: sched sep 0.4–0.6 vs main ~1.0). Tried and reverted this round:
+`_spine_delta()` grounding — subtract the own path's lateral displacement
+from the applied offset (delta measured against the ref spine's held
+normals, in screen points). With full grounding those four seeds go to
+0.8–1.0, but forks gain crossings (a peeling strand's delta grows fast and
+pushing it sideways crosses the bundle: fuzz seeds 4 and 10 went 2->8 and
+2->10 in-bundle crossings), and a gradient fade trades one class for
+another (45 -> 55 problem seeds). The next attempt should ground on a
+group-consensus street (median displacement of the bundle) rather than a
+single ref, and skip observers whose corridor membership is ending.
+
+## Fuzz status after the metric rebuild (2026-09-01)
+
+lane_check: green on all 7 scenarios (drawn-ribbon metrics, comparative
+gates). lane_fuzz: 45/120 seeds flagged, now all real signal, classes:
+- crossings added vs main (15 seeds; worst 43: 5->13, 10: 2->10, 1: 12->14)
+- bundle wobble above main (sched instability; worst 54: 5.41 vs 0.00,
+  18: 2.64 vs 0.00, 61: 4.09 vs 0.37)
+- separation below main (own-path displacement class above; plus marginal
+  both-bad cases where main also pinches)
