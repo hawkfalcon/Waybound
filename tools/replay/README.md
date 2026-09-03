@@ -141,3 +141,43 @@ gates). lane_fuzz: 45/120 seeds flagged, now all real signal, classes:
   18: 2.64 vs 0.00, 61: 4.09 vs 0.37)
 - separation below main (own-path displacement class above; plus marginal
   both-bad cases where main also pinches)
+
+## Swift port (2026-09-02)
+
+The anchored-lane scheduler is now ported into
+`Waybound/Views/WayboundMapView.swift` (this file remains the executable
+spec; constants above are mirrored 1:1 by `CorridorLaneScheduling`):
+
+- `Coordinator.recomputeCorridorLaneSchedule()` — runs inside
+  `ensureCorridorLaneLayouts()`'s corridor-content signature gate, so the
+  schedule is cached per static feed/journey set and live departures never
+  re-trigger it. It builds one `CorridorSchedStrand` per (journey,
+  flagship polyline) from the same densified coordinates the layout pass
+  uses, plus each strand's held-direction chain (the renderer's reversal
+  hold), then `buildCorridorLaneSchedule` (runs → union-find corridors →
+  longest-first sweeps → `postFillSchedule`).
+- `CorridorSegmentIndex` gained per-segment `CorridorSegmentLocation`
+  (polylineIndex, segmentIndex) and `parallelMember(near:direction:)` so
+  the membership scan can locate a matched segment on the member's own
+  strand — the `own_index` of the spec.
+- `sharedCorridorSegmentLayout` no longer re-sorts members per sample or
+  re-centres offsets on current member count. It keeps membership,
+  dominance/trunk voting, and adoption, but the lane offset comes from
+  `corridorLaneSchedule[(journey, polyline)][segmentIndex]`, converted
+  into the journey's own frame by the held-direction dot (replacing
+  main's per-sample directionSign). Alignment follows the schedule's
+  sticky reference when locally matched.
+- The rest of the pipeline (removeShortCorridorRuns, offset averaging,
+  stabilize/bridge/transitions, taper, clamp, `stableRouteOffsetPoints`,
+  dedup, trunk/detail cross-fade) is untouched.
+
+Port divergences (intentional): member ordering uses the shipped
+`corridorLaneComesBefore` (route number → agency → direction → stack →
+id) everywhere, where the spec's `sort_key` omitted agency; strands are
+per flagship polyline rather than per journey (multi-leg trips schedule
+each leg independently, keyed by (journeyID, polylineIndex)).
+
+No Swift compiler exists in this sandbox: the port was validated by
+line-by-line review against the spec above. lane_check (7 scenarios,
+drawn-ribbon metrics) and lane_fuzz expectations carry over unchanged;
+the real gate is the downtown-SB screenshot comparison on a Mac build.
