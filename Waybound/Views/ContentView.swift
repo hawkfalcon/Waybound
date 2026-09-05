@@ -33,7 +33,6 @@ struct ContentView: View {
     @State private var isShowingPlanningSettings = false
     #if DEBUG
     @State private var laneDiagnosticsRequestID = 0
-    @State private var laneDiagnosticsURL: URL?
     #endif
 
     private var selectedJourney: RouteJourney? {
@@ -89,10 +88,7 @@ struct ContentView: View {
                             journeyIDs: journeyIDs
                         )
                     },
-                    diagnosticsRequestID: laneDiagnosticsRequestID,
-                    onDiagnosticsFile: { url in
-                        laneDiagnosticsURL = url
-                    }
+                    diagnosticsRequestID: laneDiagnosticsRequestID
                 )
                 .ignoresSafeArea()
                 #if DEBUG
@@ -150,16 +146,7 @@ struct ContentView: View {
             .presentationDragIndicator(.visible)
             .presentationCornerRadius(28)
         }
-        #if DEBUG
-        .sheet(isPresented: Binding(
-            get: { laneDiagnosticsURL != nil },
-            set: { if !$0 { laneDiagnosticsURL = nil } }
-        )) {
-            if let url = laneDiagnosticsURL {
-                LaneDiagnosticsShareSheet(url: url)
-            }
-        }
-        #endif
+
     }
 
     private var destinationSheet: some View {
@@ -1064,21 +1051,3 @@ private struct ScheduledBadge: View {
     ContentView()
 }
 
-#if DEBUG
-/// Share sheet for the lane-diagnostics export (debug builds only).
-private struct LaneDiagnosticsShareSheet: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(
-            activityItems: [url],
-            applicationActivities: nil
-        )
-    }
-
-    func updateUIViewController(
-        _ viewController: UIActivityViewController,
-        context: Context
-    ) {}
-}
-#endif

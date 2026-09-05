@@ -95,10 +95,9 @@ struct WayboundMapView: UIViewRepresentable {
     let onSelectStop: (Int, Set<Int>, Set<Int>) -> Void
     /// Bump to make the coordinator dump its lane state (densified strand
     /// coordinates, the anchored-lane schedule, and the final per-vertex
-    /// layouts) to a JSON file; the URL comes back via onDiagnosticsFile.
+    /// layouts) to a JSON file and present a share sheet for it.
     /// Diagnostics only — never set from production UI.
     var diagnosticsRequestID: Int = 0
-    var onDiagnosticsFile: ((URL?) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -142,9 +141,7 @@ struct WayboundMapView: UIViewRepresentable {
         }
         if context.coordinator.lastDiagnosticsRequestID != diagnosticsRequestID {
             context.coordinator.lastDiagnosticsRequestID = diagnosticsRequestID
-            context.coordinator.onDiagnosticsFile = onDiagnosticsFile
-            let url = context.coordinator.exportLaneDiagnostics()
-            onDiagnosticsFile?(url)
+            context.coordinator.shareLaneDiagnostics(from: mapView)
         }
     }
 
@@ -161,7 +158,6 @@ struct WayboundMapView: UIViewRepresentable {
         private var pulseTimer: Timer?
         private var corridorSignature: Int?
         var lastDiagnosticsRequestID: Int?
-        fileprivate var onDiagnosticsFile: ((URL?) -> Void)?
         /// Full-polyline lane layouts, computed once per corridor-content change
         /// and only clipped per viewport tick. Recomputing these on every pan
         /// frame was O(routes² × segments²) and drove the memory spikes that got
@@ -380,6 +376,31 @@ struct WayboundMapView: UIViewRepresentable {
                             polylineIndex: polylineIndex
                         )
                     }
+            }
+        }
+
+        /// Export the lane state (see exportLaneDiagnostics) and present a
+        /// UIKit share sheet for the file, walked up from the map view. The
+        /// presentation is dispatched async: this runs inside updateUIView,
+        /// where presenting (or touching SwiftUI state) mid-update would be
+        /// dropped.
+        fileprivate func shareLaneDiagnostics(from mapView: MKMapView) {
+            guard let url = exportLaneDiagnostics() else { return }
+            DispatchQueue.main.async {
+                let share = UIActivityViewController(
+                    activityItems: [url],
+                    applicationActivities: nil
+                )
+                share.popoverPresentationController?.sourceView = mapView
+                var responder: UIResponder? = mapView
+                while let current = responder,
+                      !(current is UIViewController) {
+                    responder = current.next
+                }
+                guard let presenter = responder as? UIViewController else {
+                    return
+                }
+                presenter.present(share, animated: true)
             }
         }
 
