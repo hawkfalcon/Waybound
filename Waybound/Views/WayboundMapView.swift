@@ -160,7 +160,7 @@ struct WayboundMapView: UIViewRepresentable {
         private var lastPulsedJourneyID: Int?
         private var pulseTimer: Timer?
         private var corridorSignature: Int?
-        private var lastDiagnosticsRequestID: Int?
+        var lastDiagnosticsRequestID: Int?
         fileprivate var onDiagnosticsFile: ((URL?) -> Void)?
         /// Full-polyline lane layouts, computed once per corridor-content change
         /// and only clipped per viewport tick. Recomputing these on every pan
@@ -390,7 +390,7 @@ struct WayboundMapView: UIViewRepresentable {
         /// per-vertex layouts the renderer consumes. tools/replay/ingest.py
         /// rebuilds and renders the same shapes, so a reported visual can be
         /// reproduced numerically.
-        private func exportLaneDiagnostics() -> URL? {
+        fileprivate func exportLaneDiagnostics() -> URL? {
             ensureCorridorLaneLayouts()
             var root: [String: Any] = [
                 "format": "waybound-lanes-v1",
