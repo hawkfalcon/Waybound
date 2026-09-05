@@ -181,3 +181,22 @@ No Swift compiler exists in this sandbox: the port was validated by
 line-by-line review against the spec above. lane_check (7 scenarios,
 drawn-ribbon metrics) and lane_fuzz expectations carry over unchanged;
 the real gate is the downtown-SB screenshot comparison on a Mac build.
+
+## Lane diagnostics export (debug builds)
+
+`ContentView` shows a small DEBUG-only button (top-leading, over the map)
+that makes the coordinator dump its lane state to a JSON file and share it:
+per journey the densified flagship coordinates (the scheduler's exact
+input), the anchored-lane schedule (offset / spine direction / reference
+per strand segment), and the final per-vertex layouts. Rebuild + run, tap
+the button at the spot you want to report, share the file (AirDrop/Files)
+and upload it into the session.
+
+`python3 tools/replay/ingest.py <waybound-lanes-*.json>` then rebuilds the
+exact shapes here and prints: the lateral stacking at stations along each
+spine (the numeric version of a screenshot), a port check (Swift final
+offsets vs this harness's pipeline re-run over the Swift schedule —
+mismatch means a port divergence), a scheduler check (Swift schedule vs a
+fresh Python scheduler run on the same geometry — mismatch means a
+real-data case the algorithm itself gets wrong), and an SVG rendering
+into out/.

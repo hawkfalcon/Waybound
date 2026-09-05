@@ -93,6 +93,12 @@ struct WayboundMapView: UIViewRepresentable {
     let cameraRequest: WayboundCameraRequest
     let onSelectJourney: (Int) -> Void
     let onSelectStop: (Int, Set<Int>, Set<Int>) -> Void
+    /// Bump to make the coordinator dump its lane state (densified strand
+    /// coordinates, the anchored-lane schedule, and the final per-vertex
+    /// layouts) to a JSON file; the URL comes back via onDiagnosticsFile.
+    /// Diagnostics only — never set from production UI.
+    var diagnosticsRequestID: Int = 0
+    var onDiagnosticsFile: ((URL?) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -134,6 +140,12 @@ struct WayboundMapView: UIViewRepresentable {
             context.coordinator.lastCameraRequestID = cameraRequest.id
             mapView.setRegion(cameraRequest.region, animated: true)
         }
+        if context.coordinator.lastDiagnosticsRequestID != diagnosticsRequestID {
+            context.coordinator.lastDiagnosticsRequestID = diagnosticsRequestID
+            context.coordinator.onDiagnosticsFile = onDiagnosticsFile
+            let url = context.coordinator.exportLaneDiagnostics()
+            onDiagnosticsFile?(url)
+        }
     }
 
     final class Coordinator: NSObject, MKMapViewDelegate, UIGestureRecognizerDelegate {
@@ -148,6 +160,8 @@ struct WayboundMapView: UIViewRepresentable {
         private var lastPulsedJourneyID: Int?
         private var pulseTimer: Timer?
         private var corridorSignature: Int?
+        private var lastDiagnosticsRequestID: Int?
+        fileprivate var onDiagnosticsFile: ((URL?) -> Void)?
         /// Full-polyline lane layouts, computed once per corridor-content change
         /// and only clipped per viewport tick. Recomputing these on every pan
         /// frame was O(routes² × segments²) and drove the memory spikes that got
@@ -366,6 +380,87 @@ struct WayboundMapView: UIViewRepresentable {
                             polylineIndex: polylineIndex
                         )
                     }
+            }
+        }
+
+        /// Dump the corridor lane state to a JSON file for offline
+        /// diagnosis: per journey the densified flagship coordinates (the
+        /// scheduler's exact input), the anchored-lane schedule (offset,
+        /// spine direction, reference per strand segment), and the final
+        /// per-vertex layouts the renderer consumes. tools/replay/ingest.py
+        /// rebuilds and renders the same shapes, so a reported visual can be
+        /// reproduced numerically.
+        private func exportLaneDiagnostics() -> URL? {
+            ensureCorridorLaneLayouts()
+            var root: [String: Any] = [
+                "format": "waybound-lanes-v1",
+                "exportedAt": Date().timeIntervalSince1970,
+                "laneSpacingPoints": RouteMapStyle.laneSpacingPoints,
+                "selectedJourneyID": parent.selectedJourneyID ?? -1
+            ]
+            var journeys = [[String: Any]]()
+            for journey in parent.journeys {
+                guard let geometry = corridorGeometryByJourneyID[journey.id]
+                else { continue }
+                journeys.append([
+                    "id": journey.id,
+                    "routeNumber": geometry.routeNumber,
+                    "agency": geometry.agencyName,
+                    "directionID": geometry.directionID ?? -1,
+                    "stackOrder": geometry.stackOrder,
+                    "departures": geometry.observedDepartureCount,
+                    "polylines": (densifiedFlagshipCoordinatesByJourneyID[
+                        journey.id
+                    ] ?? []).map { polyline in
+                        polyline.map { [$0.latitude, $0.longitude] }
+                    }
+                ])
+            }
+            root["journeys"] = journeys
+
+            var schedule = [[String: Any]]()
+            for (key, entries) in corridorLaneSchedule {
+                schedule.append([
+                    "journeyID": key.journeyID,
+                    "polylineIndex": key.polylineIndex,
+                    "entries": entries
+                        .sorted { $0.key < $1.key }
+                        .map { index, sample in
+                            [index, sample.offset, sample.directionX,
+                             sample.directionY, sample.referenceID] as [Any]
+                        }
+                ])
+            }
+            root["schedule"] = schedule
+
+            var layouts = [[String: Any]]()
+            for (journeyID, laneLayouts) in laneLayoutsByJourneyID {
+                for (polylineIndex, layout) in laneLayouts.enumerated() {
+                    layouts.append([
+                        "journeyID": journeyID,
+                        "polylineIndex": polylineIndex,
+                        "offsets": layout.offsets,
+                        "shared": layout.sharedVertices.map { $0 ? 1 : 0 },
+                        "trunk": layout.trunkOwnerVertices.map { $0 ? 1 : 0 }
+                    ])
+                }
+            }
+            root["layouts"] = layouts
+
+            guard JSONSerialization.isValidJSONObject(root),
+                  let data = try? JSONSerialization.data(
+                      withJSONObject: root,
+                      options: [.sortedKeys]
+                  )
+            else { return nil }
+            let stamp = Int(Date().timeIntervalSince1970)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("waybound-lanes-\(stamp).json")
+            do {
+                try data.write(to: url)
+                return url
+            } catch {
+                return nil
             }
         }
 
