@@ -351,14 +351,11 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                                      key_of)
                 side = join_side(cid, si)
                 if side is None:
-                    # A strand born on the corridor (trip start / boarding
-                    # stop) appears in place, so any free slot is crossing
-                    # free: prefer the side it will peel off toward, so a
-                    # fork's strands sit adjacent, subway-style.
+                    # See the cohort note: presence running to the sweep end
+                    # is usually this strand peeling as the last partner.
                     out_si = next((b for a, b in presence[cid]
                                    if a <= si < b), s1)
-                    if out_si < s1:
-                        side = exit_side(cid, out_si)
+                    side = exit_side(cid, min(out_si, s1))
                 slots[k] = place(cid, side, gsign, rank)
                 if DEBUG:
                     print(f"    [sweep {geoms[jid].num}] join {geoms[cid].num}"
@@ -372,8 +369,13 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                 continue
             gsign = group_sign(cid, si)
             out_si = next((b for a, b in presence[cid] if a <= si < b), s1)
-            stays = out_si >= s1
-            side = None if stays else exit_side(cid, out_si)
+            # A presence stretch that runs to the sweep end usually means
+            # THIS strand is the spine's last partner: the run ended
+            # because it left. exit_side walks the strand's own
+            # continuation past its last match, so calling it at the run
+            # end still tells peel-off (a side) from a true stayer that
+            # carries on along the street (None).
+            side = exit_side(cid, min(out_si, s1))
             cohort.append((cid, k, gsign, out_si, side))
             slot_groups[k] = gsign
         with_group = [x for x in cohort if x[2] >= 0]
@@ -477,11 +479,12 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                     # A strand born on the corridor (trip start / boarding
                     # stop) appears in place, so any free slot is crossing
                     # free: prefer the side it will peel off toward, so a
-                    # fork's strands sit adjacent, subway-style.
+                    # fork's strands sit adjacent, subway-style. Includes
+                    # presence that runs to the sweep end (the spine's last
+                    # partner peels there too).
                     out_si = next((b for a, b in presence[cid]
                                    if a <= si < b), s1)
-                    if out_si < s1:
-                        side = exit_side(cid, out_si)
+                    side = exit_side(cid, min(out_si, s1))
                 slots[k] = place(cid, side, gsign, rank)
                 if DEBUG:
                     print(f"    [sweep {geoms[jid].num}] join {geoms[cid].num}"

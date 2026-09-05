@@ -222,6 +222,33 @@ def scenario_chapala(drift=4.0):
     }
 
 
+
+def scenario_fanout():
+    """Transit-center fan-out (user-reported downtown SB shape): six lines
+    leave the center together; 80 joins slightly later; then they peel off
+    in sequence. Least-crosses order puts the first to peel on each side
+    outermost on that side."""
+    spine = spine_points([(0, 0), (0, 1200)])
+    arcs = arc_of(spine)
+
+    def leg(x_exit, side):
+        pts = strand(spine, arcs, 0, x_exit)
+        pts.append((30 * side, x_exit))
+        pts.append((140 * side, x_exit + 60))
+        return pts
+
+    return {
+        "j1": G("j1", "1", 0, polyline_m(strand(spine, arcs, 0, 1200))),
+        "j7": G("j7", "7", 0, polyline_m(leg(450, +1))),
+        "j80": G("j80", "80", 0, polyline_m(
+            [(-60, -150), (-25, -60)] + strand(spine, arcs, 0, 300)
+            + [(30, 300), (140, 360)]), agency="VCTC"),
+        "j5": G("j5", "5", 0, polyline_m(leg(600, -1))),
+        "j17": G("j17", "17", 0, polyline_m(leg(750, -1))),
+        "j4": G("j4", "4", 0, polyline_m(leg(900, -1))),
+    }
+
+
 def scenario_fork():
     """A trunk that forks: 1/3 turn onto a side street and keep sharing it
     while 12X/24X continue on the trunk — the corridor graph branches."""
@@ -279,6 +306,11 @@ SCENARIOS = [
     ("dropout", scenario_dropout, {"max_bundle": 2, "sep_slack": 0.2,
                                    "note": "side-street bay excursion crosses the outer lanes out and back"}),
     ("fork", scenario_fork, {"max_bundle": 1, "note": "24X enters north of 3; 3 later peels north across it"}),
+    # My synthetic legs put 5/17/4 on the -side and 7/80 on the +side; in
+    # this geometry least-crosses reads (5, 17, 4, 1, 7, 80) left-to-right,
+    # the mirror image of the user's real-world (80, 7, 1, 4, 17, 5).
+    ("fanout", scenario_fanout, {"max_bundle": 0,
+                                 "expect_order": (250, ["5", "17", "4", "1", "7", "80"])}),
     ("reversed_spine", scenario_reversed_spine, {"max_bundle": 0}),
     ("chapala", scenario_chapala, {"max_bundle": 0}),
 ]
@@ -327,6 +359,32 @@ def evaluate(name, maker, opts, render=False):
     if bundle_sched > allowed:
         problems.append(f"strands cross inside the bundle ({bundle_sched} > "
                         f"{allowed}: {[(geoms[a].num, geoms[b].num) for a, b, _ in pairs_sched]})")
+    expected = opts.get("expect_order")
+    if expected:
+        probe, nums = expected
+        from lanesched import schedule_lanes
+        from corridor3 import membership_scan as _mscan
+        sched2 = schedule_lanes(geoms, _mscan(geoms))
+        by_num = {g.num: jid for jid, g in geoms.items()}
+        entries = []
+        for num in nums:
+            jid = by_num[num]
+            g = geoms[jid]
+            best_si, best_d = None, None
+            for i in range(len(g.segs)):
+                if g.segs[i] is None:
+                    continue
+                d = abs(g.arc()[i] - probe)
+                if best_d is None or d < best_d:
+                    best_d, best_si = d, i
+            e = sched2.get((jid, best_si)) if best_si is not None else None
+            entries.append((None if e is None else e.offset, num))
+        got = [n for _, n in sorted(entries, key=lambda t: (t[0] is None, t[0]))]
+        ok = got == nums
+        print(f"  lateral order           {'ok ' if ok else 'BAD'}  {got}")
+        if not ok:
+            problems.append(f"lateral order {got} != {nums}")
+
     if wobble_sched > max(0.05, wobble_main) * 1.10 + 0.05:
         problems.append(f"continuing strands still wobble ({wobble_sched:.3f} lanes,"
                         f" main {wobble_main:.3f})")

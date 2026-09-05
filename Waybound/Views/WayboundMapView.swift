@@ -1835,11 +1835,11 @@ struct WayboundMapView: UIViewRepresentable {
                 // A strand born on the corridor (trip start / boarding stop)
                 // appears in place, so any free slot is crossing free: prefer
                 // the side it will peel off toward, so a fork's strands sit
-                // adjacent, subway-style.
+                // adjacent, subway-style. Includes presence that runs to the
+                // sweep end: the spine's last partner peels there too.
                 let outSi = presence[cid]?
                     .first { $0.0 <= si && si < $0.1 }?.1 ?? s1
-                guard outSi < s1 else { return nil }
-                return exitSide(cid, outSi)
+                return exitSide(cid, min(outSi, s1))
             }
 
             func birth(_ si: Int) {
@@ -1876,8 +1876,13 @@ struct WayboundMapView: UIViewRepresentable {
                     let outSi = presence[cid]?
                         .first { $0.0 <= si && si < $0.1 }?.1
                         ?? s1
-                    let stays = outSi >= s1
-                    let side = stays ? nil : exitSide(cid, outSi)
+                    // Presence running to the sweep end usually means this
+                    // strand is the spine's last partner: the run ended
+                    // because it left. exitSide walks the strand's own
+                    // continuation past its last match, so calling it at the
+                    // run end still tells peel-off (a side) from a true
+                    // stayer that carries on along the street (nil).
+                    let side = exitSide(cid, min(outSi, s1))
                     cohort.append(
                         CohortMember(
                             journeyID: cid,
