@@ -93,6 +93,11 @@ struct WayboundMapView: UIViewRepresentable {
     let cameraRequest: WayboundCameraRequest
     let onSelectJourney: (Int) -> Void
     let onSelectStop: (Int, Set<Int>, Set<Int>) -> Void
+    /// Bump to make the coordinator dump its lane state (densified strand
+    /// coordinates, the anchored-lane schedule, and the final per-vertex
+    /// layouts) to a JSON file and present a share sheet for it.
+    /// Diagnostics only — never set from production UI.
+    var diagnosticsRequestID: Int = 0
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -134,6 +139,10 @@ struct WayboundMapView: UIViewRepresentable {
             context.coordinator.lastCameraRequestID = cameraRequest.id
             mapView.setRegion(cameraRequest.region, animated: true)
         }
+        if context.coordinator.lastDiagnosticsRequestID != diagnosticsRequestID {
+            context.coordinator.lastDiagnosticsRequestID = diagnosticsRequestID
+            context.coordinator.shareLaneDiagnostics(from: mapView)
+        }
     }
 
     final class Coordinator: NSObject, MKMapViewDelegate, UIGestureRecognizerDelegate {
@@ -148,11 +157,21 @@ struct WayboundMapView: UIViewRepresentable {
         private var lastPulsedJourneyID: Int?
         private var pulseTimer: Timer?
         private var corridorSignature: Int?
+        var lastDiagnosticsRequestID: Int?
         /// Full-polyline lane layouts, computed once per corridor-content change
         /// and only clipped per viewport tick. Recomputing these on every pan
         /// frame was O(routes² × segments²) and drove the memory spikes that got
         /// the app jettisoned.
         private var laneLayoutsByJourneyID: [Int: [CorridorLaneLayout]] = [:]
+        /// Anchored-lane schedule: one lane sample per (journey, flagship
+        /// polyline, densified segment), computed once per corridor-content
+        /// change alongside the layouts. Live departures never re-trigger it.
+        private var corridorLaneSchedule:
+            [CorridorStrandKey: [Int: CorridorScheduledLaneSample]] = [:]
+        private var heldUnitDirectionsByStrand:
+            [CorridorStrandKey: [(x: Double, y: Double)]] = [:]
+        private var densifiedFlagshipCoordinatesByJourneyID:
+            [Int: [[CLLocationCoordinate2D]]] = [:]
 
         init(parent: WayboundMapView) {
             self.parent = parent
@@ -293,43 +312,176 @@ struct WayboundMapView: UIViewRepresentable {
             // centerlines: they may not claim a lane, mark another route's
             // flagship as shared, or win a trunk that would then be drawn
             // faded — or, for continuations, not drawn at all.
-            corridorGeometryByJourneyID = Dictionary(
-                uniqueKeysWithValues: parent.journeys.enumerated().map {
-                    index, journey in
-                    (
-                        journey.id,
-                        CorridorJourneyGeometry(
-                            stackOrder: index,
-                            routeNumber: journey.route.routeNumber
-                                ?? journey.route.shortName,
-                            agencyName: journey.route.agencyName,
-                            directionID: journey.directionID,
-                            observedDepartureCount: journey.observedDepartureCount,
-                            segmentIndex: CorridorSegmentIndex(
-                                segments: routeSegments(
-                                    for: journey.flagshipPolylines.map {
-                                        densifiedRouteCoordinates($0)
-                                    }
+            // Densify once and share the coordinates between the member
+            // index, the lane scheduler, and the layout pass below.
+            corridorGeometryByJourneyID = [:]
+            densifiedFlagshipCoordinatesByJourneyID = [:]
+            for (index, journey) in parent.journeys.enumerated() {
+                let densified = journey.flagshipPolylines
+                    .filter { $0.count >= 2 }
+                    .map { densifiedRouteCoordinates($0) }
+                densifiedFlagshipCoordinatesByJourneyID[journey.id] = densified
+
+                var indexedSegments: [MapRouteSegment] = []
+                var segmentLocations: [CorridorSegmentLocation] = []
+                for (polylineIndex, coordinates) in densified.enumerated() {
+                    guard coordinates.count >= 2 else { continue }
+                    for segmentIndex in 0..<(coordinates.count - 1) {
+                        if let segment = MapRouteSegment(
+                            start: MKMapPoint(coordinates[segmentIndex]),
+                            end: MKMapPoint(coordinates[segmentIndex + 1])
+                        ) {
+                            indexedSegments.append(segment)
+                            segmentLocations.append(
+                                CorridorSegmentLocation(
+                                    polylineIndex: polylineIndex,
+                                    segmentIndex: segmentIndex
                                 )
                             )
+                        }
+                    }
+                }
+
+                corridorGeometryByJourneyID[journey.id] =
+                    CorridorJourneyGeometry(
+                        stackOrder: index,
+                        routeNumber: journey.route.routeNumber
+                            ?? journey.route.shortName,
+                        agencyName: journey.route.agencyName,
+                        directionID: journey.directionID,
+                        observedDepartureCount: journey.observedDepartureCount,
+                        segmentIndex: CorridorSegmentIndex(
+                            segments: indexedSegments,
+                            locations: segmentLocations
                         )
                     )
-                }
-            )
+            }
+
+            // Anchored lanes: one global pass over every journey's flagship
+            // strands. A strand keeps the lane it was given when it entered
+            // a corridor for as long as it continues — the re-centring slide
+            // that made shared-street ribbons braid is gone.
+            recomputeCorridorLaneSchedule()
 
             laneLayoutsByJourneyID = [:]
             for journey in parent.journeys {
-                // Regular samples give branch merges enough geometry to fan
-                // over distance. Sparse GTFS vertices otherwise force an entire
-                // ribbon to change lane at one sharp point.
-                laneLayoutsByJourneyID[journey.id] = journey.flagshipPolylines
-                    .filter { $0.count >= 2 }
-                    .map {
-                        sharedCorridorLaneLayout(
-                            for: densifiedRouteCoordinates($0),
-                            journeyID: journey.id
+                let densified =
+                    densifiedFlagshipCoordinatesByJourneyID[journey.id] ?? []
+                laneLayoutsByJourneyID[journey.id] = densified.enumerated()
+                    .compactMap { polylineIndex, coordinates in
+                        guard coordinates.count >= 2 else { return nil }
+                        return sharedCorridorLaneLayout(
+                            for: coordinates,
+                            journeyID: journey.id,
+                            polylineIndex: polylineIndex
                         )
                     }
+            }
+        }
+
+        /// Export the lane state (see exportLaneDiagnostics) and present a
+        /// UIKit share sheet for the file, walked up from the map view. The
+        /// presentation is dispatched async: this runs inside updateUIView,
+        /// where presenting (or touching SwiftUI state) mid-update would be
+        /// dropped.
+        fileprivate func shareLaneDiagnostics(from mapView: MKMapView) {
+            guard let url = exportLaneDiagnostics() else { return }
+            DispatchQueue.main.async {
+                let share = UIActivityViewController(
+                    activityItems: [url],
+                    applicationActivities: nil
+                )
+                share.popoverPresentationController?.sourceView = mapView
+                var responder: UIResponder? = mapView
+                while let current = responder,
+                      !(current is UIViewController) {
+                    responder = current.next
+                }
+                guard let presenter = responder as? UIViewController else {
+                    return
+                }
+                presenter.present(share, animated: true)
+            }
+        }
+
+        /// Dump the corridor lane state to a JSON file for offline
+        /// diagnosis: per journey the densified flagship coordinates (the
+        /// scheduler's exact input), the anchored-lane schedule (offset,
+        /// spine direction, reference per strand segment), and the final
+        /// per-vertex layouts the renderer consumes. tools/replay/ingest.py
+        /// rebuilds and renders the same shapes, so a reported visual can be
+        /// reproduced numerically.
+        fileprivate func exportLaneDiagnostics() -> URL? {
+            ensureCorridorLaneLayouts()
+            var root: [String: Any] = [
+                "format": "waybound-lanes-v1",
+                "exportedAt": Date().timeIntervalSince1970,
+                "laneSpacingPoints": RouteMapStyle.laneSpacingPoints,
+                "selectedJourneyID": parent.selectedJourneyID ?? -1
+            ]
+            var journeys = [[String: Any]]()
+            for journey in parent.journeys {
+                guard let geometry = corridorGeometryByJourneyID[journey.id]
+                else { continue }
+                journeys.append([
+                    "id": journey.id,
+                    "routeNumber": geometry.routeNumber,
+                    "agency": geometry.agencyName,
+                    "directionID": geometry.directionID ?? -1,
+                    "stackOrder": geometry.stackOrder,
+                    "departures": geometry.observedDepartureCount,
+                    "polylines": (densifiedFlagshipCoordinatesByJourneyID[
+                        journey.id
+                    ] ?? []).map { polyline in
+                        polyline.map { [$0.latitude, $0.longitude] }
+                    }
+                ])
+            }
+            root["journeys"] = journeys
+
+            var schedule = [[String: Any]]()
+            for (key, entries) in corridorLaneSchedule {
+                schedule.append([
+                    "journeyID": key.journeyID,
+                    "polylineIndex": key.polylineIndex,
+                    "entries": entries
+                        .sorted { $0.key < $1.key }
+                        .map { index, sample in
+                            [index, sample.offset, sample.directionX,
+                             sample.directionY, sample.referenceID] as [Any]
+                        }
+                ])
+            }
+            root["schedule"] = schedule
+
+            var layouts = [[String: Any]]()
+            for (journeyID, laneLayouts) in laneLayoutsByJourneyID {
+                for (polylineIndex, layout) in laneLayouts.enumerated() {
+                    layouts.append([
+                        "journeyID": journeyID,
+                        "polylineIndex": polylineIndex,
+                        "offsets": layout.offsets,
+                        "shared": layout.sharedVertices.map { $0 ? 1 : 0 },
+                        "trunk": layout.trunkOwnerVertices.map { $0 ? 1 : 0 }
+                    ])
+                }
+            }
+            root["layouts"] = layouts
+
+            guard JSONSerialization.isValidJSONObject(root),
+                  let data = try? JSONSerialization.data(
+                      withJSONObject: root,
+                      options: [.sortedKeys]
+                  )
+            else { return nil }
+            let stamp = Int(Date().timeIntervalSince1970)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("waybound-lanes-\(stamp).json")
+            do {
+                try data.write(to: url)
+                return url
+            } catch {
+                return nil
             }
         }
 
@@ -1088,20 +1240,6 @@ struct WayboundMapView: UIViewRepresentable {
             }
         }
 
-        private func routeSegments(
-            for polylines: [[CLLocationCoordinate2D]]
-        ) -> [MapRouteSegment] {
-            polylines.flatMap { polyline -> [MapRouteSegment] in
-                guard polyline.count >= 2 else { return [] }
-                return (0..<(polyline.count - 1)).compactMap { index in
-                    MapRouteSegment(
-                        start: MKMapPoint(polyline[index]),
-                        end: MKMapPoint(polyline[index + 1])
-                    )
-                }
-            }
-        }
-
         private func densifiedRouteCoordinates(
             _ coordinates: [CLLocationCoordinate2D]
         ) -> [CLLocationCoordinate2D] {
@@ -1142,9 +1280,988 @@ struct WayboundMapView: UIViewRepresentable {
         /// sharing one road first align to a single local corridor spine and then
         /// receive consecutive screen-space lanes. This produces one compact ribbon
         /// instead of several almost-parallel shapes drifting across the road.
+        // MARK: - Anchored lane scheduling
+        //
+        // Mirrors tools/replay/lanesched.py (the executable spec). One pass
+        // per connected group of shared runs ("corridor"): a strand's lane is
+        // chosen once, when it enters the corridor, and is held while it
+        // continues; joiners enter at the outer edge of their approach side;
+        // leavers keep their lane and peel away; freed slots are remembered so
+        // a dropout-and-return reclaims its own lane; corridor-birth order is
+        // exit-aware (first strand to peel off on a side sits outermost there,
+        // which minimises fork crossings); opposite travel directions stay on
+        // opposite sides of the centreline. The schedule stores, per strand
+        // segment, the lane offset expressed against the sweeping spine's
+        // travel direction plus the sticky reference journey; observers
+        // convert into their own frame against their held direction chain —
+        // the same reversal hold stableRouteOffsetPoints applies.
+
+        private enum CorridorLaneScheduling {
+            static let laneSpacing = RouteMapStyle.laneSpacingPoints
+            static let joinMinimum: Double = 30
+            static let gapBridge: Double = 150
+            static let gapChordRatio: Double = 0.75
+            static let sideLookahead: Double = 45
+            static let centreClearance = laneSpacing / 4
+            static let slotClearance = 0.6 * laneSpacing
+        }
+
+        private struct CorridorStrandKey: Hashable {
+            let journeyID: Int
+            let polylineIndex: Int
+        }
+
+        private struct CorridorSegmentLocation: Equatable {
+            let polylineIndex: Int
+            let segmentIndex: Int
+        }
+
+        private struct CorridorScheduledLaneSample {
+            let offset: Double
+            let directionX: Double
+            let directionY: Double
+            let referenceID: Int
+        }
+
+        private struct CorridorSchedStrand {
+            let key: CorridorStrandKey
+            let points: [MKMapPoint]
+            let segments: [MapRouteSegment?]
+            let arc: [Double]
+            let metersPerMapPoint: Double
+        }
+
+        private struct CorridorMemberMatch {
+            let segment: MapRouteSegment
+            let location: CorridorSegmentLocation
+        }
+
+        private struct CorridorLaneRun {
+            let strand: CorridorStrandKey
+            let start: Int
+            let end: Int
+        }
+
+        private func corridorPublicRouteKey(for journeyID: Int) -> String {
+            guard let geometry = corridorGeometryByJourneyID[journeyID] else {
+                return "id:\(journeyID)"
+            }
+            return "\(geometry.agencyName)|\(geometry.routeNumber)"
+        }
+
+        /// Rebuild the anchored-lane schedule and the held-direction chains
+        /// from the current densified flagship strands. Called only inside
+        /// the corridor-content signature gate.
+        private func recomputeCorridorLaneSchedule() {
+            var strands: [CorridorStrandKey: CorridorSchedStrand] = [:]
+            var held: [CorridorStrandKey: [(x: Double, y: Double)]] = [:]
+
+            for journeyID in densifiedFlagshipCoordinatesByJourneyID.keys {
+                guard let densified =
+                    densifiedFlagshipCoordinatesByJourneyID[journeyID]
+                else { continue }
+                for (polylineIndex, coordinates) in densified.enumerated() {
+                    guard coordinates.count >= 2 else { continue }
+                    let points = coordinates.map { MKMapPoint($0) }
+                    let metersPerMapPoint = TripPathGeometry
+                        .metersPerMapPoint(atLatitude: coordinates[0].latitude)
+                    var segments: [MapRouteSegment?] = []
+                    var arc: [Double] = [0]
+                    for index in 0..<(points.count - 1) {
+                        segments.append(
+                            MapRouteSegment(
+                                start: points[index],
+                                end: points[index + 1]
+                            )
+                        )
+                        arc.append(
+                            arc[index]
+                                + points[index].distance(to: points[index + 1])
+                                    * metersPerMapPoint
+                        )
+                    }
+                    let key = CorridorStrandKey(
+                        journeyID: journeyID,
+                        polylineIndex: polylineIndex
+                    )
+                    strands[key] = CorridorSchedStrand(
+                        key: key,
+                        points: points,
+                        segments: segments,
+                        arc: arc,
+                        metersPerMapPoint: metersPerMapPoint
+                    )
+
+                    var directions: [(x: Double, y: Double)] = []
+                    var previous: (x: Double, y: Double)?
+                    for segment in segments {
+                        if let segment {
+                            var unitX = segment.unitX
+                            var unitY = segment.unitY
+                            if let previous,
+                               unitX * previous.x + unitY * previous.y < -0.8 {
+                                unitX = -unitX
+                                unitY = -unitY
+                            }
+                            directions.append((unitX, unitY))
+                            previous = (unitX, unitY)
+                        } else {
+                            directions.append(previous ?? (x: 1, y: 0))
+                        }
+                    }
+                    held[key] = directions
+                }
+            }
+
+            heldUnitDirectionsByStrand = held
+            corridorLaneSchedule = buildCorridorLaneSchedule(strands)
+        }
+
+        private func buildCorridorLaneSchedule(
+            _ strands: [CorridorStrandKey: CorridorSchedStrand]
+        ) -> [CorridorStrandKey: [Int: CorridorScheduledLaneSample]] {
+            guard !strands.isEmpty else { return [:] }
+            let scan = corridorMembershipScan(strands)
+            var schedule:
+                [CorridorStrandKey: [Int: CorridorScheduledLaneSample]] = [:]
+
+            // Runs: maximal sharing stretches per strand, >= 30 m.
+            var runs: [CorridorLaneRun] = []
+            for (key, strand) in strands.sorted(by: {
+                ($0.key.journeyID, $0.key.polylineIndex)
+                    < ($1.key.journeyID, $1.key.polylineIndex)
+            }) {
+                let rows = scan[key] ?? []
+                var index = 0
+                while index < rows.count {
+                    if rows[index].isEmpty {
+                        index += 1
+                        continue
+                    }
+                    var end = index + 1
+                    while end < rows.count && !rows[end].isEmpty {
+                        end += 1
+                    }
+                    if strand.arc[end] - strand.arc[index]
+                        >= CorridorLaneScheduling.joinMinimum {
+                        runs.append(
+                            CorridorLaneRun(strand: key, start: index, end: end)
+                        )
+                    }
+                    index = end
+                }
+            }
+
+            // Corridor groups: union runs whose journeys share members.
+            var parent = Array(runs.indices)
+            func find(_ x: Int) -> Int {
+                var root = x
+                while parent[root] != root {
+                    parent[root] = parent[parent[root]]
+                    root = parent[root]
+                }
+                return root
+            }
+            var runsByJourney: [Int: [Int]] = [:]
+            for (index, run) in runs.enumerated() {
+                runsByJourney[run.strand.journeyID, default: []].append(index)
+            }
+            for (index, run) in runs.enumerated() {
+                let key = run.strand
+                let rows = scan[key] ?? []
+                var members = Set<Int>()
+                for si in run.start..<run.end {
+                    members.formUnion(rows[si].keys)
+                }
+                members.insert(key.journeyID)
+                for memberID in members {
+                    for otherIndex in runsByJourney[memberID] ?? [] {
+                        let rootA = find(index)
+                        let rootB = find(otherIndex)
+                        if rootA != rootB {
+                            parent[rootA] = rootB
+                        }
+                    }
+                }
+            }
+            var groups: [Int: [Int]] = [:]
+            for index in runs.indices {
+                groups[find(index), default: []].append(index)
+            }
+
+            // Longest corridors first, longest runs first inside a corridor.
+            for (_, runIndices) in groups.sorted(by: {
+                if $0.value.count != $1.value.count {
+                    return $0.value.count > $1.value.count
+                }
+                return $0.key < $1.key
+            }) {
+                let ordered = runIndices.sorted(by: {
+                    let firstLength = runLength(runs[$0], strands: strands)
+                    let secondLength = runLength(runs[$1], strands: strands)
+                    if firstLength != secondLength {
+                        return firstLength > secondLength
+                    }
+                    return $0 < $1
+                })
+                var memory: [String: Double] = [:]
+                for runIndex in ordered {
+                    let outcome = sweepCorridorRun(
+                        runs[runIndex],
+                        strands: strands,
+                        scan: scan,
+                        schedule: schedule,
+                        memory: memory
+                    )
+                    schedule = outcome.schedule
+                    memory = outcome.memory
+                }
+            }
+
+            postFillSchedule(strands, scan, &schedule)
+            return schedule
+        }
+
+        private func runLength(
+            _ run: CorridorLaneRun,
+            strands: [CorridorStrandKey: CorridorSchedStrand]
+        ) -> Double {
+            guard let strand = strands[run.strand] else { return 0 }
+            return strand.arc[run.end] - strand.arc[run.start]
+        }
+
+        /// Per strand, per segment: {other journey: matched segment} — the
+        /// same midpoint-plus-endpoints parallel test the layout pass uses.
+        private func corridorMembershipScan(
+            _ strands: [CorridorStrandKey: CorridorSchedStrand]
+        ) -> [CorridorStrandKey: [[Int: CorridorMemberMatch]]] {
+            var scan: [CorridorStrandKey: [[Int: CorridorMemberMatch]]] = [:]
+            for (key, strand) in strands {
+                var rows: [[Int: CorridorMemberMatch]] = []
+                rows.reserveCapacity(strand.segments.count)
+                for segment in strand.segments {
+                    guard let segment else {
+                        rows.append([:])
+                        continue
+                    }
+                    let midpoint = MKMapPoint(
+                        x: (segment.start.x + segment.end.x) / 2,
+                        y: (segment.start.y + segment.end.y) / 2
+                    )
+                    var members: [Int: CorridorMemberMatch] = [:]
+                    for (candidateID, geometry) in corridorGeometryByJourneyID
+                    where candidateID != key.journeyID {
+                        guard let member = geometry.segmentIndex.parallelMember(
+                            near: midpoint,
+                            direction: segment,
+                            metersPerMapPoint: strand.metersPerMapPoint
+                        ),
+                            hasParallelCorridor(
+                                near: segment.start,
+                                direction: segment,
+                                among: geometry.segmentIndex.segments(
+                                    near: segment.start
+                                ),
+                                metersPerMapPoint: strand.metersPerMapPoint
+                            ),
+                            hasParallelCorridor(
+                                near: segment.end,
+                                direction: segment,
+                                among: geometry.segmentIndex.segments(
+                                    near: segment.end
+                                ),
+                                metersPerMapPoint: strand.metersPerMapPoint
+                            )
+                        else { continue }
+                        members[candidateID] = CorridorMemberMatch(
+                            segment: member.segment,
+                            location: member.location
+                        )
+                    }
+                    rows.append(members)
+                }
+                scan[key] = rows
+            }
+            return scan
+        }
+
+        private func sweepCorridorRun(
+            _ run: CorridorLaneRun,
+            strands: [CorridorStrandKey: CorridorSchedStrand],
+            scan: [CorridorStrandKey: [[Int: CorridorMemberMatch]]],
+            schedule: [CorridorStrandKey: [Int: CorridorScheduledLaneSample]],
+            memory: [String: Double]
+        ) -> (schedule: [CorridorStrandKey: [Int: CorridorScheduledLaneSample]],
+              memory: [String: Double]) {
+            let key = run.strand
+            guard let strand = strands[key] else {
+                return (schedule, memory)
+            }
+            let rows = scan[key] ?? []
+            let s0 = run.start
+            let s1 = run.end
+            var schedule = schedule
+            var memory = memory
+
+            // Presence stretches of every member over this sweep, debounced.
+            var presence: [Int: [(Int, Int)]] = [
+                key.journeyID: [(s0, s1)]
+            ]
+            var memberIDs = Set<Int>()
+            for si in s0..<s1 {
+                guard si < rows.count else { break }
+                memberIDs.formUnion(rows[si].keys)
+            }
+            for cid in memberIDs.sorted() {
+                let stretches = debouncedPresence(
+                    rows, from: s0, to: s1, member: cid, arc: strand.arc
+                )
+                if !stretches.isEmpty {
+                    presence[cid] = stretches
+                }
+            }
+
+            func segmentDirection(at si: Int) -> (Double, Double) {
+                if si >= 0 && si < strand.segments.count,
+                   let segment = strand.segments[si] {
+                    return (segment.unitX, segment.unitY)
+                }
+                let fallbackIndex = max(s0, si - 1)
+                if fallbackIndex >= 0 && fallbackIndex < strand.segments.count,
+                   let fallback = strand.segments[fallbackIndex] {
+                    return (fallback.unitX, fallback.unitY)
+                }
+                return (x: 1, y: 0)
+            }
+
+            func matched(_ cid: Int, _ si: Int) -> CorridorMemberMatch? {
+                guard si >= 0 && si < rows.count else { return nil }
+                return rows[si][cid]
+            }
+
+            func ownLocation(_ cid: Int, _ si: Int) -> CorridorSegmentLocation? {
+                matched(cid, si)?.location
+            }
+
+            func nearestOwnLocation(
+                _ cid: Int,
+                _ si: Int
+            ) -> CorridorSegmentLocation? {
+                var best: (distance: Int, probe: Int)?
+                for probe in max(s0, si - 24)..<min(s1, si + 24) {
+                    guard matched(cid, probe) != nil else { continue }
+                    let distance = abs(probe - si)
+                    if best == nil || distance < best!.distance {
+                        best = (distance, probe)
+                    }
+                }
+                guard let best else { return nil }
+                return ownLocation(cid, best.probe)
+            }
+
+            func memberStrand(
+                _ location: CorridorSegmentLocation,
+                _ cid: Int
+            ) -> CorridorSchedStrand? {
+                strands[
+                    CorridorStrandKey(
+                        journeyID: cid,
+                        polylineIndex: location.polylineIndex
+                    )
+                ]
+            }
+
+            func sideSign(
+                of point: MKMapPoint,
+                from origin: MKMapPoint,
+                direction: (Double, Double)
+            ) -> Int? {
+                let leftX = -direction.1
+                let leftY = direction.0
+                let side = (point.x - origin.x) * leftX
+                    + (point.y - origin.y) * leftY
+                if abs(side) * strand.metersPerMapPoint < 2 {
+                    return nil
+                }
+                return side > 0 ? 1 : -1
+            }
+
+            func joinSide(_ cid: Int, _ si: Int) -> Int? {
+                guard let location = ownLocation(cid, si),
+                      location.segmentIndex > 0,
+                      let member = memberStrand(location, cid)
+                else { return nil }
+                var back = location.segmentIndex
+                var travelled = 0.0
+                while back > 0 && travelled < CorridorLaneScheduling
+                    .sideLookahead {
+                    travelled += member.points[back - 1]
+                        .distance(to: member.points[back])
+                        * strand.metersPerMapPoint
+                    back -= 1
+                }
+                guard si > 0 || strand.segments[si] != nil else { return nil }
+                let segment = strand.segments[si] ?? strand.segments[si - 1]
+                guard let segment else { return nil }
+                return sideSign(
+                    of: member.points[back],
+                    from: segment.start,
+                    direction: segmentDirection(at: si)
+                )
+            }
+
+            func exitSide(_ cid: Int, _ outSi: Int) -> Int? {
+                var probe: Int?
+                var match: CorridorMemberMatch?
+                var index = min(outSi, s1 - 1)
+                while index >= s0 {
+                    if let candidate = matched(cid, index) {
+                        match = candidate
+                        probe = index
+                        break
+                    }
+                    index -= 1
+                }
+                guard let match, let probe else { return nil }
+                guard let member = memberStrand(match.location, cid),
+                      match.location.segmentIndex < member.points.count - 1
+                else { return nil }
+                var forward = match.location.segmentIndex
+                var travelled = 0.0
+                while forward < member.points.count - 1
+                        && travelled < CorridorLaneScheduling.sideLookahead {
+                    travelled += member.points[forward]
+                        .distance(to: member.points[forward + 1])
+                        * strand.metersPerMapPoint
+                    forward += 1
+                }
+                guard let segment = strand.segments[probe] else { return nil }
+                return sideSign(
+                    of: member.points[forward],
+                    from: segment.start,
+                    direction: segmentDirection(at: probe)
+                )
+            }
+
+            func groupSign(_ cid: Int, _ si: Int) -> Int {
+                guard let location = ownLocation(cid, si),
+                      let member = memberStrand(location, cid),
+                      let segment = member.segments[
+                          min(location.segmentIndex,
+                              member.segments.count - 1)
+                      ]
+                else { return 1 }
+                let direction = segmentDirection(at: si)
+                let dot = segment.unitX * direction.0
+                    + segment.unitY * direction.1
+                return dot >= 0 ? 1 : -1
+            }
+
+            // Sweep state.
+            var slots: [String: Double] = [:]
+            var slotGroups: [String: Int] = [:]
+            var stickyReferenceID: Int?
+
+            func presentJourneys(_ si: Int) -> [Int] {
+                presence.keys
+                    .filter { cid in
+                        (presence[cid] ?? []).contains {
+                            $0.0 <= si && si < $0.1
+                        }
+                    }
+                    .sorted(by: corridorLaneComesBefore)
+            }
+
+            func presentKeys(_ si: Int) -> [String] {
+                var seen = Set<String>()
+                var keys: [String] = []
+                for cid in presentJourneys(si) {
+                    let key = corridorPublicRouteKey(for: cid)
+                    if seen.insert(key).inserted {
+                        keys.append(key)
+                    }
+                }
+                return keys
+            }
+
+            func occupied() -> [Double] {
+                Array(slots.values)
+            }
+
+            func freeSlot(_ candidate: Double, step: Double) -> Double {
+                var slot = candidate
+                while occupied().contains(where: { taken in
+                    abs(slot - taken) < CorridorLaneScheduling.slotClearance
+                }) {
+                    slot += step
+                }
+                return slot
+            }
+
+            func crossesCentre(_ candidate: Double, gsign: Int) -> Bool {
+                guard slotGroups.values.contains(-gsign) else { return false }
+                return candidate * Double(gsign)
+                    < CorridorLaneScheduling.centreClearance
+            }
+
+            func groupOffsets(_ gsign: Int) -> [Double] {
+                slots.filter { slotGroups[$0.key] == gsign }.map(\.value)
+            }
+
+            func outermost(_ offsets: [Double], outward: Int) -> Double {
+                outward > 0 ? offsets.max() ?? 0 : offsets.min() ?? 0
+            }
+
+            func innermost(_ offsets: [Double], outward: Int) -> Double {
+                outward > 0 ? offsets.min() ?? 0 : offsets.max() ?? 0
+            }
+
+            func numericRank(_ present: [Int], _ cid: Int) -> Int {
+                var rank = 0
+                for other in present where other != cid {
+                    guard slots[corridorPublicRouteKey(for: other)] == nil
+                    else { continue }
+                    if corridorLaneComesBefore(other, cid) {
+                        rank += 1
+                    }
+                }
+                return rank
+            }
+
+            func place(_ cid: Int, side: Int?, gsign: Int, rank: Int) -> Double {
+                let offsets = groupOffsets(gsign)
+                let outward = gsign >= 0 ? 1 : -1
+                if offsets.isEmpty {
+                    let firstSlot = CorridorLaneScheduling.laneSpacing / 2
+                        * Double(gsign)
+                    if occupied().allSatisfy({ abs(firstSlot - $0)
+                        >= CorridorLaneScheduling.slotClearance }) {
+                        return firstSlot
+                    }
+                    return freeSlot(
+                        firstSlot,
+                        step: CorridorLaneScheduling.laneSpacing / 2
+                            * Double(outward)
+                    )
+                }
+                if side == nil {
+                    let ordered = offsets.sorted()
+                    let target: Double
+                    if rank >= ordered.count {
+                        target = outermost(offsets, outward: outward)
+                            + CorridorLaneScheduling.laneSpacing * Double(outward)
+                    } else if outward > 0 {
+                        target = ordered[rank]
+                    } else {
+                        target = ordered.reversed()[rank]
+                    }
+                    if occupied().allSatisfy({ abs(target - $0)
+                        >= CorridorLaneScheduling.slotClearance }) {
+                        return target
+                    }
+                    return freeSlot(
+                        target,
+                        step: CorridorLaneScheduling.laneSpacing / 2
+                            * Double(outward)
+                    )
+                }
+                if side == outward {
+                    let base = outermost(offsets, outward: outward)
+                        + CorridorLaneScheduling.laneSpacing * Double(outward)
+                    return freeSlot(
+                        base,
+                        step: CorridorLaneScheduling.laneSpacing / 2
+                            * Double(outward)
+                    )
+                }
+                let innerBase = innermost(offsets, outward: outward)
+                    - CorridorLaneScheduling.laneSpacing * Double(outward)
+                if !crossesCentre(innerBase, gsign: gsign) {
+                    let candidate = freeSlot(
+                        innerBase,
+                        step: -CorridorLaneScheduling.laneSpacing / 2
+                            * Double(outward)
+                    )
+                    if !crossesCentre(candidate, gsign: gsign) {
+                        return candidate
+                    }
+                }
+                let outerBase = outermost(offsets, outward: outward)
+                    + CorridorLaneScheduling.laneSpacing * Double(outward)
+                return freeSlot(
+                    outerBase,
+                    step: CorridorLaneScheduling.laneSpacing / 2
+                        * Double(outward)
+                )
+            }
+
+            func nearestScheduledSample(
+                _ cid: Int,
+                _ location: CorridorSegmentLocation
+            ) -> CorridorScheduledLaneSample? {
+                let memberKey = CorridorStrandKey(
+                    journeyID: cid,
+                    polylineIndex: location.polylineIndex
+                )
+                let entries = schedule[memberKey] ?? [:]
+                let si = location.segmentIndex
+                for delta in 0..<12 {
+                    for probe in [si - delta, si + delta] where probe >= 0 {
+                        if let sample = entries[probe] {
+                            return sample
+                        }
+                    }
+                }
+                return nil
+            }
+
+            func adoptExisting(_ si: Int) {
+                for cid in presentJourneys(si) {
+                    let slotKey = corridorPublicRouteKey(for: cid)
+                    guard slots[slotKey] == nil else { continue }
+                    let own: CorridorSegmentLocation
+                    if cid == key.journeyID {
+                        own = CorridorSegmentLocation(
+                            polylineIndex: key.polylineIndex,
+                            segmentIndex: si
+                        )
+                    } else {
+                        guard let location = ownLocation(cid, si)
+                            ?? nearestOwnLocation(cid, si)
+                        else { continue }
+                        own = location
+                    }
+                    guard let sample = nearestScheduledSample(cid, own)
+                    else { continue }
+                    let direction = segmentDirection(at: si)
+                    let sign: Double = sample.directionX * direction.0
+                        + sample.directionY * direction.1 >= 0 ? 1 : -1
+                    slots[slotKey] = sample.offset * sign
+                    slotGroups[slotKey] = groupSign(cid, si)
+                }
+            }
+
+            func exitAwareSide(
+                for cid: Int,
+                at si: Int
+            ) -> Int? {
+                if let side = joinSide(cid, si) {
+                    return side
+                }
+                // A strand born on the corridor (trip start / boarding stop)
+                // appears in place, so any free slot is crossing free: prefer
+                // the side it will peel off toward, so a fork's strands sit
+                // adjacent, subway-style. Includes presence that runs to the
+                // sweep end: the spine's last partner peels there too.
+                let outSi = presence[cid]?
+                    .first { $0.0 <= si && si < $0.1 }?.1 ?? s1
+                return exitSide(cid, min(outSi, s1))
+            }
+
+            func birth(_ si: Int) {
+                if !slots.isEmpty {
+                    // Chained sweep start where earlier lanes exist.
+                    for cid in presentJourneys(si) {
+                        let key = corridorPublicRouteKey(for: cid)
+                        guard slots[key] == nil else { continue }
+                        let gsign = groupSign(cid, si)
+                        slotGroups[key] = gsign
+                        let rank = numericRank(presentJourneys(si), cid)
+                        let side = exitAwareSide(for: cid, at: si)
+                        slots[key] = place(
+                            cid,
+                            side: side,
+                            gsign: gsign,
+                            rank: rank
+                        )
+                    }
+                    return
+                }
+                struct CohortMember {
+                    let journeyID: Int
+                    let key: String
+                    let gsign: Int
+                    let outSi: Int
+                    let side: Int?
+                }
+                var cohort: [CohortMember] = []
+                for cid in presentJourneys(si) {
+                    let key = corridorPublicRouteKey(for: cid)
+                    guard slots[key] == nil else { continue }
+                    let gsign = groupSign(cid, si)
+                    let outSi = presence[cid]?
+                        .first { $0.0 <= si && si < $0.1 }?.1
+                        ?? s1
+                    // Presence running to the sweep end usually means this
+                    // strand is the spine's last partner: the run ended
+                    // because it left. exitSide walks the strand's own
+                    // continuation past its last match, so calling it at the
+                    // run end still tells peel-off (a side) from a true
+                    // stayer that carries on along the street (nil).
+                    let side = exitSide(cid, min(outSi, s1))
+                    cohort.append(
+                        CohortMember(
+                            journeyID: cid,
+                            key: key,
+                            gsign: gsign,
+                            outSi: outSi,
+                            side: side
+                        )
+                    )
+                    slotGroups[key] = gsign
+                }
+                let withGroup = cohort.filter { $0.gsign >= 0 }
+                let against = cohort.filter { $0.gsign < 0 }
+                let both = !withGroup.isEmpty && !against.isEmpty
+
+                func ordered(
+                    _ group: [CohortMember],
+                    sign: Int
+                ) -> [CohortMember] {
+                    let leavingLeft = group
+                        .filter { $0.side == 1 }
+                        .sorted { $0.outSi < $1.outSi }
+                    let leavingRight = group
+                        .filter { $0.side == -1 }
+                        .sorted { $0.outSi < $1.outSi }
+                    let staying = group
+                        .filter { $0.side == nil }
+                        .sorted { corridorLaneComesBefore($0.journeyID, $1.journeyID) }
+                    return sign >= 0
+                        ? leavingRight + staying + leavingLeft.reversed()
+                        : leavingLeft + staying + leavingRight.reversed()
+                }
+
+                for (group, sign) in [(withGroup, 1), (against, -1)] {
+                    let sequence = ordered(group, sign: sign)
+                    guard !sequence.isEmpty else { continue }
+                    if !both {
+                        let count = sequence.count
+                        for (index, member) in sequence.enumerated() {
+                            slots[member.key] =
+                                (Double(index) - Double(count - 1) / 2)
+                                    * CorridorLaneScheduling.laneSpacing
+                                    * (sign >= 0 ? 1 : -1)
+                        }
+                        continue
+                    }
+                    var slot = CorridorLaneScheduling.laneSpacing / 2
+                        * Double(sign)
+                    for member in sequence {
+                        slots[member.key] = slot
+                        slot += CorridorLaneScheduling.laneSpacing
+                            * Double(sign)
+                    }
+                }
+            }
+
+            func record(_ bstart: Int, _ bend: Int, _ siRef: Int) {
+                let present = presentJourneys(siRef)
+                let referenceKeys = Set(
+                    present.map { corridorPublicRouteKey(for: $0) }
+                )
+                if let current = stickyReferenceID,
+                   referenceKeys.contains(
+                       corridorPublicRouteKey(for: current)
+                   ) {
+                    stickyReferenceID = current
+                } else {
+                    stickyReferenceID = present.first
+                }
+                guard let referenceID = stickyReferenceID else { return }
+                for si in bstart..<bend {
+                    let direction = segmentDirection(at: si)
+                    let spineKey = corridorPublicRouteKey(for: key.journeyID)
+                    if let spineSlot = slots[spineKey],
+                       schedule[key]?[si] == nil {
+                        schedule[key, default: [:]][si] =
+                            CorridorScheduledLaneSample(
+                                offset: spineSlot,
+                                directionX: direction.0,
+                                directionY: direction.1,
+                                referenceID: referenceID
+                            )
+                    }
+                    for cid in present {
+                        guard let offset = slots[
+                            corridorPublicRouteKey(for: cid)
+                        ] else { continue }
+                        guard let location = ownLocation(cid, si)
+                        else { continue }
+                        let memberKey = CorridorStrandKey(
+                            journeyID: cid,
+                            polylineIndex: location.polylineIndex
+                        )
+                        guard schedule[memberKey]?[location.segmentIndex]
+                            == nil else { continue }
+                        schedule[memberKey, default: [:]][location.segmentIndex] =
+                            CorridorScheduledLaneSample(
+                                offset: offset,
+                                directionX: direction.0,
+                                directionY: direction.1,
+                                referenceID: referenceID
+                            )
+                    }
+                }
+            }
+
+            // Event bounds: run ends plus every presence stretch edge.
+            var bounds = Set([s0, s1])
+            for stretches in presence.values {
+                for (start, end) in stretches {
+                    if s0 <= start && start <= s1 {
+                        bounds.insert(start)
+                    }
+                    if s0 <= end && end <= s1 {
+                        bounds.insert(end)
+                    }
+                }
+            }
+            let orderedBounds = bounds.sorted()
+
+            var previous: Int?
+            for index in 0..<(orderedBounds.count - 1) {
+                let bstart = orderedBounds[index]
+                let bend = orderedBounds[index + 1]
+                guard bend > bstart else { continue }
+                let si = bstart
+                adoptExisting(si)
+                if previous == nil {
+                    birth(si)
+                } else {
+                    let before = presentKeys(previous!)
+                    let after = presentKeys(si)
+                    for key in before
+                    where !after.contains(key) && slots[key] != nil {
+                        memory[key] = slots.removeValue(forKey: key)
+                        slotGroups.removeValue(forKey: key)
+                    }
+                    for cid in presentJourneys(si) {
+                        let key = corridorPublicRouteKey(for: cid)
+                        guard slots[key] == nil else { continue }
+                        slotGroups[key] = groupSign(cid, si)
+                        if let remembered = memory[key],
+                           occupied().allSatisfy({ abs(remembered - $0)
+                               >= CorridorLaneScheduling.slotClearance }) {
+                            slots[key] = remembered
+                            continue
+                        }
+                        let rank = numericRank(presentJourneys(si), cid)
+                        let side = exitAwareSide(for: cid, at: si)
+                        slots[key] = place(
+                            cid,
+                            side: side,
+                            gsign: slotGroups[key] ?? 1,
+                            rank: rank
+                        )
+                    }
+                }
+                record(bstart, bend, si)
+                previous = si
+            }
+
+            return (schedule, memory)
+        }
+
+        /// Presence stretches of one member over a sweep: dropouts up to
+        /// `gapBridge` merge, stretches under `joinMinimum` drop.
+        private func debouncedPresence(
+            _ rows: [[Int: CorridorMemberMatch]],
+            from s0: Int,
+            to s1: Int,
+            member cid: Int,
+            arc: [Double]
+        ) -> [(Int, Int)] {
+            var stretches: [(Int, Int)] = []
+            var index = s0
+            while index < s1 && index < rows.count {
+                if rows[index][cid] != nil {
+                    var end = index + 1
+                    while end < s1 && end < rows.count
+                            && rows[end][cid] != nil {
+                        end += 1
+                    }
+                    stretches.append((index, end))
+                    index = end
+                } else {
+                    index += 1
+                }
+            }
+            guard !stretches.isEmpty else { return [] }
+            var bridged = [stretches[0]]
+            for stretch in stretches.dropFirst() {
+                let previousEnd = bridged[bridged.count - 1].1
+                if arc[stretch.0] - arc[previousEnd]
+                    <= CorridorLaneScheduling.gapBridge {
+                    bridged[bridged.count - 1].1 =
+                        max(previousEnd, stretch.1)
+                } else {
+                    bridged.append(stretch)
+                }
+            }
+            return bridged.filter {
+                arc[$0.1] - arc[$0.0]
+                    >= CorridorLaneScheduling.joinMinimum
+            }
+        }
+
+        /// Hold a lane through short schedule dropouts inside a strand's
+        /// shared run (same distance and straightness gates as the gap
+        /// bridge downstream), but only when both anchors agree.
+        private func postFillSchedule(
+            _ strands: [CorridorStrandKey: CorridorSchedStrand],
+            _ scan: [CorridorStrandKey: [[Int: CorridorMemberMatch]]],
+            _ schedule: inout [CorridorStrandKey: [Int: CorridorScheduledLaneSample]]
+        ) {
+            for (key, strand) in strands.sorted(by: {
+                ($0.key.journeyID, $0.key.polylineIndex)
+                    < ($1.key.journeyID, $1.key.polylineIndex)
+            }) {
+                let rows = scan[key] ?? []
+                var index = 0
+                while index < rows.count {
+                    if rows[index].isEmpty {
+                        index += 1
+                        continue
+                    }
+                    var end = index + 1
+                    while end < rows.count && !rows[end].isEmpty {
+                        end += 1
+                    }
+                    let entries = schedule[key] ?? [:]
+                    let assigned = (index..<end).filter { entries[$0] != nil }
+                    if let first = assigned.first, let last = assigned.last,
+                       first < last {
+                        for slot in (first + 1)..<last {
+                            guard entries[slot] == nil else { continue }
+                            let left = assigned.filter { $0 < slot }.max()!
+                            let right = assigned.filter { $0 > slot }.min()!
+                            guard let before = entries[left],
+                                  let after = entries[right]
+                            else { continue }
+                            guard abs(before.offset - after.offset) < 0.0005,
+                                  before.referenceID == after.referenceID
+                            else { continue }
+                            let path = strand.arc[slot] - strand.arc[left]
+                            let chord = strand.points[left]
+                                .distance(to: strand.points[slot])
+                                    * strand.metersPerMapPoint
+                            if path <= CorridorLaneScheduling.gapBridge,
+                               chord >= CorridorLaneScheduling.gapChordRatio
+                                    * max(path, 1e-6) {
+                                schedule[key, default: [:]][slot] = before
+                            }
+                        }
+                    }
+                    index = end
+                }
+            }
+        }
+
         private func sharedCorridorLaneLayout(
             for coordinates: [CLLocationCoordinate2D],
-            journeyID: Int
+            journeyID: Int,
+            polylineIndex: Int
         ) -> CorridorLaneLayout {
             guard coordinates.count >= 2 else {
                 return CorridorLaneLayout(
@@ -1181,6 +2298,8 @@ struct WayboundMapView: UIViewRepresentable {
                     sharedCorridorSegmentLayout(
                         for: segment,
                         journeyID: journeyID,
+                        polylineIndex: polylineIndex,
+                        segmentIndex: index,
                         metersPerMapPoint: metersPerMapPoint
                     )
                 )
@@ -1671,6 +2790,8 @@ struct WayboundMapView: UIViewRepresentable {
         private func sharedCorridorSegmentLayout(
             for segment: MapRouteSegment,
             journeyID: Int,
+            polylineIndex: Int,
+            segmentIndex: Int,
             metersPerMapPoint: Double
         ) -> CorridorSegmentLayout? {
             let midpoint = MKMapPoint(
@@ -1716,7 +2837,6 @@ struct WayboundMapView: UIViewRepresentable {
             let memberIDs = localSegmentByJourneyID.keys.sorted(
                 by: corridorLaneComesBefore
             )
-
             // Both directions of one numbered route are one visual strand.
             func publicRouteKey(for memberID: Int) -> String {
                 guard let geometry = corridorGeometryByJourneyID[memberID] else {
@@ -1724,19 +2844,6 @@ struct WayboundMapView: UIViewRepresentable {
                 }
                 return "\(geometry.agencyName)|\(geometry.routeNumber)"
             }
-            var claimedRouteKeys: Set<String> = []
-            let laneMemberIDs = memberIDs.filter {
-                claimedRouteKeys.insert(publicRouteKey(for: $0)).inserted
-            }
-            // Both directions of one numbered route are one visual strand: a
-            // direction whose sibling already claimed the public-route lane
-            // rides that same lane. Without this, the second direction fell
-            // out of the corridor entirely and drew its own unaligned strand
-            // beside the ribbon — the doubled, wandering line that made
-            // shared-street routes look broken.
-            let laneJourneyID = laneMemberIDs.first {
-                publicRouteKey(for: $0) == publicRouteKey(for: journeyID)
-            } ?? journeyID
             let dominanceCandidates: [Int]
             if let selectedID = parent.selectedJourneyID,
                memberIDs.contains(selectedID) {
@@ -1764,59 +2871,48 @@ struct WayboundMapView: UIViewRepresentable {
                 if firstOrder != secondOrder { return firstOrder < secondOrder }
                 return firstID < secondID
             }) else { return nil }
-            guard let referenceID = memberIDs.first,
-                  let referenceSegment = localSegmentByJourneyID[referenceID]
+
+            // Anchored lane: this segment's lane comes from the global
+            // schedule, chosen once when the strand entered this corridor and
+            // held while it continues. The previously re-derived stack slid
+            // every continuing strand by half a lane at each join or leave —
+            // the braiding defect this replaces.
+            let strandKey = CorridorStrandKey(
+                journeyID: journeyID,
+                polylineIndex: polylineIndex
+            )
+            guard let sample = corridorLaneSchedule[strandKey]?[segmentIndex]
             else { return nil }
+            // The schedule stores the offset against the sweeping spine's
+            // travel direction; convert into this journey's frame using its
+            // held direction chain — the same reversal hold the renderer's
+            // offset pass applies — so hairpins keep the physical side.
+            let heldDirection = heldUnitDirectionsByStrand[
+                strandKey
+            ]?[segmentIndex] ?? (x: segment.unitX, y: segment.unitY)
+            let frameSign: Double = heldDirection.0 * sample.directionX
+                + heldDirection.1 * sample.directionY >= 0 ? 1 : -1
+            let localOffset = sample.offset * frameSign
 
-            // Partition every local corridor by physical travel direction. When
-            // both directions are present they start in adjacent fixed-width lanes
-            // on opposite sides of the GTFS centerline; additional same-direction
-            // routes stack outward rather than crossing through the other group.
-            let alignedIDs = laneMemberIDs.filter { memberID in
-                guard let member = localSegmentByJourneyID[memberID] else {
-                    return false
-                }
-                return member.unitX * referenceSegment.unitX
-                    + member.unitY * referenceSegment.unitY >= 0
-            }
-            let reverseIDs = laneMemberIDs.filter { !alignedIDs.contains($0) }
-
-            let laneSpacing = RouteMapStyle.laneSpacingPoints
-            let physicalOffset: Double
-            let enteringPhysicalOffset: Double
-            if !reverseIDs.isEmpty {
-                if let laneIndex = alignedIDs.firstIndex(of: laneJourneyID) {
-                    physicalOffset = laneSpacing / 2
-                        + Double(laneIndex) * laneSpacing
-                    enteringPhysicalOffset = laneSpacing / 2
-                        + Double(alignedIDs.count - 1) * laneSpacing
-                } else if let laneIndex = reverseIDs.firstIndex(of: laneJourneyID) {
-                    physicalOffset = -laneSpacing / 2
-                        - Double(laneIndex) * laneSpacing
-                    enteringPhysicalOffset = -laneSpacing / 2
-                        - Double(reverseIDs.count - 1) * laneSpacing
-                } else {
-                    return nil
-                }
+            // Alignment anchors follow the schedule's sticky corridor
+            // reference when it is locally matched; a reference not visible
+            // from this sample keeps the observer's own vertices (no
+            // adoption), matching the scheduler's spine choice downstream.
+            let referenceID: Int
+            let referenceSegment: MapRouteSegment?
+            if let matchedReference = localSegmentByJourneyID[
+                sample.referenceID
+            ] {
+                referenceID = sample.referenceID
+                referenceSegment = matchedReference
             } else {
-                guard let laneIndex = alignedIDs.firstIndex(of: laneJourneyID) else {
-                    return nil
-                }
-                physicalOffset = (
-                    Double(laneIndex) - Double(alignedIDs.count - 1) / 2
-                ) * laneSpacing
-                // A new strand enters from the nearest outside edge rather than
-                // inserting itself between established colors. This intentionally
-                // lets topology override natural-number order at that one merge.
-                let joinsLowerEdge = laneIndex * 2 < alignedIDs.count - 1
-                let edgeSign: Double = joinsLowerEdge ? -1 : 1
-                let edgeMagnitude = Double(alignedIDs.count) / 2 * laneSpacing
-                enteringPhysicalOffset = edgeSign * edgeMagnitude
+                referenceID = memberIDs.first ?? journeyID
+                referenceSegment = localSegmentByJourneyID[referenceID]
             }
 
             let alignedStart: MKMapPoint
             let alignedEnd: MKMapPoint
-            if referenceID == journeyID {
+            if referenceID == journeyID || referenceSegment == nil {
                 alignedStart = segment.start
                 alignedEnd = segment.end
             } else {
@@ -1825,28 +2921,23 @@ struct WayboundMapView: UIViewRepresentable {
                 // pieces of a terminal loop and manufacture a sideways jog.
                 alignedStart = corridorProjection(
                     of: segment.start,
-                    onto: referenceSegment,
+                    onto: referenceSegment!,
                     metersPerMapPoint: metersPerMapPoint
                 )
                 alignedEnd = corridorProjection(
                     of: segment.end,
-                    onto: referenceSegment,
+                    onto: referenceSegment!,
                     metersPerMapPoint: metersPerMapPoint
                 )
             }
 
-            // Screen-space offset normals reverse with polyline direction. Convert
-            // the canonical physical side back into this journey's local scalar.
-            let directionDot = segment.unitX * referenceSegment.unitX
-                + segment.unitY * referenceSegment.unitY
-            let directionSign: Double = directionDot >= 0 ? 1 : -1
             // Trunk ownership belongs to the dominant public route, not to one
             // journey of it: both directions project onto the same reference
             // centerline and would otherwise each leave the consolidated
             // city-scale trunk to the other.
             return CorridorSegmentLayout(
-                offset: physicalOffset * directionSign,
-                enteringOffset: enteringPhysicalOffset * directionSign,
+                offset: localOffset,
+                enteringOffset: localOffset,
                 alignedStart: alignedStart,
                 alignedEnd: alignedEnd,
                 referenceID: referenceID,
@@ -1985,10 +3076,15 @@ struct WayboundMapView: UIViewRepresentable {
             private static let queryPadding: CLLocationDistance = 24
             private let cellSize: Double
             private let segments: [MapRouteSegment]
+            private let locations: [CorridorSegmentLocation]?
             private var segmentIndicesByCell: [UInt64: [Int32]] = [:]
 
-            init(segments: [MapRouteSegment]) {
+            init(
+                segments: [MapRouteSegment],
+                locations: [CorridorSegmentLocation]? = nil
+            ) {
                 self.segments = segments
+                self.locations = locations
                 guard let first = segments.first else {
                     cellSize = 1
                     return
@@ -2042,6 +3138,73 @@ struct WayboundMapView: UIViewRepresentable {
                 )
                 guard let indices = segmentIndicesByCell[key] else { return [] }
                 return indices.map { segments[Int($0)] }
+            }
+
+            /// Nearest parallel segment within corridor tolerances, together
+            /// with its location on the owning journey's flagship strands —
+            /// the membership scan the lane scheduler runs over. Same gates
+            /// as parallelCorridorSegment below.
+            func parallelMember(
+                near point: MKMapPoint,
+                direction: MapRouteSegment,
+                metersPerMapPoint: Double
+            ) -> (segment: MapRouteSegment,
+                  location: CorridorSegmentLocation)? {
+                guard let locations else { return nil }
+                guard !segments.isEmpty else { return nil }
+                let key = Self.cellKey(
+                    Int32(point.x / cellSize),
+                    Int32(point.y / cellSize)
+                )
+                guard let indices = segmentIndicesByCell[key] else {
+                    return nil
+                }
+                let maximumSeparation: Double = 20
+                let minimumParallelDot = 0.93
+                var best:
+                    (segment: MapRouteSegment,
+                     location: CorridorSegmentLocation)?
+                var bestDistance = Double.greatestFiniteMagnitude
+                for index in indices {
+                    let candidate = segments[Int(index)]
+                    guard abs(
+                        direction.unitX * candidate.unitX
+                            + direction.unitY * candidate.unitY
+                    ) >= minimumParallelDot else { continue }
+                    let distance = point.distance(
+                        to: Self.projection(of: point, onto: candidate)
+                    )
+                    guard distance * metersPerMapPoint
+                            <= maximumSeparation,
+                          distance < bestDistance
+                    else { continue }
+                    best = (candidate, locations[Int(index)])
+                    bestDistance = distance
+                }
+                return best
+            }
+
+            private static func projection(
+                of point: MKMapPoint,
+                onto segment: MapRouteSegment
+            ) -> MKMapPoint {
+                let deltaX = segment.end.x - segment.start.x
+                let deltaY = segment.end.y - segment.start.y
+                let lengthSquared = deltaX * deltaX + deltaY * deltaY
+                guard lengthSquared > 0 else { return point }
+                let progress = max(
+                    0,
+                    min(
+                        1,
+                        ((point.x - segment.start.x) * deltaX
+                            + (point.y - segment.start.y) * deltaY)
+                            / lengthSquared
+                    )
+                )
+                return MKMapPoint(
+                    x: segment.start.x + progress * deltaX,
+                    y: segment.start.y + progress * deltaY
+                )
             }
 
             private static func cellKey(_ x: Int32, _ y: Int32) -> UInt64 {

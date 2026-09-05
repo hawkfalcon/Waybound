@@ -31,6 +31,9 @@ struct ContentView: View {
     @State private var selectedStopJourneyIDs: Set<Int>?
     @State private var expansionPrototype: RouteExpansionPrototype = .sheet
     @State private var isShowingPlanningSettings = false
+    #if DEBUG
+    @State private var laneDiagnosticsRequestID = 0
+    #endif
 
     private var selectedJourney: RouteJourney? {
         viewModel.journeys.first { $0.id == selectedJourneyID }
@@ -84,9 +87,28 @@ struct ContentView: View {
                             routeIDs: routeIDs,
                             journeyIDs: journeyIDs
                         )
-                    }
+                    },
+                    diagnosticsRequestID: laneDiagnosticsRequestID
                 )
                 .ignoresSafeArea()
+                #if DEBUG
+                .overlay(alignment: .topLeading) {
+                    Button {
+                        laneDiagnosticsRequestID += 1
+                    } label: {
+                        Image(systemName: "waveform.path.ecg")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(WayboundPalette.ink)
+                            .frame(width: 29, height: 29)
+                            .background(.white.opacity(0.72))
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Export corridor lane diagnostics")
+                    .padding(.leading, 10)
+                    .padding(.top, 62)
+                }
+                #endif
 
                 destinationSheet
                     .frame(
@@ -124,6 +146,7 @@ struct ContentView: View {
             .presentationDragIndicator(.visible)
             .presentationCornerRadius(28)
         }
+
     }
 
     private var destinationSheet: some View {
@@ -1027,3 +1050,4 @@ private struct ScheduledBadge: View {
 #Preview {
     ContentView()
 }
+

@@ -86,3 +86,117 @@ Arrellaga (1.4 km), standing in for the 12x/24x expresses where they share
 Chapala with route 6 south of Sola. Feed drift (the two agencies'/routes'
 centerlines disagreeing by a few meters) is injected synthetically in
 `corridor_check.py` because both traces come from the same router.
+
+## Lane metrics (corridor3.pair_metrics, bundle_wobble, min_lane_separation)
+
+All lane-quality numbers are measured on the DRAWN ribbons (ribbon() applies
+stableRouteOffsetPoints verbatim) against a COMMON street spine, so no
+travel-frame convention can fake or hide a result:
+
+- `project_onto_spine(layout, geoms, spine)` — screen-space projection of a
+  ribbon onto one spine polyline. The spine's direction chain is *held*
+  through its own 180° reversals (held_directions), so lateral sign is
+  stable along the street. The cursor full-searches the first sample and
+  re-anchors when a windowed hit is > 40 pts away (approach stubs).
+- `pair_metrics(a, b, ...)` — orientation-stable wrapper (tries both
+  observers' dominant spines, keeps the one with more matched pairs).
+  Samples are paired by spine arc (bisect, either direction of travel).
+  Excluded per sample: spine corners (miter pinch is renderer physics,
+  not a lane change — the whole segment touching a turn is flagged),
+  |lateral| > 50 pts (that ribbon is on another street), and samples
+  within 3 of a stacked/ref boundary on either side (tapered join/leave).
+  The sequence is split into monotone passes (a U-turn's two legs are never
+  compared to each other); each pass is trimmed 20% at both ends (a merge
+  from an adjacent lane sweeps while it converges — a join, not drift).
+  Drift = robust p5–p95 range of (lat_a − lat_b); gap = p5 of |lat_a −
+  lat_b|. Both in lanes (LS = laneSpacingPoints = 4.2 screen pts).
+- `bundle_wobble` = worst pair drift over the bundle; `min_lane_separation`
+  = worst pair gap. Same-public-key pairs share a lane by design: skipped.
+
+Gate semantics (lane_check, lane_fuzz): comparative against main run on the
+same scenario — wobble_sched ≤ max(0.05, wobble_main)·1.10 + 0.05,
+sep_sched ≥ min(0.75, sep_main) − 0.02 (− per-scenario sep_slack).
+Structurally forced crossings are gated by per-scenario max_bundle.
+
+Known scheduler gap (next fix): slots are stored and applied along each
+journey's OWN path normals, so a journey whose own polyline runs ~half a
+lane inside the street draws ~half a lane inside its slot (fuzz seeds 35/
+42/46/68: sched sep 0.4–0.6 vs main ~1.0). Tried and reverted this round:
+`_spine_delta()` grounding — subtract the own path's lateral displacement
+from the applied offset (delta measured against the ref spine's held
+normals, in screen points). With full grounding those four seeds go to
+0.8–1.0, but forks gain crossings (a peeling strand's delta grows fast and
+pushing it sideways crosses the bundle: fuzz seeds 4 and 10 went 2->8 and
+2->10 in-bundle crossings), and a gradient fade trades one class for
+another (45 -> 55 problem seeds). The next attempt should ground on a
+group-consensus street (median displacement of the bundle) rather than a
+single ref, and skip observers whose corridor membership is ending.
+
+## Fuzz status after the metric rebuild (2026-09-01)
+
+lane_check: green on all 7 scenarios (drawn-ribbon metrics, comparative
+gates). lane_fuzz: 45/120 seeds flagged, now all real signal, classes:
+- crossings added vs main (15 seeds; worst 43: 5->13, 10: 2->10, 1: 12->14)
+- bundle wobble above main (sched instability; worst 54: 5.41 vs 0.00,
+  18: 2.64 vs 0.00, 61: 4.09 vs 0.37)
+- separation below main (own-path displacement class above; plus marginal
+  both-bad cases where main also pinches)
+
+## Swift port (2026-09-02)
+
+The anchored-lane scheduler is now ported into
+`Waybound/Views/WayboundMapView.swift` (this file remains the executable
+spec; constants above are mirrored 1:1 by `CorridorLaneScheduling`):
+
+- `Coordinator.recomputeCorridorLaneSchedule()` — runs inside
+  `ensureCorridorLaneLayouts()`'s corridor-content signature gate, so the
+  schedule is cached per static feed/journey set and live departures never
+  re-trigger it. It builds one `CorridorSchedStrand` per (journey,
+  flagship polyline) from the same densified coordinates the layout pass
+  uses, plus each strand's held-direction chain (the renderer's reversal
+  hold), then `buildCorridorLaneSchedule` (runs → union-find corridors →
+  longest-first sweeps → `postFillSchedule`).
+- `CorridorSegmentIndex` gained per-segment `CorridorSegmentLocation`
+  (polylineIndex, segmentIndex) and `parallelMember(near:direction:)` so
+  the membership scan can locate a matched segment on the member's own
+  strand — the `own_index` of the spec.
+- `sharedCorridorSegmentLayout` no longer re-sorts members per sample or
+  re-centres offsets on current member count. It keeps membership,
+  dominance/trunk voting, and adoption, but the lane offset comes from
+  `corridorLaneSchedule[(journey, polyline)][segmentIndex]`, converted
+  into the journey's own frame by the held-direction dot (replacing
+  main's per-sample directionSign). Alignment follows the schedule's
+  sticky reference when locally matched.
+- The rest of the pipeline (removeShortCorridorRuns, offset averaging,
+  stabilize/bridge/transitions, taper, clamp, `stableRouteOffsetPoints`,
+  dedup, trunk/detail cross-fade) is untouched.
+
+Port divergences (intentional): member ordering uses the shipped
+`corridorLaneComesBefore` (route number → agency → direction → stack →
+id) everywhere, where the spec's `sort_key` omitted agency; strands are
+per flagship polyline rather than per journey (multi-leg trips schedule
+each leg independently, keyed by (journeyID, polylineIndex)).
+
+No Swift compiler exists in this sandbox: the port was validated by
+line-by-line review against the spec above. lane_check (7 scenarios,
+drawn-ribbon metrics) and lane_fuzz expectations carry over unchanged;
+the real gate is the downtown-SB screenshot comparison on a Mac build.
+
+## Lane diagnostics export (debug builds)
+
+`ContentView` shows a small DEBUG-only button (top-leading, over the map)
+that makes the coordinator dump its lane state to a JSON file and share it:
+per journey the densified flagship coordinates (the scheduler's exact
+input), the anchored-lane schedule (offset / spine direction / reference
+per strand segment), and the final per-vertex layouts. Rebuild + run, tap
+the button at the spot you want to report, share the file (AirDrop/Files)
+and upload it into the session.
+
+`python3 tools/replay/ingest.py <waybound-lanes-*.json>` then rebuilds the
+exact shapes here and prints: the lateral stacking at stations along each
+spine (the numeric version of a screenshot), a port check (Swift final
+offsets vs this harness's pipeline re-run over the Swift schedule —
+mismatch means a port divergence), a scheduler check (Swift schedule vs a
+fresh Python scheduler run on the same geometry — mismatch means a
+real-data case the algorithm itself gets wrong), and an SVG rendering
+into out/.
