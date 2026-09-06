@@ -37,7 +37,12 @@ from geo import mpm, dist
 JOIN_MIN = 30.0            # presence stretch shorter than this is not a join
 GAP_BRIDGE = 150.0         # presence dropouts up to this hold their lane
 GAP_CHORD_RATIO = 0.75     # straight-path gate for holding a lane through one
-SIDE_LOOKAHEAD = 45.0      # metres of own geometry read for a join/exit side
+SIDE_LOOKAHEAD = 45.0      # metres of own geometry read for a join side
+EXIT_LOOKAHEAD = 120.0     # metres walked to decide a departure side
+SIDE_DEADBAND = 2.0        # metres off the reference line before a side counts
+EXIT_ANGLE = 0.025         # a departure must also diverge faster than ~1.4
+                           # degrees: gentle same-street curvature stays a
+                           # stayer however far the walk runs
 CENTRE_CLEARANCE = LS / 4  # how close opposite groups may approach the spine
 SLOT_CLEARANCE = 0.6 * LS  # offsets closer than this to a slot collide
 
@@ -110,9 +115,33 @@ def schedule_lanes(geoms, scan):
 
     schedule = {}
     for root in sorted(groups, key=lambda r: -len(groups[r])):
-        run_idxs = sorted(groups[root],
-                          key=lambda i: -(arcs[runs[i][0]][runs[i][2]]
-                                          - arcs[runs[i][0]][runs[i][1]]))
+        # Birth priority: the sweep whose spine follows the BUNDLE longest
+        # (median member presence) runs first, so ladders are laid by a
+        # spine with truthful presence for its members. Raw run length is
+        # the wrong key: a spine that drags one express partner down a
+        # freeway (long run, stub presence for everyone else — the transit
+        # center stub) would otherwise birth a scrambled ladder that every
+        # later sweep adopts.
+        def _coverage(idx):
+            jid, s0, s1 = runs[idx]
+            rows = scan[jid]
+            members = set()
+            for si in range(s0, s1):
+                members.update(rows[si] or ())
+            lens = []
+            for cid in members:
+                if cid == jid:
+                    continue
+                n = sum(1 for si in range(s0, s1)
+                        if rows[si] and cid in rows[si])
+                if n:
+                    lens.append(n)
+            lens.sort()
+            median = lens[len(lens) // 2] if lens else 0
+            length = arcs[jid][s1] - arcs[jid][s0]
+            return (-median, -length, jid)
+
+        run_idxs = sorted(groups[root], key=_coverage)
         memory = {}   # public key -> freed offset, for re-entry
         for run_idx in run_idxs:
             _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory)
@@ -200,7 +229,11 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
         return _side_sign(cg.points[back], seg.s, seg_dir(si), mm)
 
     def exit_side(cid, out_si):
-        """Side cid leaves toward once its presence stretch ends."""
+        """Side cid leaves toward once its presence stretch ends. Walks the
+        strand's own polyline up to EXIT_LOOKAHEAD, stopping at the first
+        point clearly off the spine line: a gentle fork (ramp merge angle)
+        takes tens of metres to clear the deadband, which a fixed short
+        window used to read as 'stays on'."""
         hit, probe = None, None
         for si in range(min(out_si, s1 - 1), s0 - 1, -1):
             hit = matched(cid, si)
@@ -215,12 +248,18 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
         cg = geoms[cid]
         if k >= len(cg.points) - 1:
             return None
+        seg = g.segs[probe]
+        d = seg_dir(probe)
+        lx, ly = -d[1], d[0]
         fwd, travelled = k, 0.0
-        while fwd < len(cg.points) - 1 and travelled < SIDE_LOOKAHEAD:
+        while fwd < len(cg.points) - 1 and travelled < EXIT_LOOKAHEAD:
+            s = ((cg.points[fwd][0] - seg.s[0]) * lx
+                 + (cg.points[fwd][1] - seg.s[1]) * ly)
+            if abs(s) * mm >= max(SIDE_DEADBAND, EXIT_ANGLE * travelled):
+                return 1 if s > 0 else -1
             travelled += dist(cg.points[fwd], cg.points[fwd + 1]) * mm
             fwd += 1
-        seg = g.segs[probe]
-        return _side_sign(cg.points[fwd], seg.s, seg_dir(probe), mm)
+        return None
 
     def group_sign(cid, si):
         k = own_index(cid, si)
@@ -334,6 +373,69 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
             slots[k] = entry.offset * sign
             slot_groups[k] = group_sign(cid, si)
 
+    def consensus_direction(si, members):
+        """Average travel direction at si of the given members' matched
+        segments, aligned to the spine's frame. Robust to any single
+        polyline turning: the street is what the group does."""
+        xs, ys = 0.0, 0.0
+        d = seg_dir(si)
+        for cid in members:
+            k = own_index(cid, si)
+            if k is None:
+                continue
+            seg = geoms[cid].segs[k] if k < len(geoms[cid].segs) else None
+            if seg is None:
+                continue
+            s = 1 if seg.ux * d[0] + seg.uy * d[1] >= 0 else -1
+            xs += s * seg.ux
+            ys += s * seg.uy
+        length = math.hypot(xs, ys)
+        if length < 1e-6:
+            return d
+        return (xs / length, ys / length)
+
+    def departure_side(cid, out_si):
+        """Side on which cid leaves the corridor at out_si, measured against
+        the members that REMAIN at that point — the street continues with
+        them, so the consensus of the remainder, not any one polyline, is
+        the reference."""
+        probe = max(s0, min(out_si, s1) - 1)
+        hit = None
+        while probe >= s0:
+            hit = matched(cid, probe)
+            if hit is not None:
+                break
+            probe -= 1
+        if hit is None:
+            return None
+        k = geoms[cid].seg_index.get(id(hit))
+        if k is None:
+            return None
+        cg = geoms[cid]
+        remaining = [c for c in present_journeys(probe)
+                     if c != cid
+                     and any(a <= probe < b for a, b in presence.get(c, []))]
+        direction = consensus_direction(
+            probe, remaining) if remaining else seg_dir(probe)
+        if direction is None:
+            return None
+        # Walk the strand's own path forward, stopping at the first point
+        # clearly off the street-consensus line (origin on the strand's
+        # own point at the probe: immune to the few-metre baseline offsets
+        # between matched polylines). A gentle fork takes tens of metres
+        # to clear the deadband; a fixed short window reads it as a stayer.
+        lx, ly = -direction[1], direction[0]
+        fwd, travelled = k, 0.0
+        while fwd < len(cg.points) - 1 and travelled < EXIT_LOOKAHEAD:
+            s = ((cg.points[fwd][0] - cg.points[k][0]) * lx
+                 + (cg.points[fwd][1] - cg.points[k][1]) * ly)
+            if abs(s) * mm >= max(SIDE_DEADBAND, EXIT_ANGLE * travelled):
+                return 1 if s > 0 else -1
+            travelled += dist(cg.points[fwd], cg.points[fwd + 1]) * mm
+            fwd += 1
+        return None
+
+
     def birth(si):
         """Order a corridor's first bundle. Exit-aware: the first strand to
         peel off on a side sits outermost on that side; stayers fill the
@@ -369,25 +471,51 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                 continue
             gsign = group_sign(cid, si)
             out_si = next((b for a, b in presence[cid] if a <= si < b), s1)
-            # A presence stretch that runs to the sweep end usually means
-            # THIS strand is the spine's last partner: the run ended
-            # because it left. exit_side walks the strand's own
-            # continuation past its last match, so calling it at the run
-            # end still tells peel-off (a side) from a true stayer that
-            # carries on along the street (None).
-            side = exit_side(cid, min(out_si, s1))
-            cohort.append((cid, k, gsign, out_si, side))
+            cohort.append((cid, k, gsign, out_si, None))
             slot_groups[k] = gsign
         with_group = [x for x in cohort if x[2] >= 0]
         against = [x for x in cohort if x[2] < 0]
         both = bool(with_group) and bool(against)
 
         def ordered(group, sign):
-            # innermost -> outermost on this group's lattice
-            lefts = sorted([x for x in group if x[4] == 1], key=lambda x: x[3])
-            rights = sorted([x for x in group if x[4] == -1], key=lambda x: x[3])
-            middles = sorted([x for x in group if x[4] is None],
+            """Fork walk, innermost -> outermost on this group's lattice.
+            Departures are processed in street order; the first to leave on a
+            side sits outermost there. Each side is measured against the
+            members that REMAIN at the departure point: when the sweep spine
+            itself peels off (transit center: every stayer "exits" where the
+            longest run turns away, all at the same point, numerically
+            tie-broken), single-polyline reference directions scramble the
+            ladder."""
+            # The spine itself always stays; any OTHER strand's presence
+            # running to the sweep end is that strand leaving as the last
+            # partner (the run ended because sharing ended), so it departs
+            # at s1. Side=None continuation means it genuinely carries on
+            # along the street -> stayer.
+            stayers = [x for x in group if x[0] == jid]
+            leaving = sorted(
+                [x for x in group if x[0] != jid],
+                key=lambda x: (min(x[3], s1), geoms[x[0]].sort_key()))
+            lefts, rights = [], []   # outermost first
+            for cid, k, gsign, out_si, _ in leaving:
+                side = departure_side(cid, min(out_si, s1))
+                if side == 1:
+                    lefts.append((cid, k))
+                elif side == -1:
+                    rights.append((cid, k))
+                else:
+                    stayers.append((cid, k, gsign, out_si, None))
+            middles = sorted(stayers,
                              key=lambda x: geoms[x[0]].sort_key())
+            if DEBUG:
+                print(f"      fork-walk s0={s0} s1={s1} jid={geoms[jid].num}")
+                for cid, k, gsign, out_si, _ in leaving:
+                    print(f"        leave {geoms[cid].num:>3} out_si={out_si}"
+                          f" side={departure_side(cid, min(out_si, s1))}")
+                for x in stayers:
+                    print(f"        stay  {geoms[x[0]].num:>3}")
+                seq_dbg = (rights if sign >= 0 else lefts) + middles
+                seq_dbg += list(reversed(lefts if sign >= 0 else rights))
+                print("        seq=" + str([geoms[x[0]].num for x in seq_dbg]))
             if sign >= 0:
                 return rights + middles + list(reversed(lefts))
             return lefts + middles + list(reversed(rights))
