@@ -1302,6 +1302,9 @@ struct WayboundMapView: UIViewRepresentable {
             static let gapBridge: Double = 150
             static let gapChordRatio: Double = 0.75
             static let sideLookahead: Double = 45
+            static let exitLookahead: Double = 120
+            static let sideDeadband: Double = 2
+            static let exitAngle: Double = 0.025
             static let centreClearance = laneSpacing / 4
             static let slotClearance = 0.6 * laneSpacing
         }
@@ -1496,14 +1499,30 @@ struct WayboundMapView: UIViewRepresentable {
                 }
                 return $0.key < $1.key
             }) {
-                let ordered = runIndices.sorted(by: {
-                    let firstLength = runLength(runs[$0], strands: strands)
-                    let secondLength = runLength(runs[$1], strands: strands)
-                    if firstLength != secondLength {
-                        return firstLength > secondLength
-                    }
-                    return $0 < $1
-                })
+            // Birth priority: the sweep whose spine follows the BUNDLE
+            // longest (median member presence) runs first, so ladders are
+            // laid by a spine with truthful presence for its members. Raw
+            // run length is the wrong key: a spine that drags one express
+            // partner down a freeway (long run, stub presence for everyone
+            // else — the transit-center stub) would otherwise birth a
+            // scrambled ladder that every later sweep adopts.
+            let ordered = runIndices.sorted(by: {
+                let firstCoverage = runMedianCoverage(
+                    runs[$0], strands: strands, scan: scan
+                )
+                let secondCoverage = runMedianCoverage(
+                    runs[$1], strands: strands, scan: scan
+                )
+                if firstCoverage != secondCoverage {
+                    return firstCoverage > secondCoverage
+                }
+                let firstLength = runLength(runs[$0], strands: strands)
+                let secondLength = runLength(runs[$1], strands: strands)
+                if firstLength != secondLength {
+                    return firstLength > secondLength
+                }
+                return $0 < $1
+            })
                 var memory: [String: Double] = [:]
                 for runIndex in ordered {
                     let outcome = sweepCorridorRun(
@@ -1528,6 +1547,32 @@ struct WayboundMapView: UIViewRepresentable {
         ) -> Double {
             guard let strand = strands[run.strand] else { return 0 }
             return strand.arc[run.end] - strand.arc[run.start]
+        }
+
+        /// Median member-presence length (segments) over a run: how far
+        /// this run's spine travels with the typical member. High values
+        /// mark spines that follow the corridor; a spine whose run is long
+        /// only because one express partner rides along scores low here.
+        private func runMedianCoverage(
+            _ run: CorridorLaneRun,
+            strands: [CorridorStrandKey: CorridorSchedStrand],
+            scan: [CorridorStrandKey: [[Int: CorridorMemberMatch]]]
+        ) -> Int {
+            let rows = scan[run.strand] ?? []
+            var members = Set<Int>()
+            for si in run.start..<run.end where si < rows.count {
+                members.formUnion(rows[si].keys)
+            }
+            var lengths: [Int] = []
+            for cid in members where cid != run.strand.journeyID {
+                var count = 0
+                for si in run.start..<run.end where si < rows.count {
+                    if rows[si][cid] != nil { count += 1 }
+                }
+                if count > 0 { lengths.append(count) }
+            }
+            lengths.sort()
+            return lengths.isEmpty ? 0 : lengths[lengths.count / 2]
         }
 
         /// Per strand, per segment: {other journey: matched segment} — the
@@ -1726,21 +1771,122 @@ struct WayboundMapView: UIViewRepresentable {
                 guard let member = memberStrand(match.location, cid),
                       match.location.segmentIndex < member.points.count - 1
                 else { return nil }
+                guard let segment = strand.segments[probe] else { return nil }
+                // Walk the strand's own polyline, stopping at the first
+                // point clearly off the spine line: a gentle fork (ramp
+                // merge angle) takes tens of metres to clear the
+                // deadband, which a fixed short window read as "stays on".
+                let direction = segmentDirection(at: probe)
+                let leftX = -direction.1
+                let leftY = direction.0
                 var forward = match.location.segmentIndex
                 var travelled = 0.0
                 while forward < member.points.count - 1
-                        && travelled < CorridorLaneScheduling.sideLookahead {
+                        && travelled < CorridorLaneScheduling.exitLookahead {
+                    let side = (member.points[forward].x - segment.start.x)
+                            * leftX
+                        + (member.points[forward].y - segment.start.y)
+                            * leftY
+                    let threshold = max(
+                        CorridorLaneScheduling.sideDeadband,
+                        CorridorLaneScheduling.exitAngle * travelled
+                    )
+                    if abs(side) * strand.metersPerMapPoint >= threshold {
+                        return side > 0 ? 1 : -1
+                    }
                     travelled += member.points[forward]
                         .distance(to: member.points[forward + 1])
                         * strand.metersPerMapPoint
                     forward += 1
                 }
-                guard let segment = strand.segments[probe] else { return nil }
-                return sideSign(
-                    of: member.points[forward],
-                    from: segment.start,
-                    direction: segmentDirection(at: probe)
-                )
+                return nil
+            }
+
+            /// Average travel direction at si of the given members' matched
+            /// segments, aligned to the spine's frame. Robust to any single
+            /// polyline turning: the street is what the group does.
+            func consensusDirection(
+                _ si: Int,
+                _ members: [Int]
+            ) -> (Double, Double) {
+                var x = 0.0
+                var y = 0.0
+                let spine = segmentDirection(at: si)
+                for cid in members {
+                    guard let location = ownLocation(cid, si),
+                          let member = memberStrand(location, cid),
+                          location.segmentIndex < member.segments.count,
+                          let segment = member.segments[
+                              location.segmentIndex
+                          ]
+                    else { continue }
+                    let aligned = segment.unitX * spine.0
+                            + segment.unitY * spine.1 >= 0 ? 1.0 : -1.0
+                    x += aligned * segment.unitX
+                    y += aligned * segment.unitY
+                }
+                let length = (x * x + y * y).squareRoot()
+                guard length >= 1e-6 else { return spine }
+                return (x / length, y / length)
+            }
+
+            /// Side on which cid leaves the corridor at outSi, measured
+            /// against the members that REMAIN at that point — the street
+            /// continues with them, so the consensus of the remainder, not
+            /// any one polyline, is the reference. Origin sits on the
+            /// strand's own point at the probe (immune to the few-metre
+            /// baseline offsets between matched polylines), and the walk
+            /// runs until the strand clearly diverges from the consensus
+            /// line: gentle same-street curvature stays a stayer (nil).
+            func departureSide(_ cid: Int, _ outSi: Int) -> Int? {
+                var probe = max(s0, min(outSi, s1) - 1)
+                var match: CorridorMemberMatch?
+                while probe >= s0 {
+                    if let candidate = matched(cid, probe) {
+                        match = candidate
+                        break
+                    }
+                    probe -= 1
+                }
+                guard let match, let member = memberStrand(
+                    match.location,
+                    cid
+                ) else { return nil }
+                let originIndex = match.location.segmentIndex
+                guard originIndex < member.points.count - 1 else {
+                    return nil
+                }
+                let remaining = presentJourneys(probe).filter { other in
+                    other != cid
+                        && (presence[other] ?? []).contains {
+                            $0.0 <= probe && probe < $0.1
+                        }
+                }
+                let direction = remaining.isEmpty
+                    ? segmentDirection(at: probe)
+                    : consensusDirection(probe, remaining)
+                let leftX = -direction.1
+                let leftY = direction.0
+                let origin = member.points[originIndex]
+                var forward = originIndex
+                var travelled = 0.0
+                while forward < member.points.count - 1
+                        && travelled < CorridorLaneScheduling.exitLookahead {
+                    let side = (member.points[forward].x - origin.x) * leftX
+                        + (member.points[forward].y - origin.y) * leftY
+                    let threshold = max(
+                        CorridorLaneScheduling.sideDeadband,
+                        CorridorLaneScheduling.exitAngle * travelled
+                    )
+                    if abs(side) * strand.metersPerMapPoint >= threshold {
+                        return side > 0 ? 1 : -1
+                    }
+                    travelled += member.points[forward]
+                        .distance(to: member.points[forward + 1])
+                        * strand.metersPerMapPoint
+                    forward += 1
+                }
+                return nil
             }
 
             func groupSign(_ cid: Int, _ si: Int) -> Int {
@@ -1992,20 +2138,13 @@ struct WayboundMapView: UIViewRepresentable {
                     let outSi = presence[cid]?
                         .first { $0.0 <= si && si < $0.1 }?.1
                         ?? s1
-                    // Presence running to the sweep end usually means this
-                    // strand is the spine's last partner: the run ended
-                    // because it left. exitSide walks the strand's own
-                    // continuation past its last match, so calling it at the
-                    // run end still tells peel-off (a side) from a true
-                    // stayer that carries on along the street (nil).
-                    let side = exitSide(cid, min(outSi, s1))
                     cohort.append(
                         CohortMember(
                             journeyID: cid,
                             key: key,
                             gsign: gsign,
                             outSi: outSi,
-                            side: side
+                            side: nil
                         )
                     )
                     slotGroups[key] = gsign
@@ -2018,18 +2157,48 @@ struct WayboundMapView: UIViewRepresentable {
                     _ group: [CohortMember],
                     sign: Int
                 ) -> [CohortMember] {
-                    let leavingLeft = group
-                        .filter { $0.side == 1 }
-                        .sorted { $0.outSi < $1.outSi }
-                    let leavingRight = group
-                        .filter { $0.side == -1 }
-                        .sorted { $0.outSi < $1.outSi }
-                    let staying = group
-                        .filter { $0.side == nil }
-                        .sorted { corridorLaneComesBefore($0.journeyID, $1.journeyID) }
+                    // Fork walk, innermost -> outermost on this group's
+                    // lattice. Departures run in street order; the first
+                    // to leave on a side sits outermost there. The spine
+                    // itself always stays; any OTHER strand's presence
+                    // running to the sweep end is that strand leaving as
+                    // the last partner (the run ended because sharing
+                    // ended), so it departs at s1. A nil continuation
+                    // side means the strand genuinely carries on along
+                    // the street — a stayer.
+                    let spineID = key.journeyID
+                    var stayers = group.filter { $0.journeyID == spineID }
+                    let leaving = group
+                        .filter { $0.journeyID != spineID }
+                        .sorted {
+                            let firstOut = min($0.outSi, s1)
+                            let secondOut = min($1.outSi, s1)
+                            if firstOut != secondOut {
+                                return firstOut < secondOut
+                            }
+                            return corridorLaneComesBefore(
+                                $0.journeyID,
+                                $1.journeyID
+                            )
+                        }
+                    var lefts: [CohortMember] = []
+                    var rights: [CohortMember] = []
+                    for member in leaving {
+                        switch departureSide(
+                            member.journeyID,
+                            min(member.outSi, s1)
+                        ) {
+                        case 1: lefts.append(member)
+                        case -1: rights.append(member)
+                        default: stayers.append(member)
+                        }
+                    }
+                    let middles = stayers.sorted {
+                        corridorLaneComesBefore($0.journeyID, $1.journeyID)
+                    }
                     return sign >= 0
-                        ? leavingRight + staying + leavingLeft.reversed()
-                        : leavingLeft + staying + leavingRight.reversed()
+                        ? rights + middles + lefts.reversed()
+                        : lefts + middles + rights.reversed()
                 }
 
                 for (group, sign) in [(withGroup, 1), (against, -1)] {

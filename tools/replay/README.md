@@ -142,6 +142,25 @@ gates). lane_fuzz: 45/120 seeds flagged, now all real signal, classes:
 - separation below main (own-path displacement class above; plus marginal
   both-bad cases where main also pinches)
 
+## Fork-walk birth on real data (2026-09-06)
+
+The real-export downtown bundle (waybound-lanes-1788723444) exposed the
+scramble's root cause: the first sweep to touch the corridor group birthed
+its ladder, and sweep order was raw run length — a spine that leaves the
+street ~30 m in but drags one express partner down the freeway (24X/12X)
+had the longest run, so every stayer's presence ended at the same stub
+point, numerically tie-broken. Order sweeps by median member-presence
+coverage instead; exit/departure sides now read against the consensus
+direction of the members that REMAIN at the departure (origin on the
+strand's own point, walk to 120 m with a ~1.4-degree angular threshold:
+gentle same-street curvature stays a stayer); birth orders by fork walk —
+spine stays, presence-to-run-end strands depart as last partner, per side
+the first to peel sits outermost, stayers fill the numeric middle.
+Downtown now lays 24X | 12X | 1, 17 | 4, 7, 5, 3 with lanes held
+monotonic 0-300 m. lane_check 8/8; lane_fuzz 46/120 (seed 91 fixed,
+synthetic seed 20 new — a fuzz-only crossing class, parked with the
+others above).
+
 ## Swift port (2026-09-02)
 
 The anchored-lane scheduler is now ported into
@@ -155,7 +174,10 @@ spec; constants above are mirrored 1:1 by `CorridorLaneScheduling`):
   flagship polyline) from the same densified coordinates the layout pass
   uses, plus each strand's held-direction chain (the renderer's reversal
   hold), then `buildCorridorLaneSchedule` (runs → union-find corridors →
-  longest-first sweeps → `postFillSchedule`).
+  sweeps ordered by median member-presence coverage so the spine that
+  follows the bundle longest births its ladder — a raw longest-run
+  order let freeway-dominated stubs birth scrambled layouts — →
+  `postFillSchedule`).
 - `CorridorSegmentIndex` gained per-segment `CorridorSegmentLocation`
   (polylineIndex, segmentIndex) and `parallelMember(near:direction:)` so
   the membership scan can locate a matched segment on the member's own
