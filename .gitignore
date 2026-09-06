@@ -1,2 +1,3 @@
 Secrets.plist
 __pycache__/
+tools/replay/out/
