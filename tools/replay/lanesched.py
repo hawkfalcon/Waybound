@@ -609,13 +609,20 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
         ox, oy = cg.points[k]
         fwd, travelled = k, 0.0
         net_s, net_d = 0.0, 0.0
-        while fwd < len(cg.points) - 1 and travelled < EXIT_LOOKAHEAD:
+        # A member whose presence runs to the run end splits at the
+        # corridor's own end (the street turns away from it); give the
+        # read a longer window to see that divergence.
+        lookahead = EXIT_LOOKAHEAD * (2.5 if min(out_si, s1) >= s1 else 1.0)
+        while fwd < len(cg.points) - 1 and travelled < lookahead:
             travelled += dist(cg.points[fwd], cg.points[fwd + 1]) * mm
             fwd += 1
             net_s = ((cg.points[fwd][0] - ox) * lx
                      + (cg.points[fwd][1] - oy) * ly)
             net_d = travelled
-        if abs(net_s) * mm >= max(SIDE_DEADBAND, EXIT_ANGLE * net_d):
+        # A read must clear the angle threshold by half again: a polyline
+        # running a few metres off its neighbours' (drawing parallax)
+        # otherwise flips the side on noise.
+        if abs(net_s) * mm >= max(SIDE_DEADBAND, 1.5 * EXIT_ANGLE * net_d):
             return 1 if net_s > 0 else -1
         return None
 
@@ -660,6 +667,11 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                     out_si = next((b for a, b in presence[cid]
                                    if a <= si < b), s1)
                     side = exit_side(cid, min(out_si, s1))
+                if snake and side is not None:
+                    # Winding street: joiners join the staircase side --
+                    # ordered by where they leave, not by which side of
+                    # this particular bend they arrived from.
+                    side = 1 if gsign >= 0 else -1
                 slots[k] = place(cid, side, gsign, rank, si=si)
                 if DEBUG:
                     print(f"    [sweep {geoms[jid].num}] join {geoms[cid].num}"
@@ -700,10 +712,12 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
             lefts, rights = [], []   # outermost first
             for cid, k, gsign, out_si, _ in leaving:
                 side = departure_side(cid, min(out_si, s1))
-                import os as _os
-                if _os.environ.get('FORCE_FLIP') and geoms[cid].num == _os.environ['FORCE_FLIP']:
-                    side = 1 if side == -1 else (-1 if side is not None else None)
-                if side == 1:
+                if snake:
+                    # Staircase: every exit takes the same side of the
+                    # ladder, ordered by exit point -- first-out outermost.
+                    # The local side only separates ties at one point.
+                    lefts.append((cid, k))
+                elif side == 1:
                     lefts.append((cid, k))
                 elif side == -1:
                     rights.append((cid, k))
@@ -762,6 +776,16 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                 if (cid, k) in schedule:
                     continue
                 schedule[(cid, k)] = LaneSample(offset, d[0], d[1], ref_jid)
+
+    # A winding street: the spine's direction rotates across the run
+    # (circulators, TC loops). "Left" and "right" then flip at every bend,
+    # so per-probe exit sides cannot share one ladder -- the least-crossing
+    # order is a staircase by exit point (see birth()).
+    _dirs = [d for d in (geoms[jid].segs[si] for si in range(s0, s1))
+             if d is not None]
+    _rn = (math.hypot(sum(d.ux for d in _dirs), sum(d.uy for d in _dirs))
+           / max(len(_dirs), 1))
+    snake = _rn < 0.7
 
     bounds = {s0, s1}
     for stretches in presence.values():
@@ -823,6 +847,11 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                     out_si = next((b for a, b in presence[cid]
                                    if a <= si < b), s1)
                     side = exit_side(cid, min(out_si, s1))
+                if snake and side is not None:
+                    # Winding street: joiners join the staircase side --
+                    # ordered by where they leave, not by which side of
+                    # this particular bend they arrived from.
+                    side = 1 if gsign >= 0 else -1
                 slots[k] = place(cid, side, gsign, rank, si=si)
                 if DEBUG:
                     print(f"    [sweep {geoms[jid].num}] join {geoms[cid].num}"

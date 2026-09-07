@@ -1688,6 +1688,25 @@ struct WayboundMapView: UIViewRepresentable {
             var schedule = schedule
             var memory = memory
 
+            // A winding street: the spine's direction rotates across the
+            // run (circulators, TC loops). "Left" and "right" then flip at
+            // every bend, so per-probe exit sides cannot share one ladder
+            // -- the least-crossing order is a staircase by exit point
+            // (see birth()).
+            var sumX = 0.0
+            var sumY = 0.0
+            var dirCount = 0
+            for si in s0..<min(s1, strand.segments.count) {
+                if let segment = strand.segments[si] {
+                    sumX += segment.unitX
+                    sumY += segment.unitY
+                    dirCount += 1
+                }
+            }
+            let snake = dirCount > 0
+                && (sumX * sumX + sumY * sumY).squareRoot()
+                    / Double(dirCount) < 0.7
+
             // Presence stretches of every member over this sweep, debounced.
             var presence: [Int: [(Int, Int)]] = [
                 key.journeyID: [(s0, s1)]
@@ -1934,12 +1953,17 @@ struct WayboundMapView: UIViewRepresentable {
                 // window is the same wherever in the segment the walk
                 // starts. A gentle fork never clears the deadband across
                 // the window; a bay excursion that returns nets to zero.
+                // A member whose presence runs to the run end splits at
+                // the corridor's own end (the street turns away from it);
+                // give the read a longer window to see that divergence.
+                let lookahead = CorridorLaneScheduling.exitLookahead
+                    * (min(outSi, s1) >= s1 ? 2.5 : 1.0)
                 var forward = originIndex
                 var travelled = 0.0
                 var netSide = 0.0
                 var netDistance = 0.0
                 while forward < member.points.count - 1
-                        && travelled < CorridorLaneScheduling.exitLookahead {
+                        && travelled < lookahead {
                     travelled += member.points[forward]
                         .distance(to: member.points[forward + 1])
                         * strand.metersPerMapPoint
@@ -1948,9 +1972,12 @@ struct WayboundMapView: UIViewRepresentable {
                         + (member.points[forward].y - origin.y) * leftY
                     netDistance = travelled
                 }
+                // A read must clear the angle threshold by half again: a
+                // polyline running a few metres off its neighbours'
+                // (drawing parallax) otherwise flips the side on noise.
                 let threshold = max(
                     CorridorLaneScheduling.sideDeadband,
-                    CorridorLaneScheduling.exitAngle * netDistance
+                    1.5 * CorridorLaneScheduling.exitAngle * netDistance
                 )
                 let side: Int?
                 if abs(netSide) * strand.metersPerMapPoint >= threshold {
@@ -2417,7 +2444,14 @@ struct WayboundMapView: UIViewRepresentable {
                         let gsign = groupSign(cid, si)
                         slotGroups[key] = gsign
                         let rank = numericRank(presentJourneys(si), cid)
-                        let side = exitAwareSide(for: cid, at: si)
+                        var side = exitAwareSide(for: cid, at: si)
+                        if snake, side != nil {
+                            // Winding street: joiners join the staircase
+                            // side -- ordered by where they leave, not by
+                            // which side of this particular bend they
+                            // arrived from.
+                            side = gsign >= 0 ? 1 : -1
+                        }
                         slots[key] = place(
                             cid,
                             side: side,
@@ -2489,6 +2523,14 @@ struct WayboundMapView: UIViewRepresentable {
                     var lefts: [CohortMember] = []
                     var rights: [CohortMember] = []
                     for member in leaving {
+                        if snake {
+                            // Staircase: every exit takes the same side of
+                            // the ladder, ordered by exit point -- first-out
+                            // outermost. The local side only separates ties
+                            // at one point.
+                            lefts.append(member)
+                            continue
+                        }
                         switch departureSide(
                             member.journeyID,
                             min(member.outSi, s1)
@@ -2664,7 +2706,14 @@ struct WayboundMapView: UIViewRepresentable {
                             }
                         }
                         let rank = numericRank(presentJourneys(si), cid)
-                        let side = exitAwareSide(for: cid, at: si)
+                        var side = exitAwareSide(for: cid, at: si)
+                        if snake, side != nil {
+                            // Winding street: joiners join the staircase
+                            // side -- ordered by where they leave, not by
+                            // which side of this particular bend they
+                            // arrived from.
+                            side = (slotGroups[slotKey] ?? 1) >= 0 ? 1 : -1
+                        }
                         slots[slotKey] = place(
                             cid,
                             side: side,
