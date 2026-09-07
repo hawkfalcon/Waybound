@@ -1812,32 +1812,34 @@ struct WayboundMapView: UIViewRepresentable {
                       match.location.segmentIndex < member.points.count - 1
                 else { return nil }
                 guard let segment = strand.segments[probe] else { return nil }
-                // Walk the strand's own polyline, stopping at the first
-                // point clearly off the spine line: a gentle fork (ramp
-                // merge angle) takes tens of metres to clear the
-                // deadband, which a fixed short window read as "stays on".
+                // Walk the strand's own polyline across the whole lookahead
+                // window and read the NET lateral displacement at the end
+                // (see departureSide for why net, not first crossing).
                 let direction = segmentDirection(at: probe)
                 let leftX = -direction.1
                 let leftY = direction.0
+                let originX = segment.start.x
+                let originY = segment.start.y
                 var forward = match.location.segmentIndex
                 var travelled = 0.0
+                var netSide = 0.0
+                var netDistance = 0.0
                 while forward < member.points.count - 1
                         && travelled < CorridorLaneScheduling.exitLookahead {
-                    let side = (member.points[forward].x - segment.start.x)
-                            * leftX
-                        + (member.points[forward].y - segment.start.y)
-                            * leftY
-                    let threshold = max(
-                        CorridorLaneScheduling.sideDeadband,
-                        CorridorLaneScheduling.exitAngle * travelled
-                    )
-                    if abs(side) * strand.metersPerMapPoint >= threshold {
-                        return side > 0 ? 1 : -1
-                    }
                     travelled += member.points[forward]
                         .distance(to: member.points[forward + 1])
                         * strand.metersPerMapPoint
                     forward += 1
+                    netSide = (member.points[forward].x - originX) * leftX
+                        + (member.points[forward].y - originY) * leftY
+                    netDistance = travelled
+                }
+                let threshold = max(
+                    CorridorLaneScheduling.sideDeadband,
+                    CorridorLaneScheduling.exitAngle * netDistance
+                )
+                if abs(netSide) * strand.metersPerMapPoint >= threshold {
+                    return netSide > 0 ? 1 : -1
                 }
                 return nil
             }
@@ -1924,25 +1926,48 @@ struct WayboundMapView: UIViewRepresentable {
                 let leftX = -direction.1
                 let leftY = direction.0
                 let origin = member.points[originIndex]
+                // Walk the strand's own path forward across the whole
+                // lookahead window and read the NET lateral displacement
+                // at the end. The first threshold crossing flips on the
+                // exact origin vertex -- a knife edge between
+                // implementations -- while the net displacement over the
+                // window is the same wherever in the segment the walk
+                // starts. A gentle fork never clears the deadband across
+                // the window; a bay excursion that returns nets to zero.
                 var forward = originIndex
                 var travelled = 0.0
+                var netSide = 0.0
+                var netDistance = 0.0
                 while forward < member.points.count - 1
                         && travelled < CorridorLaneScheduling.exitLookahead {
-                    let side = (member.points[forward].x - origin.x) * leftX
-                        + (member.points[forward].y - origin.y) * leftY
-                    let threshold = max(
-                        CorridorLaneScheduling.sideDeadband,
-                        CorridorLaneScheduling.exitAngle * travelled
-                    )
-                    if abs(side) * strand.metersPerMapPoint >= threshold {
-                        return side > 0 ? 1 : -1
-                    }
                     travelled += member.points[forward]
                         .distance(to: member.points[forward + 1])
                         * strand.metersPerMapPoint
                     forward += 1
+                    netSide = (member.points[forward].x - origin.x) * leftX
+                        + (member.points[forward].y - origin.y) * leftY
+                    netDistance = travelled
                 }
-                return nil
+                let threshold = max(
+                    CorridorLaneScheduling.sideDeadband,
+                    CorridorLaneScheduling.exitAngle * netDistance
+                )
+                let side: Int?
+                if abs(netSide) * strand.metersPerMapPoint >= threshold {
+                    side = netSide > 0 ? 1 : -1
+                } else {
+                    side = nil
+                }
+                #if DEBUG
+                print(
+                    "[lanes] departureSide cid=\(cid) spine=\(key.journeyID)"
+                    + " outSi=\(outSi) probe=\(probe)"
+                    + " remaining=\(remaining.count)"
+                    + " net=\(netSide * strand.metersPerMapPoint)m"
+                    + " over=\(netDistance)m -> \(String(describing: side))"
+                )
+                #endif
+                return side
             }
 
             func groupSign(_ cid: Int, _ si: Int) -> Int {
@@ -3393,14 +3418,17 @@ struct WayboundMapView: UIViewRepresentable {
             // adoption), matching the scheduler's spine choice downstream.
             let referenceID: Int
             let referenceSegment: MapRouteSegment?
+            let stickyReferenceMatched: Bool
             if let matchedReference = localSegmentByJourneyID[
                 sample.referenceID
             ] {
                 referenceID = sample.referenceID
                 referenceSegment = matchedReference
+                stickyReferenceMatched = true
             } else {
                 referenceID = memberIDs.first ?? journeyID
                 referenceSegment = localSegmentByJourneyID[referenceID]
+                stickyReferenceMatched = false
             }
 
             var alignedStart: MKMapPoint
@@ -3435,7 +3463,8 @@ struct WayboundMapView: UIViewRepresentable {
             // and taper passes interpolate lanes. The displacement is
             // measured on the adopted anchor (the adoption snap is not
             // double-counted) against the exact matched segment.
-            if referenceID != journeyID, let reference = referenceSegment {
+            if referenceID != journeyID, stickyReferenceMatched,
+               let reference = referenceSegment {
                 let refX = reference.unitX, refY = reference.unitY
                 // anchors are left of the OWN travel: flip the reference
                 // frame when this segment runs against the reference
@@ -3445,6 +3474,12 @@ struct WayboundMapView: UIViewRepresentable {
                 let spanX = reference.end.x - reference.start.x
                 let spanY = reference.end.y - reference.start.y
                 let norm2 = spanX * spanX + spanY * spanY
+                // Legitimate corrections are sub-lane (a few metres of
+                // polyline parallax); anything larger means the anchor
+                // was measured against the wrong piece of street (a
+                // fallback reference, a far-away parallel segment) and
+                // would throw the ribbon off the road. Cap at 30 m.
+                let maxShift = 30.0 / metersPerMapPoint
                 if norm2 > 0 {
                     func streetAnchored(_ anchor: MKMapPoint) -> MKMapPoint {
                         var t = ((anchor.x - reference.start.x) * spanX
@@ -3452,8 +3487,9 @@ struct WayboundMapView: UIViewRepresentable {
                         t = min(max(t, 0), 1)
                         let hitX = reference.start.x + t * spanX
                         let hitY = reference.start.y + t * spanY
-                        let delta = ((anchor.x - hitX) * normalX
+                        var delta = ((anchor.x - hitX) * normalX
                             + (anchor.y - hitY) * normalY) * frame
+                        delta = min(max(delta, -maxShift), maxShift)
                         return MKMapPoint(
                             x: anchor.x + delta * segment.unitY,
                             y: anchor.y - delta * segment.unitX

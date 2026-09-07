@@ -596,20 +596,27 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
             probe, remaining) if remaining else seg_dir(probe)
         if direction is None:
             return None
-        # Walk the strand's own path forward, stopping at the first point
-        # clearly off the street-consensus line (origin on the strand's
-        # own point at the probe: immune to the few-metre baseline offsets
-        # between matched polylines). A gentle fork takes tens of metres
-        # to clear the deadband; a fixed short window reads it as a stayer.
+        # Walk the strand's own path forward across the whole lookahead
+        # window and read the NET lateral displacement at the end (origin
+        # on the strand's own point at the probe: immune to the few-metre
+        # baseline offsets between matched polylines). The first threshold
+        # crossing flips on the exact origin vertex -- a knife edge between
+        # implementations -- while the net displacement over the window is
+        # the same wherever in the segment the walk starts. A gentle fork
+        # never clears the deadband across the window; a bay excursion
+        # that returns nets to zero.
         lx, ly = -direction[1], direction[0]
+        ox, oy = cg.points[k]
         fwd, travelled = k, 0.0
+        net_s, net_d = 0.0, 0.0
         while fwd < len(cg.points) - 1 and travelled < EXIT_LOOKAHEAD:
-            s = ((cg.points[fwd][0] - cg.points[k][0]) * lx
-                 + (cg.points[fwd][1] - cg.points[k][1]) * ly)
-            if abs(s) * mm >= max(SIDE_DEADBAND, EXIT_ANGLE * travelled):
-                return 1 if s > 0 else -1
             travelled += dist(cg.points[fwd], cg.points[fwd + 1]) * mm
             fwd += 1
+            net_s = ((cg.points[fwd][0] - ox) * lx
+                     + (cg.points[fwd][1] - oy) * ly)
+            net_d = travelled
+        if abs(net_s) * mm >= max(SIDE_DEADBAND, EXIT_ANGLE * net_d):
+            return 1 if net_s > 0 else -1
         return None
 
 
@@ -693,6 +700,9 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
             lefts, rights = [], []   # outermost first
             for cid, k, gsign, out_si, _ in leaving:
                 side = departure_side(cid, min(out_si, s1))
+                import os as _os
+                if _os.environ.get('FORCE_FLIP') and geoms[cid].num == _os.environ['FORCE_FLIP']:
+                    side = 1 if side == -1 else (-1 if side is not None else None)
                 if side == 1:
                     lefts.append((cid, k))
                 elif side == -1:

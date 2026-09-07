@@ -909,10 +909,16 @@ def _apply_path_delta(g, jid, segs, geoms, scan, mpp=2.0):
         if seg is None:
             continue
         lx, ly = -seg.uy, seg.ux
+        # Legitimate corrections are sub-lane (a few metres of polyline
+        # parallax); anything larger means the anchor was measured against
+        # the wrong piece of street and would throw the ribbon off the
+        # road. Cap at 30 m.
+        cap = 30.0 / mpm(g.coords[0][0])
         shifts = []
         for i in (si, si + 1):
             if cnt[i]:
                 d_raw = (acc[i] / cnt[i]) / k
+                d_raw = max(-cap, min(cap, d_raw))
                 shifts.append((d_raw * lx, d_raw * ly))
             else:
                 shifts.append(None)
