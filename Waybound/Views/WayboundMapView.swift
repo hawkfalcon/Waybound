@@ -1307,6 +1307,14 @@ struct WayboundMapView: UIViewRepresentable {
             static let exitAngle: Double = 0.025
             static let centreClearance = laneSpacing / 4
             static let slotClearance = 0.6 * laneSpacing
+            // Stayers vs leavers: segments a stayer rides past the bound,
+            // the tail tolerance for riding with a route that ends here,
+            // and the own-index slack that recognises a route's last
+            // segments.
+            static let stableHorizon = 24
+            static let tailSlack = 6
+            static let terminalLookback = 8
+            static let terminalSlack = 3
         }
 
         private struct CorridorStrandKey: Hashable {
@@ -1538,7 +1546,39 @@ struct WayboundMapView: UIViewRepresentable {
             }
 
             postFillSchedule(strands, scan, &schedule)
+            pruneIslandScheduleEntries(&schedule)
             return schedule
+        }
+
+        /// One-segment lattice islands: where several corridors' sweeps
+        /// overlap geographically (streets meeting at a corner, a sliver
+        /// run bridged into two sweeps), the first sweep to record an own
+        /// segment can plant the OTHER corridor's lattice value there — a
+        /// lone entry jumping a lane and a half from both neighbours
+        /// inside an otherwise constant run. Drop it and let the bridge
+        /// fill the slot continuously.
+        private func pruneIslandScheduleEntries(
+            _ schedule: inout [CorridorStrandKey: [Int: CorridorScheduledLaneSample]]
+        ) {
+            let laneSpacing = CorridorLaneScheduling.laneSpacing
+            for (strandKey, entries) in schedule {
+                var removals: [Int] = []
+                for index in entries.keys {
+                    guard let before = entries[index - 1],
+                          let after = entries[index + 1],
+                          let island = entries[index]
+                    else { continue }
+                    let a = before.offset, b = island.offset, c = after.offset
+                    if abs(b - a) > 1.5 * laneSpacing
+                        && abs(b - c) > 1.5 * laneSpacing
+                        && abs(a - c) <= laneSpacing {
+                        removals.append(index)
+                    }
+                }
+                for index in removals {
+                    schedule[strandKey]?.removeValue(forKey: index)
+                }
+            }
         }
 
         private func runLength(
@@ -1813,18 +1853,34 @@ struct WayboundMapView: UIViewRepresentable {
                 var y = 0.0
                 let spine = segmentDirection(at: si)
                 for cid in members {
-                    guard let location = ownLocation(cid, si),
-                          let member = memberStrand(location, cid),
-                          location.segmentIndex < member.segments.count,
-                          let segment = member.segments[
-                              location.segmentIndex
-                          ]
-                    else { continue }
-                    let aligned = segment.unitX * spine.0
-                            + segment.unitY * spine.1 >= 0 ? 1.0 : -1.0
-                    x += aligned * segment.unitX
-                    y += aligned * segment.unitY
+                    // Read the member's direction at its nearest matched
+                    // probe within a few spine rows: knife-edge scan rows
+                    // (a member matched on one row but not the next) must
+                    // not flip the consensus the sweep orders lanes by.
+                    var picked: (unitX: Double, unitY: Double)?
+                    for delta in [0, 1, -1, 2, -2, 3, -3] {
+                        let probe = si + delta
+                        guard probe >= s0, probe < rows.count,
+                              let location = ownLocation(cid, probe),
+                              let member = memberStrand(location, cid),
+                              location.segmentIndex < member.segments.count,
+                              let segment = member.segments[
+                                  location.segmentIndex
+                              ]
+                        else { continue }
+                        picked = (segment.unitX, segment.unitY)
+                        break
+                    }
+                    guard let picked else { continue }
+                    let aligned = picked.unitX * spine.0
+                            + picked.unitY * spine.1 >= 0 ? 1.0 : -1.0
+                    x += aligned * picked.unitX
+                    y += aligned * picked.unitY
                 }
+                // The spine's own vote anchors the consensus to the street
+                // the sweep is actually ordering.
+                x += spine.0
+                y += spine.1
                 let length = (x * x + y * y).squareRoot()
                 guard length >= 1e-6 else { return spine }
                 return (x / length, y / length)
@@ -1962,6 +2018,107 @@ struct WayboundMapView: UIViewRepresentable {
                 outward > 0 ? offsets.min() ?? 0 : offsets.max() ?? 0
             }
 
+            /// True when cid stays on this spine well past si — either it
+            /// rides on `stableHorizon`+ segments, or this is its terminal
+            /// stretch (the route ending here, not peeling onto another
+            /// street). Stayers belong beside the members they travel
+            /// with; leavers sit outside however wide the momentary bundle
+            /// is.
+            func travelsFar(_ cid: Int, _ si: Int) -> Bool {
+                let stretches = presence[cid] ?? []
+                for (index, stretch) in stretches.enumerated()
+                where stretch.0 <= si && si < stretch.1 {
+                    if stretch.1 - si > CorridorLaneScheduling.stableHorizon {
+                        return true
+                    }
+                    if index == stretches.count - 1,
+                       stretch.1 - si > CorridorLaneScheduling.terminalLookback {
+                        guard let location = ownLocation(
+                            cid,
+                            stretch.1 - 1
+                        ) ?? nearestOwnLocation(cid, stretch.1 - 1),
+                            let member = memberStrand(location, cid)
+                        else { return false }
+                        return location.segmentIndex >= member.segments.count
+                            - CorridorLaneScheduling.terminalSlack
+                    }
+                    return false
+                }
+                return false
+            }
+
+            /// (centre, width, count) of the lane band the members that
+            /// actually travel with cid justify: those present (or joining
+            /// within the horizon) whose presence runs well past si.
+            /// Strands about to peel do not count — however extreme their
+            /// slots, the bundle collapses the moment they leave. The
+            /// centre is the stable companions' placed median (the band is
+            /// relative to the bundle, not the spine zero); nil when no
+            /// stable companion is placed. Tail companionship (riding with
+            /// cid to the end of its overlap) only counts when cid really
+            /// ends here — its route finishing — rather than the sweep's
+            /// run merely stopping.
+            func stableBound(
+                _ cid: Int,
+                _ si: Int
+            ) -> (centre: Double?, width: Double, count: Int) {
+                var count = 1
+                var comp: [Double] = []
+                let stretches = presence[cid] ?? []
+                let bCid = stretches.first {
+                    $0.0 <= si && si < $0.1
+                }?.1 ?? si + CorridorLaneScheduling.stableHorizon + 1
+                var terminal = false
+                if let location = ownLocation(cid, bCid - 1)
+                    ?? nearestOwnLocation(cid, bCid - 1),
+                    let member = memberStrand(location, cid) {
+                    terminal = location.segmentIndex
+                        >= member.segments.count
+                        - CorridorLaneScheduling.terminalSlack
+                }
+                let horizon = si + CorridorLaneScheduling.stableHorizon
+                for other in presence.keys where other != cid {
+                    var rides = false
+                    for (a, b) in presence[other] ?? [] {
+                        if a <= horizon
+                            && (b > horizon
+                                || (terminal
+                                    && b >= bCid - CorridorLaneScheduling.tailSlack)) {
+                            rides = true
+                            break
+                        }
+                    }
+                    if !rides { continue }
+                    count += 1
+                    if let slot = slots[
+                        corridorPublicRouteKey(for: other)
+                    ] {
+                        comp.append(slot)
+                    }
+                }
+                let width = CorridorLaneScheduling.laneSpacing / 2
+                    * Double(count)
+                guard !comp.isEmpty else { return (nil, width, count) }
+                comp.sort()
+                let mid = comp.count / 2
+                let centre = comp.count % 2 == 1
+                    ? comp[mid]
+                    : (comp[mid - 1] + comp[mid]) / 2
+                return (centre, width, count)
+            }
+
+            /// True when the member owning this public key stays on the
+            /// spine past si (used to collect a stayer's companions).
+            func staysKey(_ slotKey: String, _ si: Int) -> Bool {
+                for other in presence.keys {
+                    if corridorPublicRouteKey(for: other) == slotKey,
+                       travelsFar(other, si) {
+                        return true
+                    }
+                }
+                return false
+            }
+
             func numericRank(_ present: [Int], _ cid: Int) -> Int {
                 var rank = 0
                 for other in present where other != cid {
@@ -1974,9 +2131,27 @@ struct WayboundMapView: UIViewRepresentable {
                 return rank
             }
 
-            func place(_ cid: Int, side: Int?, gsign: Int, rank: Int) -> Double {
+            func place(
+                _ cid: Int,
+                side: Int?,
+                gsign: Int,
+                rank: Int,
+                si: Int
+            ) -> Double {
                 let offsets = groupOffsets(gsign)
                 let outward = gsign >= 0 ? 1 : -1
+                let stayer = travelsFar(cid, si)
+                let band: (centre: Double, width: Double)?
+                if stayer {
+                    let bound = stableBound(cid, si)
+                    band = (bound.centre ?? 0, bound.width)
+                } else {
+                    band = nil
+                }
+                func fits(_ candidate: Double) -> Bool {
+                    guard let band else { return true }
+                    return abs(candidate - band.centre) <= band.width + 1e-9
+                }
                 if offsets.isEmpty {
                     let firstSlot = CorridorLaneScheduling.laneSpacing / 2
                         * Double(gsign)
@@ -1991,6 +2166,65 @@ struct WayboundMapView: UIViewRepresentable {
                     )
                 }
                 if side == nil {
+                    if stayer {
+                        // A stayer with no approach side (born on this
+                        // corridor or riding it to its end) belongs NEXT
+                        // to the members it actually travels with — never
+                        // stacked outside strangers whose extreme slots
+                        // peel off in a few segments.
+                        let slotKey = corridorPublicRouteKey(for: cid)
+                        let compSlots = slots.filter {
+                            $0.key != slotKey && staysKey($0.key, si)
+                        }.map(\.value)
+                        let target: Double
+                        if !compSlots.isEmpty {
+                            let comps = compSlots.sorted()
+                            target = comps[comps.count / 2]
+                        } else {
+                            target = CorridorLaneScheduling.laneSpacing / 2
+                                * Double(gsign)
+                        }
+                        let taken = occupied()
+                        for step in 0..<30 {
+                            let candidates: [Double] = step == 0
+                                ? [target]
+                                : (target >= 0
+                                   ? [
+                                       target
+                                           + CorridorLaneScheduling.laneSpacing
+                                               * Double(step),
+                                       target
+                                           - CorridorLaneScheduling.laneSpacing
+                                               * Double(step)
+                                   ]
+                                   : [
+                                       target
+                                           - CorridorLaneScheduling.laneSpacing
+                                               * Double(step),
+                                       target
+                                           + CorridorLaneScheduling.laneSpacing
+                                               * Double(step)
+                                   ])
+                            for candidate in candidates {
+                                if taken.contains(where: {
+                                    abs(candidate - $0)
+                                        < CorridorLaneScheduling.slotClearance
+                                }) { continue }
+                                if crossesCentre(candidate, gsign: gsign) {
+                                    continue
+                                }
+                                if !fits(candidate) { continue }
+                                return candidate
+                            }
+                        }
+                        return freeSlot(
+                            target,
+                            step: CorridorLaneScheduling.laneSpacing / 2
+                                * Double(outward)
+                        )
+                    }
+                    // A leaver born on the corridor: prefer the slot its
+                    // numeric identity suggests, else step outward.
                     let ordered = offsets.sorted()
                     let target: Double
                     if rank >= ordered.count {
@@ -2014,22 +2248,54 @@ struct WayboundMapView: UIViewRepresentable {
                 if side == outward {
                     let base = outermost(offsets, outward: outward)
                         + CorridorLaneScheduling.laneSpacing * Double(outward)
-                    return freeSlot(
+                    let candidate = freeSlot(
                         base,
                         step: CorridorLaneScheduling.laneSpacing / 2
                             * Double(outward)
                     )
-                }
-                let innerBase = innermost(offsets, outward: outward)
-                    - CorridorLaneScheduling.laneSpacing * Double(outward)
-                if !crossesCentre(innerBase, gsign: gsign) {
-                    let candidate = freeSlot(
-                        innerBase,
-                        step: -CorridorLaneScheduling.laneSpacing / 2
-                            * Double(outward)
-                    )
-                    if !crossesCentre(candidate, gsign: gsign) {
+                    if fits(candidate) {
                         return candidate
+                    }
+                } else {
+                    let innerBase = innermost(offsets, outward: outward)
+                        - CorridorLaneScheduling.laneSpacing * Double(outward)
+                    if !crossesCentre(innerBase, gsign: gsign) {
+                        let candidate = freeSlot(
+                            innerBase,
+                            step: -CorridorLaneScheduling.laneSpacing / 2
+                                * Double(outward)
+                        )
+                        if !crossesCentre(candidate, gsign: gsign),
+                           fits(candidate) {
+                            return candidate
+                        }
+                    }
+                }
+                if let band {
+                    // Outside the band the stable membership justifies:
+                    // take the free rung nearest the band centre, stepping
+                    // outward within the band — the wide adopted extremes
+                    // peel off shortly.
+                    let taken = occupied()
+                    let signs: [Double] = band.centre >= 0 ? [1, -1] : [-1, 1]
+                    for step in 0..<(taken.count + 14) {
+                        for sign in signs {
+                            let candidate = band.centre
+                                + sign
+                                * CorridorLaneScheduling.laneSpacing
+                                * Double(step)
+                            if taken.contains(where: {
+                                abs(candidate - $0)
+                                    < CorridorLaneScheduling.slotClearance
+                            }) { continue }
+                            if crossesCentre(candidate, gsign: gsign) {
+                                continue
+                            }
+                            if abs(candidate - band.centre) > band.width {
+                                continue
+                            }
+                            return candidate
+                        }
                     }
                 }
                 let outerBase = outermost(offsets, outward: outward)
@@ -2082,7 +2348,20 @@ struct WayboundMapView: UIViewRepresentable {
                     let direction = segmentDirection(at: si)
                     let sign: Double = sample.directionX * direction.0
                         + sample.directionY * direction.1 >= 0 ? 1 : -1
-                    slots[slotKey] = sample.offset * sign
+                    let adopted = sample.offset * sign
+                    if travelsFar(cid, si) {
+                        let bound = stableBound(cid, si)
+                        if bound.count > 1,
+                           abs(adopted - (bound.centre ?? 0)) > bound.width {
+                            // Context-foreign slot: the entry was set in
+                            // some other corridor's lattice (an express
+                            // stub where this strand was a momentary outer
+                            // leaver). A stayer here must not inherit it
+                            // five lanes out — leave it for placement.
+                            continue
+                        }
+                    }
+                    slots[slotKey] = adopted
                     slotGroups[slotKey] = groupSign(cid, si)
                 }
             }
@@ -2118,7 +2397,8 @@ struct WayboundMapView: UIViewRepresentable {
                             cid,
                             side: side,
                             gsign: gsign,
-                            rank: rank
+                            rank: rank,
+                            si: si
                         )
                     }
                     return
@@ -2306,22 +2586,66 @@ struct WayboundMapView: UIViewRepresentable {
                         slotGroups.removeValue(forKey: key)
                     }
                     for cid in presentJourneys(si) {
-                        let key = corridorPublicRouteKey(for: cid)
-                        guard slots[key] == nil else { continue }
-                        slotGroups[key] = groupSign(cid, si)
-                        if let remembered = memory[key],
+                        let slotKey = corridorPublicRouteKey(for: cid)
+                        guard slots[slotKey] == nil else { continue }
+                        slotGroups[slotKey] = groupSign(cid, si)
+                        if let remembered = memory[slotKey],
                            occupied().allSatisfy({ abs(remembered - $0)
                                >= CorridorLaneScheduling.slotClearance }) {
-                            slots[key] = remembered
-                            continue
+                            if !travelsFar(cid, si) {
+                                slots[slotKey] = remembered
+                                continue
+                            }
+                            let bound = stableBound(cid, si)
+                            if bound.count == 1
+                                || abs(
+                                    remembered - (bound.centre ?? 0)
+                                ) <= bound.width {
+                                slots[slotKey] = remembered
+                                continue
+                            }
+                        }
+                        // A leaver rejoining (or memory unusable): continue
+                        // its own prior ribbon — the nearest existing
+                        // entry, converted into this spine's frame —
+                        // rather than a fresh lattice slot that jumps the
+                        // drawn lane at the record seam.
+                        if !travelsFar(cid, si) {
+                            let own: CorridorSegmentLocation?
+                            if cid == key.journeyID {
+                                own = CorridorSegmentLocation(
+                                    polylineIndex: key.polylineIndex,
+                                    segmentIndex: si
+                                )
+                            } else {
+                                own = ownLocation(cid, si)
+                                    ?? nearestOwnLocation(cid, si)
+                            }
+                            if let own,
+                               let sample = nearestScheduledSample(cid, own) {
+                                let direction = segmentDirection(at: si)
+                                let sign: Double =
+                                    sample.directionX * direction.0
+                                    + sample.directionY * direction.1 >= 0
+                                    ? 1 : -1
+                                let candidate = sample.offset * sign
+                                if occupied().allSatisfy({
+                                    abs(candidate - $0)
+                                        >= CorridorLaneScheduling.slotClearance
+                                }) {
+                                    slots[slotKey] = candidate
+                                    continue
+                                }
+                            }
                         }
                         let rank = numericRank(presentJourneys(si), cid)
                         let side = exitAwareSide(for: cid, at: si)
-                        slots[key] = place(
+                        slots[slotKey] = place(
                             cid,
                             side: side,
-                            gsign: slotGroups[key] ?? 1,
-                            rank: rank
+                            gsign: slotGroups[slotKey] ?? 1,
+                            rank: rank,
+                            si: si
                         )
                     }
                 }
@@ -3079,8 +3403,8 @@ struct WayboundMapView: UIViewRepresentable {
                 referenceSegment = localSegmentByJourneyID[referenceID]
             }
 
-            let alignedStart: MKMapPoint
-            let alignedEnd: MKMapPoint
+            var alignedStart: MKMapPoint
+            var alignedEnd: MKMapPoint
             if referenceID == journeyID || referenceSegment == nil {
                 alignedStart = segment.start
                 alignedEnd = segment.end
@@ -3098,6 +3422,46 @@ struct WayboundMapView: UIViewRepresentable {
                     onto: referenceSegment!,
                     metersPerMapPoint: metersPerMapPoint
                 )
+            }
+
+            // Street-anchored ribbons: move the adopted anchors laterally
+            // back onto the reference street. Slots are defined against
+            // the street, but the ribbon is drawn from the own path: a
+            // joiner converging from a different starting point (or two
+            // polylines on opposite roads of a divided highway) would
+            // draw its slot shifted by that wander, and where the paths
+            // part at corners, visibly kinked. Shifting the anchors —
+            // not the offsets — keeps slots slot-valued so the bridge
+            // and taper passes interpolate lanes. The displacement is
+            // measured on the adopted anchor (the adoption snap is not
+            // double-counted) against the exact matched segment.
+            if referenceID != journeyID, let reference = referenceSegment {
+                let refX = reference.unitX, refY = reference.unitY
+                // anchors are left of the OWN travel: flip the reference
+                // frame when this segment runs against the reference
+                let frame = (segment.unitX * refX + segment.unitY * refY) >= 0
+                    ? 1.0 : -1.0
+                let normalX = -refY, normalY = refX
+                let spanX = reference.end.x - reference.start.x
+                let spanY = reference.end.y - reference.start.y
+                let norm2 = spanX * spanX + spanY * spanY
+                if norm2 > 0 {
+                    func streetAnchored(_ anchor: MKMapPoint) -> MKMapPoint {
+                        var t = ((anchor.x - reference.start.x) * spanX
+                            + (anchor.y - reference.start.y) * spanY) / norm2
+                        t = min(max(t, 0), 1)
+                        let hitX = reference.start.x + t * spanX
+                        let hitY = reference.start.y + t * spanY
+                        let delta = ((anchor.x - hitX) * normalX
+                            + (anchor.y - hitY) * normalY) * frame
+                        return MKMapPoint(
+                            x: anchor.x + delta * segment.unitY,
+                            y: anchor.y - delta * segment.unitX
+                        )
+                    }
+                    alignedStart = streetAnchored(alignedStart)
+                    alignedEnd = streetAnchored(alignedEnd)
+                }
             }
 
             // Trunk ownership belongs to the dominant public route, not to one

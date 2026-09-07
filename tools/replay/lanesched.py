@@ -146,7 +146,28 @@ def schedule_lanes(geoms, scan):
         for run_idx in run_idxs:
             _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory)
     _post_fill(geoms, scan, arcs, schedule)
+    _prune_islands(schedule)
     return schedule
+
+
+def _prune_islands(schedule):
+    """One-seg lattice islands: where several corridors' sweeps overlap
+    geographically (streets meeting at a corner, a sliver run bridged
+    into two sweeps), the first sweep to record an own segment can plant
+    the OTHER corridor's lattice value there — a lone entry jumping a
+    lane and a half from both neighbours inside an otherwise constant
+    run. Drop it and let the bridge fill the slot continuously."""
+    by_strand = {}
+    for (cid, k), e in schedule.items():
+        by_strand.setdefault(cid, {})[k] = e.offset
+    for cid, offs in by_strand.items():
+        for k in sorted(offs):
+            if (k - 1 not in offs or k + 1 not in offs):
+                continue
+            a, b, c = offs[k - 1], offs[k], offs[k + 1]
+            if (abs(b - a) > 1.5 * LS and abs(b - c) > 1.5 * LS
+                    and abs(a - c) <= LS):
+                del schedule[(cid, k)]
 
 
 def _debounced_presence(rows, s0, s1, cid, arcs):
@@ -313,11 +334,89 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
     def innermost(gofs, outward):
         return min(gofs) if outward > 0 else max(gofs)
 
-    def place(cid, side, gsign, numeric_rank):
+    def travels_far(cid, si):
+        """True when cid runs well past si — a stayer. A stayer stacked
+        outside extreme adopted slots (freed in some wider corridor
+        context) would drift lanes off the street once those peel; a
+        leaver must sit outside however wide the momentary bundle is."""
+        stretches = presence.get(cid, [])
+        for idx, (a, b) in enumerate(stretches):
+            if a <= si < b:
+                if b - si > 24:
+                    return True
+                # Terminal stretch: the route ends here rather than
+                # peeling onto another street — treat as a stayer.
+                if idx == len(stretches) - 1 and b - si > 8:
+                    own = own_index(cid, b - 1)
+                    if own is None:
+                        own = nearest_own_index(cid, b - 1)
+                    n_own = len(geoms[cid].segs)
+                    return own is not None and own >= n_own - 3
+                return False
+        return False
+
+    def stable_bound(cid, si):
+        """(centre, width, n) of the lane band the members that actually
+        travel with cid justify: those present (or joining within the next
+        few segments) whose presence runs well past si. Strands about to
+        peel do not count — however extreme their slots, the bundle
+        collapses the moment they leave. The centre is the stable
+        companions' placed median when known (the band is relative to the
+        bundle, not the spine zero)."""
+        n = 1
+        comp = []
+        b_cid = next((b for a, b in presence.get(cid, []) if a <= si < b),
+                     si + 25)
+        # Tail companionship (riding with cid to the end of its overlap)
+        # only means something when cid really ends here — its route
+        # finishing — rather than the sweep's run merely stopping.
+        own_end = own_index(cid, b_cid - 1)
+        if own_end is None:
+            own_end = nearest_own_index(cid, b_cid - 1)
+        terminal = (own_end is not None
+                    and own_end >= len(geoms[cid].segs) - 3)
+        for m in presence:
+            if m == cid:
+                continue
+            rides = False
+            for a, b in presence[m]:
+                if a <= si + 24 and (b > si + 24
+                                     or (terminal and b >= b_cid - 6)):
+                    rides = True
+                    break
+            if not rides:
+                continue
+            n += 1
+            mk = key_of(m)
+            if mk in slots:
+                comp.append(slots[mk])
+        # n == 1: no stable companion is even present — the strand is on
+        # its own here and its own prior entries are its continuity.
+        if comp:
+            comp.sort()
+            mid = len(comp) // 2
+            if len(comp) % 2:
+                centre = comp[mid]
+            else:
+                centre = (comp[mid - 1] + comp[mid]) / 2.0
+            return centre, LS / 2 * n, n
+        # No placed stable companion: judge against the spine zero.
+        return None, LS / 2 * n, n
+
+    def place(cid, side, gsign, numeric_rank, si=None):
         """Pick this joiner's slot: outside on its approach side, never
         crossing the centreline into the opposing direction group."""
         gofs = group_offsets(gsign)
         outward = 1 if gsign >= 0 else -1
+        stayer = si is not None and travels_far(cid, si)
+        band = None
+        if stayer:
+            centre, width, _n = stable_bound(cid, si)
+            band = (centre if centre is not None else 0.0, width)
+
+        def fits(cand):
+            return (band is None
+                    or abs(cand - band[0]) <= band[1] + 1e-9)
         if not gofs:
             slots_for_group = LS / 2 * gsign
             if all(abs(slots_for_group - v) >= SLOT_CLEARANCE
@@ -325,8 +424,35 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                 return slots_for_group
             return free_slot(slots_for_group, LS / 2 * outward)
         if side is None:
-            # The strand begins on the corridor (trip start / boarding stop):
-            # prefer the slot its numeric identity suggests, else step outward.
+            if stayer:
+                # A stayer with no approach side (born on this corridor or
+                # riding it to its end) belongs NEXT to the members it
+                # actually travels with — never stacked outside strangers
+                # whose extreme slots peel off in a few segments.
+                comp_slots = [slots[k] for k in slots
+                              if k != key_of(cid) and _stays_key(k, si)]
+                if comp_slots:
+                    comps = sorted(comp_slots)
+                    target = comps[len(comps) // 2]
+                else:
+                    target = LS / 2 * gsign
+                occ = occupied()
+                for step in range(0, 30):
+                    cands = ((target,) if step == 0 else
+                             ((target + LS * step, target - LS * step)
+                              if target >= 0 else
+                              (target - LS * step, target + LS * step)))
+                    for cand in cands:
+                        if any(abs(cand - v) < SLOT_CLEARANCE for v in occ):
+                            continue
+                        if crosses_centre(cand, gsign):
+                            continue
+                        if not fits(cand):
+                            continue
+                        return cand
+                return free_slot(target, LS / 2 * outward)
+            # A leaver born on the corridor: prefer the slot its numeric
+            # identity suggests, else step outward.
             ordered = sorted(gofs)
             if numeric_rank >= len(ordered):
                 target = outermost(gofs, outward) + LS * outward
@@ -336,16 +462,45 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
             if all(abs(target - v) >= SLOT_CLEARANCE for v in occupied()):
                 return target
             return free_slot(target, LS / 2 * outward)
+        if DEBUG:
+            print(f"      PLACE {geoms[cid].num} side={side} gsign={gsign}"
+                  f" rank={numeric_rank} band={band}"
+                  f" slots={dict((k, round(v, 1)) for k, v in slots.items())}",
+                  file=sys.stderr)
         if side == outward:
             base = outermost(gofs, outward) + LS * outward
-            return free_slot(base, LS / 2 * outward)
-        base = innermost(gofs, outward) - LS * outward
-        if not crosses_centre(base, gsign):
-            cand = free_slot(base, -LS / 2 * outward)
-            if not crosses_centre(cand, gsign):
+            cand = free_slot(base, LS / 2 * outward)
+            if fits(cand):
                 return cand
+        else:
+            base = innermost(gofs, outward) - LS * outward
+            if not crosses_centre(base, gsign):
+                cand = free_slot(base, -LS / 2 * outward)
+                if not crosses_centre(cand, gsign) and fits(cand):
+                    return cand
+        if band is not None:
+            # Outside the band the stable membership justifies: take the
+            # free rung nearest the band centre, stepping outward within
+            # the band — the wide adopted extremes peel off shortly.
+            centre, width = band
+            occupied_all = occupied()
+            for step in range(0, len(occupied_all) + 14):
+                for sign_step in ((1, -1) if centre >= 0 else (-1, 1)):
+                    cand = centre + sign_step * step * LS
+                    if any(abs(cand - v) < SLOT_CLEARANCE
+                           for v in occupied_all):
+                        continue
+                    if crosses_centre(cand, gsign):
+                        continue
+                    if abs(cand - centre) > width:
+                        continue
+                    return cand
         base = outermost(gofs, outward) + LS * outward
         return free_slot(base, LS / 2 * outward)
+
+    def _stays_key(k, si):
+        return any(key_of(cid) == k and travels_far(cid, si)
+                   for cid in presence)
 
     def adopt_existing(si):
         """Pull already-scheduled lanes into this sweep's state (converted
@@ -370,7 +525,17 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                 continue
             d = seg_dir(si)
             sign = 1 if entry.dx * d[0] + entry.dy * d[1] >= 0 else -1
-            slots[k] = entry.offset * sign
+            adopted = entry.offset * sign
+            if travels_far(cid, si):
+                centre, width, n_stable = stable_bound(cid, si)
+                if n_stable > 1 and abs(adopted - (centre or 0.0)) > width:
+                    # Context-foreign slot: the entry was set in some
+                    # other corridor's lattice (an express stub where
+                    # this strand was a momentary outer leaver). A stayer
+                    # here must not inherit it five lanes out — leave it
+                    # for placement.
+                    continue
+            slots[k] = adopted
             slot_groups[k] = group_sign(cid, si)
 
     def consensus_direction(si, members):
@@ -380,15 +545,27 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
         xs, ys = 0.0, 0.0
         d = seg_dir(si)
         for cid in members:
-            k = own_index(cid, si)
-            if k is None:
-                continue
-            seg = geoms[cid].segs[k] if k < len(geoms[cid].segs) else None
+            seg = None
+            for delta in (0, 1, -1, 2, -2, 3, -3):
+                probe = si + delta
+                if probe < s0 or probe >= len(rows):
+                    continue
+                hit = matched(cid, probe)
+                if hit is None:
+                    continue
+                k = geoms[cid].seg_index.get(id(hit))
+                seg = (geoms[cid].segs[k]
+                       if k is not None and k < len(geoms[cid].segs)
+                       else None)
+                if seg is not None:
+                    break
             if seg is None:
                 continue
             s = 1 if seg.ux * d[0] + seg.uy * d[1] >= 0 else -1
             xs += s * seg.ux
             ys += s * seg.uy
+        xs += d[0]
+        ys += d[1]
         length = math.hypot(xs, ys)
         if length < 1e-6:
             return d
@@ -449,6 +626,24 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                     continue
                 gsign = group_sign(cid, si)
                 slot_groups[k] = gsign
+                # A leaver rejoining (or memory unusable): continue its own
+                # prior ribbon — the nearest existing entry, converted into
+                # this spine's frame — rather than a fresh lattice slot that
+                # jumps the drawn lane at the record seam.
+                own = (si if cid == jid else own_index(cid, si))
+                if own is None and cid != jid:
+                    own = nearest_own_index(cid, si)
+                entry = (_nearest_entry(schedule, cid, own)
+                         if own is not None else None)
+                if entry is not None and not travels_far(cid, si):
+                    d = seg_dir(si)
+                    sign = (1 if entry.dx * d[0] + entry.dy * d[1] >= 0
+                            else -1)
+                    cand = entry.offset * sign
+                    if all(abs(cand - v) >= SLOT_CLEARANCE
+                           for v in occupied()):
+                        slots[k] = cand
+                        continue
                 rank = _numeric_rank(geoms, present_journeys(si), cid, slots,
                                      key_of)
                 side = join_side(cid, si)
@@ -458,7 +653,7 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                     out_si = next((b for a, b in presence[cid]
                                    if a <= si < b), s1)
                     side = exit_side(cid, min(out_si, s1))
-                slots[k] = place(cid, side, gsign, rank)
+                slots[k] = place(cid, side, gsign, rank, si=si)
                 if DEBUG:
                     print(f"    [sweep {geoms[jid].num}] join {geoms[cid].num}"
                           f" side={side} gsign={gsign} rank={rank}"
@@ -598,8 +793,13 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                 slot_groups[k] = gsign
                 if k in memory and all(abs(memory[k] - v) >= SLOT_CLEARANCE
                                        for v in occupied()):
-                    slots[k] = memory[k]
-                    continue
+                    if not travels_far(cid, si):
+                        slots[k] = memory[k]
+                        continue
+                    centre, width, n_stable = stable_bound(cid, si)
+                    if n_stable == 1 or abs(memory[k] - (centre or 0.0)) <= width:
+                        slots[k] = memory[k]
+                        continue
                 rank = _numeric_rank(geoms, present_journeys(si), cid, slots,
                                      key_of)
                 side = join_side(cid, si)
@@ -613,7 +813,7 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                     out_si = next((b for a, b in presence[cid]
                                    if a <= si < b), s1)
                     side = exit_side(cid, min(out_si, s1))
-                slots[k] = place(cid, side, gsign, rank)
+                slots[k] = place(cid, side, gsign, rank, si=si)
                 if DEBUG:
                     print(f"    [sweep {geoms[jid].num}] join {geoms[cid].num}"
                           f" side={side} gsign={gsign} rank={rank}"

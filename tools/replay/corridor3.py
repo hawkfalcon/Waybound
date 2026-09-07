@@ -855,6 +855,73 @@ def _spine_delta(g, ref_id, geoms, held, mpp=2.0):
     return out
 
 
+def _apply_path_delta(g, jid, segs, geoms, scan, mpp=2.0):
+    """Move each shared vertex's adopted anchor laterally back onto the
+    reference street polyline. Slots are defined against the street, but
+    the ribbon is drawn from the own path: a journey whose polyline
+    wanders laterally -- a joiner converging from a different starting
+    point, two routes' polylines on opposite sides of a divided highway --
+    would draw its slot shifted by that wander, and where the paths part
+    at corners, visibly kinked. Shifting the ANCHORS (not the offsets)
+    keeps slot offsets slot-valued, so the bridge and taper machinery
+    interpolates lanes rather than frame-shifted values. The shift is
+    measured on the adopted endpoints (the 6 m adoption snap is not
+    double-counted) against the exact matched segment of the reference,
+    in the reference's sign-stable held frame."""
+    k = mpm(g.coords[0][0]) / mpp
+    held_cache = {}
+    acc = [0.0] * len(g.points)
+    cnt = [0] * len(g.points)
+    for si, L in enumerate(segs):
+        if L is None:
+            continue
+        seg = g.segs[si]
+        ref_seg = scan[jid][si].get(L.ref_id) if scan[jid][si] else None
+        if ref_seg is None or seg is None:
+            continue
+        rg = geoms[L.ref_id]
+        if L.ref_id not in held_cache:
+            held_cache[L.ref_id] = held_directions(rg)
+        ridx = rg.seg_index.get(id(ref_seg))
+        rh = (held_cache[L.ref_id].get(ridx)
+              if ridx is not None else None) or (ref_seg.ux, ref_seg.uy)
+        # anchors are left of the OWN travel: flip the reference frame
+        # when this segment runs against the reference's held chain
+        f = 1.0 if seg.ux * rh[0] + seg.uy * rh[1] >= 0 else -1.0
+        nx, ny = -rh[1], rh[0]
+        dx = ref_seg.e[0] - ref_seg.s[0]
+        dy = ref_seg.e[1] - ref_seg.s[1]
+        norm2 = dx * dx + dy * dy
+        if norm2 <= 0:
+            continue
+        for i, p in ((si, L.a_s), (si + 1, L.a_e)):
+            t = ((p[0] - ref_seg.s[0]) * dx
+                 + (p[1] - ref_seg.s[1]) * dy) / norm2
+            t = max(0.0, min(1.0, t))
+            hx = ref_seg.s[0] + t * dx
+            hy = ref_seg.s[1] + t * dy
+            acc[i] += ((p[0] - hx) * nx + (p[1] - hy) * ny) * k * f
+            cnt[i] += 1
+    for si, L in enumerate(segs):
+        if L is None:
+            continue
+        seg = g.segs[si]
+        if seg is None:
+            continue
+        lx, ly = -seg.uy, seg.ux
+        shifts = []
+        for i in (si, si + 1):
+            if cnt[i]:
+                d_raw = (acc[i] / cnt[i]) / k
+                shifts.append((d_raw * lx, d_raw * ly))
+            else:
+                shifts.append(None)
+        if shifts[0] is not None:
+            L.a_s = (L.a_s[0] - shifts[0][0], L.a_s[1] - shifts[0][1])
+        if shifts[1] is not None:
+            L.a_e = (L.a_e[0] - shifts[1][0], L.a_e[1] - shifts[1][1])
+
+
 def scheduled_layouts(geoms, scan, schedule, selected=None, highlighted=None):
     layouts = {}
     for jid, g in geoms.items():
@@ -872,6 +939,7 @@ def scheduled_layouts(geoms, scan, schedule, selected=None, highlighted=None):
             segs.append(CorridorSeg(offset, a_s, a_e, ref_id,
                                     trunk_owner(geoms, scan, jid, si,
                                                 selected, highlighted) or False))
+        _apply_path_delta(g, jid, segs, geoms, scan)
         layouts[jid] = pipeline(g, segs)
     return layouts
 
