@@ -2563,9 +2563,7 @@ struct WayboundMapView: UIViewRepresentable {
                     else { continue }
                     founders[cid] = start
                 }
-                for cid in founders.keys.sorted {
-                    corridorLaneComesBefore($0, $1)
-                } {
+                for cid in founders.keys.sorted(by: corridorLaneComesBefore) {
                     let key = corridorPublicRouteKey(for: cid)
                     guard slots[key] == nil else { continue }
                     guard let start = founders[cid] else { continue }
