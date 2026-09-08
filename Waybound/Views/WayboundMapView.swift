@@ -1303,6 +1303,11 @@ struct WayboundMapView: UIViewRepresentable {
             static let gapChordRatio: Double = 0.75
             static let sideLookahead: Double = 45
             static let exitLookahead: Double = 120
+            static let turnWindow: Double = 150
+            static let birthGrace: Double = 40
+            static let collapseShare: Double = 0.05
+            static let collapseRatio: Double = 4
+            static let collapseMinimum = 1.0 * laneSpacing
             static let sideDeadband: Double = 2
             static let exitAngle: Double = 0.025
             static let centreClearance = laneSpacing / 4
@@ -1997,6 +2002,74 @@ struct WayboundMapView: UIViewRepresentable {
                 return side
             }
 
+            func turnSide(_ cid: Int, _ outSi: Int) -> Int? {
+                // Ladder side for a straight-continuer where the corridor
+                // itself turns: the spine bends off the pre-turn line while
+                // this strand stays on it (it goes straight through the
+                // junction the corridor turns at). Its ribbon belongs on
+                // the OUTSIDE of the corridor's turn -- the side opposite
+                // the spine's departure -- or the turning bundle sweeps
+                // its arc across the continuer's straight ribbon.
+                var probe = max(s0, min(outSi, s1) - 1)
+                var match: CorridorMemberMatch?
+                while probe >= s0 {
+                    if let candidate = matched(cid, probe) {
+                        match = candidate
+                        break
+                    }
+                    probe -= 1
+                }
+                guard let match, let member = memberStrand(
+                    match.location,
+                    cid
+                ) else { return nil }
+                let originIndex = match.location.segmentIndex
+                guard originIndex < member.points.count - 1 else {
+                    return nil
+                }
+                let direction = segmentDirection(at: probe)
+                let leftX = -direction.1
+                let leftY = direction.0
+
+                func netDisplacement(
+                    _ points: [MKMapPoint],
+                    from start: Int
+                ) -> Double {
+                    // Net displacement along the pre-turn normal over the
+                    // window, from this polyline's own start point (immune
+                    // to the few-metre baseline offsets between matched
+                    // polylines).
+                    let origin = points[start]
+                    var forward = start
+                    var travelled = 0.0
+                    var lateral = 0.0
+                    while forward < points.count - 1
+                            && travelled < CorridorLaneScheduling.turnWindow {
+                        travelled += points[forward]
+                            .distance(to: points[forward + 1])
+                            * strand.metersPerMapPoint
+                        forward += 1
+                        lateral = (points[forward].x - origin.x) * leftX
+                            + (points[forward].y - origin.y) * leftY
+                    }
+                    return lateral * strand.metersPerMapPoint
+                }
+
+                let memberSide = netDisplacement(
+                    member.points,
+                    from: originIndex
+                )
+                let spineSide = netDisplacement(strand.points, from: probe)
+                let gate = max(
+                    CorridorLaneScheduling.sideDeadband,
+                    1.5 * CorridorLaneScheduling.exitAngle
+                        * CorridorLaneScheduling.turnWindow
+                )
+                guard abs(memberSide) < gate,
+                      abs(spineSide) > 2 * gate else { return nil }
+                return spineSide > 0 ? -1 : 1
+            }
+
             func groupSign(_ cid: Int, _ si: Int) -> Int {
                 guard let location = ownLocation(cid, si),
                       let member = memberStrand(location, cid),
@@ -2470,12 +2543,35 @@ struct WayboundMapView: UIViewRepresentable {
                     let side: Int?
                 }
                 var cohort: [CohortMember] = []
-                for cid in presentJourneys(si) {
+                // Run-start grace: presence that begins within a few tens
+                // of metres of the birth sample is a founding member whose
+                // first segment simply has no stable scan match (polyline
+                // starts, stop driveways) -- not a mid-run joiner. It
+                // belongs in the fork walk with the rest of the founding
+                // bundle, or it lands on the outer edge a sample later and
+                // the ladder is backwards.
+                var founders: [Int: Int] = presentJourneys(si)
+                    .reduce(into: [:]) { $0[$1] = si }
+                for (cid, stretches) in presence {
+                    guard founders[cid] == nil else { continue }
+                    guard let start = stretches
+                        .first(where: { s0 <= $0.0 && $0.0 <= s1 })?.0
+                    else { continue }
+                    guard strand.arc[start] - strand.arc[si] > 0,
+                          strand.arc[start] - strand.arc[si]
+                              <= CorridorLaneScheduling.birthGrace
+                    else { continue }
+                    founders[cid] = start
+                }
+                for cid in founders.keys.sorted {
+                    corridorLaneComesBefore($0, $1)
+                } {
                     let key = corridorPublicRouteKey(for: cid)
                     guard slots[key] == nil else { continue }
-                    let gsign = groupSign(cid, si)
+                    guard let start = founders[cid] else { continue }
+                    let gsign = groupSign(cid, start)
                     let outSi = presence[cid]?
-                        .first { $0.0 <= si && si < $0.1 }?.1
+                        .first { $0.0 <= start && start < $0.1 }?.1
                         ?? s1
                     cohort.append(
                         CohortMember(
@@ -2523,18 +2619,36 @@ struct WayboundMapView: UIViewRepresentable {
                     var lefts: [CohortMember] = []
                     var rights: [CohortMember] = []
                     for member in leaving {
+                        let turn = turnSide(
+                            member.journeyID,
+                            min(member.outSi, s1)
+                        )
                         if snake {
                             // Staircase: every exit takes the same side of
                             // the ladder, ordered by exit point -- first-out
                             // outermost. The local side only separates ties
-                            // at one point.
-                            lefts.append(member)
+                            // at one point -- except a continuer the
+                            // corridor turns AWAY from (turnSide -1): it
+                            // takes the opposite side, or the turning
+                            // bundle sweeps across its straight ribbon.
+                            if turn == -1 {
+                                rights.append(member)
+                            } else {
+                                lefts.append(member)
+                            }
                             continue
                         }
-                        switch departureSide(
+                        var side = departureSide(
                             member.journeyID,
                             min(member.outSi, s1)
-                        ) {
+                        )
+                        if let turn {
+                            // A straight-continuer at a corridor turn: its
+                            // side is the outside of the turn, not the
+                            // local peel side.
+                            side = turn
+                        }
+                        switch side {
                         case 1: lefts.append(member)
                         case -1: rights.append(member)
                         default: stayers.append(member)
@@ -2651,6 +2765,78 @@ struct WayboundMapView: UIViewRepresentable {
                     where !after.contains(key) && slots[key] != nil {
                         memory[key] = slots.removeValue(forKey: key)
                         slotGroups.removeValue(forKey: key)
+                    }
+                    // Momentary-crowd collapse: a stub of pass-throughs (a
+                    // transit center, a ramp share) holds the founding
+                    // ladder's outer rungs and parks the corridor's own
+                    // long riders off their street -- displaced to draw a
+                    // parallel stripe, then never returned. When that
+                    // crowd peels, translate the whole surviving lattice
+                    // back onto the street (median slot -> 0). One rigid
+                    // shift per departure: order and spacing are
+                    // untouched, and corridors whose leavers are real
+                    // bundle members (a twentieth of the run or more)
+                    // never fire.
+                    let departedKeys = before.filter { !after.contains($0) }
+                    if !departedKeys.isEmpty, !slots.isEmpty {
+                        let runLength = strand.arc[s1] - strand.arc[s0]
+                        let memberIDByKey = presence.reduce(
+                            into: [String: Int]()
+                        ) { partial, pair in
+                            partial[
+                                corridorPublicRouteKey(for: pair.key)
+                            ] = pair.key
+                        }
+                        func endStretchLength(_ cid: Int) -> Double {
+                            // The stretch that just ended -- a member with
+                            // a long stretch elsewhere (it returns further
+                            // down the run) is not a long rider leaving.
+                            guard let stretches = presence[cid] else {
+                                return 0
+                            }
+                            for (start, end) in stretches
+                            where start <= previous! && previous! < end {
+                                return strand.arc[end] - strand.arc[start]
+                            }
+                            return 0
+                        }
+                        func longestStretch(_ cid: Int) -> Double {
+                            guard let stretches = presence[cid] else {
+                                return 0
+                            }
+                            return stretches
+                                .map { strand.arc[$0.1] - strand.arc[$0.0] }
+                                .max() ?? 0
+                        }
+                        let departedLength = departedKeys
+                            .compactMap { memberIDByKey[$0] }
+                            .map { endStretchLength($0) }
+                            .max() ?? 0
+                        let survivorLength = presence
+                            .filter { slots[
+                                corridorPublicRouteKey(for: $0.key)
+                            ] != nil }
+                            .map { longestStretch($0.key) }
+                            .max() ?? 0
+                        if departedLength
+                                < CorridorLaneScheduling.collapseShare
+                                    * runLength,
+                           survivorLength
+                                >= CorridorLaneScheduling.collapseRatio
+                                    * departedLength {
+                            let sortedValues = slots.values.sorted()
+                            let count = sortedValues.count
+                            let median: Double = count % 2 == 1
+                                ? sortedValues[count / 2]
+                                : (sortedValues[count / 2 - 1]
+                                   + sortedValues[count / 2]) / 2
+                            if abs(median)
+                                    > CorridorLaneScheduling.collapseMinimum {
+                                for slotKey in slots.keys {
+                                    slots[slotKey]! -= median
+                                }
+                            }
+                        }
                     }
                     for cid in presentJourneys(si) {
                         let slotKey = corridorPublicRouteKey(for: cid)
@@ -3026,6 +3212,50 @@ struct WayboundMapView: UIViewRepresentable {
                             deltaX: &alignmentDeltaX,
                             deltaY: &alignmentDeltaY
                         )
+                    }
+                }
+            }
+
+            // Hairpin decays — a ribbon holding lanes through a ~180°
+            // turn of its own street loops off the road: the lane offset
+            // exceeds the turn radius, so the innermost arc inverts.
+            // Bring the offset to zero at the reversal vertex and let it
+            // regrow on the far side, so the ribbon traces its own street
+            // through the turn.
+            if points.count > 2 {
+                let hairpinTaper: CLLocationDistance = 58
+                for reversal in 1..<(points.count - 1) {
+                    let u0x = points[reversal].x - points[reversal - 1].x
+                    let u0y = points[reversal].y - points[reversal - 1].y
+                    let u1x = points[reversal + 1].x - points[reversal].x
+                    let u1y = points[reversal + 1].y - points[reversal].y
+                    let l0 = hypot(u0x, u0y)
+                    let l1 = hypot(u1x, u1y)
+                    guard l0 > 1e-6, l1 > 1e-6 else { continue }
+                    if (u0x / l0) * (u1x / l1) + (u0y / l0) * (u1y / l1)
+                            >= -0.6 {
+                        continue  // not a reversal
+                    }
+                    offsets[reversal] = 0
+                    var accumulated: CLLocationDistance = 0
+                    for backIndex in stride(
+                        from: reversal - 1,
+                        through: 0,
+                        by: -1
+                    ) {
+                        accumulated += points[backIndex].distance(
+                            to: points[backIndex + 1]
+                        ) * metersPerMapPoint
+                        if accumulated >= hairpinTaper { break }
+                        offsets[backIndex] *= accumulated / hairpinTaper
+                    }
+                    accumulated = 0
+                    for forwardIndex in (reversal + 1)..<points.count {
+                        accumulated += points[forwardIndex - 1].distance(
+                            to: points[forwardIndex]
+                        ) * metersPerMapPoint
+                        if accumulated >= hairpinTaper { break }
+                        offsets[forwardIndex] *= accumulated / hairpinTaper
                     }
                 }
             }

@@ -376,6 +376,38 @@ def pipeline(g, seg_layouts, rate_clamp=ALIGNMENT_RATE_CLAMP):
             if math.hypot(cx, cy) > math.hypot(adx[fi], ady[fi]):
                 adx[fi], ady[fi] = cx, cy
 
+    # hairpin decays — a ribbon holding lanes through a ~180° turn of its
+    # own street loops off the road: the lane offset exceeds the turn
+    # radius, so the innermost arc inverts. Bring the offset to zero at
+    # the reversal vertex and let it regrow on the far side, so the
+    # ribbon traces its own street through the turn.
+    T3 = TAPER_DISTANCE
+    for r in range(1, n - 1):
+        pax, pay = pts[r - 1]
+        pbx, pby = pts[r]
+        pcx, pcy = pts[r + 1]
+        u0x, u0y = pbx - pax, pby - pay
+        u1x, u1y = pcx - pbx, pcy - pby
+        l0 = math.hypot(u0x, u0y)
+        l1 = math.hypot(u1x, u1y)
+        if l0 < 1e-6 or l1 < 1e-6:
+            continue
+        if (u0x / l0) * (u1x / l1) + (u0y / l0) * (u1y / l1) >= -0.6:
+            continue   # not a reversal
+        offsets[r] = 0.0
+        acc = 0.0
+        for bi in range(r - 1, -1, -1):
+            acc += dist(pts[bi], pts[bi + 1]) * m
+            if acc >= T3:
+                break
+            offsets[bi] *= acc / T3
+        acc = 0.0
+        for fi in range(r + 1, n):
+            acc += dist(pts[fi - 1], pts[fi]) * m
+            if acc >= T3:
+                break
+            offsets[fi] *= acc / T3
+
     # alignment rate clamp — two symmetric passes
     if rate_clamp:
         for i in range(1, n):

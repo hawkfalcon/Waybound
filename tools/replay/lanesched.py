@@ -6,7 +6,10 @@ cut through the bundle. This module replaces only that lane choice:
 
   * one pass per connected group of shared runs ("corridor")
   * a strand's lane is chosen once, when it enters the corridor, and is held
-    for as long as it continues — continuing strands never move
+    for as long as it continues — continuing strands never move (one rigid
+    exception: when a momentary stub crowd peels off, the surviving lattice
+    translates back onto the street so long riders are never stranded off
+    their own road)
   * joiners enter at the outer edge of the side they approach from
   * leavers keep their lane and peel away; freed slots are remembered so a
     dropout-and-return reclaims its own lane
@@ -39,6 +42,11 @@ GAP_BRIDGE = 150.0         # presence dropouts up to this hold their lane
 GAP_CHORD_RATIO = 0.75     # straight-path gate for holding a lane through one
 SIDE_LOOKAHEAD = 45.0      # metres of own geometry read for a join side
 EXIT_LOOKAHEAD = 120.0     # metres walked to decide a departure side
+TURN_WINDOW = 150.0        # metres walked to spot a corridor turn at an exit
+BIRTH_GRACE = 40.0         # presence starting this close to run start births
+COLLAPSE_SHARE = 0.05      # a departing crowd this small (share of run) is a stub
+COLLAPSE_RATIO = 4.0       # survivors must out-ride the stub crowd this much
+COLLAPSE_MIN = 1.0 * LS    # only translate when parked this far off the street
 SIDE_DEADBAND = 2.0        # metres off the reference line before a side counts
 EXIT_ANGLE = 0.025         # a departure must also diverge faster than ~1.4
                            # degrees: gentle same-street curvature stays a
@@ -626,6 +634,51 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
             return 1 if net_s > 0 else -1
         return None
 
+    def turn_side(cid, out_si):
+        """Ladder side for a straight-continuer where the corridor itself
+        turns: the spine bends off the pre-turn line while this strand
+        stays on it (it goes straight through the junction the corridor
+        turns at). Its ribbon belongs on the OUTSIDE of the corridor's
+        turn -- the side opposite the spine's departure -- or the turning
+        bundle sweeps its arc across the continuer's straight ribbon.
+        Returns None when no corridor turn is at hand at this exit."""
+        probe = max(s0, min(out_si, s1) - 1)
+        hit = None
+        while probe >= s0:
+            hit = matched(cid, probe)
+            if hit is not None:
+                break
+            probe -= 1
+        if hit is None:
+            return None
+        k = geoms[cid].seg_index.get(id(hit))
+        if k is None:
+            return None
+        cg = geoms[cid]
+        d = seg_dir(probe)
+        lx, ly = -d[1], d[0]
+
+        def _net(points, start):
+            """Net displacement along the pre-turn normal over the
+            window, from this polyline's own start point (immune to the
+            few-metre baseline offsets between matched polylines)."""
+            ox, oy = points[start]
+            fwd, travelled = start, 0.0
+            s = 0.0
+            while fwd < len(points) - 1 and travelled < TURN_WINDOW:
+                travelled += dist(points[fwd], points[fwd + 1]) * mm
+                fwd += 1
+                s = ((points[fwd][0] - ox) * lx
+                     + (points[fwd][1] - oy) * ly)
+            return s * mm
+
+        s_cid = _net(cg.points, k)
+        s_spine = _net(g.points, probe)
+        gate = max(SIDE_DEADBAND, 1.5 * EXIT_ANGLE * TURN_WINDOW)
+        if abs(s_cid) < gate and abs(s_spine) > 2 * gate:
+            return -1 if s_spine > 0 else 1
+        return None
+
 
     def birth(si):
         """Order a corridor's first bundle. Exit-aware: the first strand to
@@ -679,12 +732,31 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                           f" -> offset {slots[k]:.2f}", file=sys.stderr)
             return
         cohort = []
+        # Run-start grace: presence that begins within a few tens of
+        # metres of the birth sample is a founding member whose first
+        # segment simply has no stable scan match (polyline starts,
+        # stop driveways) -- not a mid-run joiner. It belongs in the
+        # fork walk with the rest of the founding bundle, or it lands
+        # on the outer edge a sample later and the ladder is backwards.
+        founders = {}   # cid -> presence start on this run
         for cid in present_journeys(si):
+            founders[cid] = si
+        for cid in presence:
+            if cid in founders:
+                continue
+            a = next((a for a, b in presence[cid] if s0 <= a <= s1), None)
+            if a is None or not (0 < arcs[jid][a] - arcs[jid][si]
+                                 <= BIRTH_GRACE):
+                continue
+            founders[cid] = a
+        for cid in sorted(founders, key=lambda c: geoms[c].sort_key()):
             k = key_of(cid)
             if k in slots:
                 continue
-            gsign = group_sign(cid, si)
-            out_si = next((b for a, b in presence[cid] if a <= si < b), s1)
+            start = founders[cid]
+            gsign = group_sign(cid, start)
+            out_si = next((b for a, b in presence[cid] if a <= start < b),
+                          s1)
             cohort.append((cid, k, gsign, out_si, None))
             slot_groups[k] = gsign
         with_group = [x for x in cohort if x[2] >= 0]
@@ -712,11 +784,22 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
             lefts, rights = [], []   # outermost first
             for cid, k, gsign, out_si, _ in leaving:
                 side = departure_side(cid, min(out_si, s1))
+                tside = turn_side(cid, min(out_si, s1))
+                if tside is not None:
+                    # A straight-continuer at a corridor turn: its side is
+                    # the outside of the turn, not the local peel side.
+                    side = tside
                 if snake:
                     # Staircase: every exit takes the same side of the
                     # ladder, ordered by exit point -- first-out outermost.
-                    # The local side only separates ties at one point.
-                    lefts.append((cid, k))
+                    # The local side only separates ties at one point --
+                    # except a continuer the corridor turns AWAY from
+                    # (turn_side -1): it takes the opposite side, or the
+                    # turning bundle sweeps across its straight ribbon.
+                    if tside == -1:
+                        rights.append((cid, k))
+                    else:
+                        lefts.append((cid, k))
                 elif side == 1:
                     lefts.append((cid, k))
                 elif side == -1:
@@ -729,7 +812,8 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                 print(f"      fork-walk s0={s0} s1={s1} jid={geoms[jid].num}")
                 for cid, k, gsign, out_si, _ in leaving:
                     print(f"        leave {geoms[cid].num:>3} out_si={out_si}"
-                          f" side={departure_side(cid, min(out_si, s1))}")
+                          f" side={departure_side(cid, min(out_si, s1))}"
+                          f" turn={turn_side(cid, min(out_si, s1))}")
                 for x in stayers:
                     print(f"        stay  {geoms[x[0]].num:>3}")
                 seq_dbg = (rights if sign >= 0 else lefts) + middles
@@ -819,6 +903,54 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                 if k not in after and k in slots:
                     memory[k] = slots.pop(k)
                     slot_groups.pop(k, None)
+            # Momentary-crowd collapse: a stub of pass-throughs (a transit
+            # center, a ramp share) holds the founding ladder's outer rungs
+            # and parks the corridor's own long riders off their street --
+            # displaced to draw a parallel stripe, then never returned.
+            # When that crowd peels, translate the whole surviving lattice
+            # back onto the street (median slot -> 0). One rigid shift per
+            # departure: order and spacing are untouched, and corridors
+            # whose leavers are real bundle members (a sixth of the run or
+            # more) never fire.
+            dep_keys = [k for k in before if k not in after]
+            if dep_keys and slots:
+                run_len = arcs[jid][s1] - arcs[jid][s0]
+
+                def _plen(cid):
+                    return max((arcs[jid][b] - arcs[jid][a]
+                                for a, b in presence.get(cid, [])),
+                               default=0.0)
+
+                def _endlen(cid):
+                    # the stretch that just ended -- a member with a long
+                    # stretch elsewhere (it returns further down the run)
+                    # is not a long rider leaving, only its ending stretch
+                    # counts as the departing crowd
+                    for a, b in presence.get(cid, []):
+                        if a <= prev < b:
+                            return arcs[jid][b] - arcs[jid][a]
+                    return 0.0
+
+                by_key = {key_of(c): c for c in presence}
+                dep_len = max((_endlen(by_key[k]) for k in dep_keys
+                               if k in by_key), default=0.0)
+                surv_len = max((_plen(c) for c in presence
+                                if key_of(c) in slots), default=0.0)
+                if (dep_len < COLLAPSE_SHARE * run_len
+                        and surv_len >= COLLAPSE_RATIO * dep_len):
+                    vals = sorted(slots.values())
+                    n_vals = len(vals)
+                    mid = (vals[n_vals // 2] if n_vals % 2 else
+                           (vals[n_vals // 2 - 1]
+                            + vals[n_vals // 2]) / 2.0)
+                    if abs(mid) > COLLAPSE_MIN:
+                        if DEBUG:
+                            print(f"    [sweep {geoms[jid].num}] collapse "
+                                  f"after {dep_len:.0f} m crowd: "
+                                  f"median {mid / LS:+.1f} lanes",
+                                  file=sys.stderr)
+                        for k in slots:
+                            slots[k] -= mid
             for cid in present_journeys(si):
                 k = key_of(cid)
                 if k in slots:
