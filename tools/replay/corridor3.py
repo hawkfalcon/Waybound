@@ -35,6 +35,7 @@ MAX_GAP_DISTANCE = 150.0       # bridgeShortCorridorGaps
 MAX_LANE_CHANGE = LS * 1.1
 GAP_CHORD_RATIO = 0.75
 TAPER_DISTANCE = 58.0
+CORNER_DOT = 0.25              # hairpin/corner decays: turn sharper than ~75deg
 ALIGNMENT_RATE_CLAMP = 0.08    # metres per metre
 ADOPTION_CAP = 6.0
 
@@ -380,7 +381,9 @@ def pipeline(g, seg_layouts, rate_clamp=ALIGNMENT_RATE_CLAMP):
     # own street loops off the road: the lane offset exceeds the turn
     # radius, so the innermost arc inverts. Bring the offset to zero at
     # the reversal vertex and let it regrow on the far side, so the
-    # ribbon traces its own street through the turn.
+    # ribbon traces its own street through the turn. (Sharp but non-
+    # reversing corridor corners are funnelled by the scheduler, in
+    # spine-arc space, where every co-member shares one frame.)
     T3 = TAPER_DISTANCE
     for r in range(1, n - 1):
         pax, pay = pts[r - 1]
@@ -568,6 +571,19 @@ def _spine_frame(spine, geoms, mpp):
         d0, d1 = dirs[i - 1], dirs[i]
         if d0[0] * d1[0] + d0[1] * d1[1] < math.cos(math.radians(8)):
             turn[i] = 1
+    # Sharp-corner funnel windows: the scheduler decays every slot
+    # toward a >= ~75-degree spine corner and regrows it past the turn
+    # over TAPER_DISTANCE. That dive-and-regrow is corner geometry the
+    # whole bundle performs together, not a strand sliding on its
+    # neighbours — exclude those windows from the drift metric the
+    # way the one-vertex miter pinch is excluded.
+    for i in range(1, len(pts) - 1):
+        d0, d1 = dirs[i - 1], dirs[i]
+        if d0[0] * d1[0] + d0[1] * d1[1] < CORNER_DOT:
+            lo = bisect.bisect_left(arc, arc[i] - TAPER_DISTANCE)
+            hi = bisect.bisect_right(arc, arc[i] + TAPER_DISTANCE)
+            for j in range(lo, min(hi, len(turn))):
+                turn[j] = 1
     return {"pts": pts, "normals": dirs, "arc": arc, "turn": turn}
 
 
