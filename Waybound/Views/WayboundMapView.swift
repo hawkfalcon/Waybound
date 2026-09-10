@@ -1308,8 +1308,6 @@ struct WayboundMapView: UIViewRepresentable {
             static let collapseShare: Double = 0.05
             static let collapseRatio: Double = 4
             static let collapseMinimum = 1.0 * laneSpacing
-            static let cornerDot: Double = 0.25
-            static let cornerTaper: Double = 58
             static let sideDeadband: Double = 2
             static let exitAngle: Double = 0.025
             static let centreClearance = laneSpacing / 4
@@ -2685,90 +2683,6 @@ struct WayboundMapView: UIViewRepresentable {
                 }
             }
 
-            // Corner funnels — the sticky reference's path is the
-            // street the bundle rides, and its sharp turns are where
-            // a lane bundle wider than the corner's inscribed radius
-            // breaks: the inside flanks of ribbons d1/d2 metres out
-            // cross about (d1+d2) from the vertex, and the outside
-            // sweep cuts across any member peeling off at the
-            // junction. Decay every emitted slot toward the corner
-            // and regrow past it — linear in the reference's arc, the
-            // SAME factor for every member at a sample (the one frame
-            // all co-members share), so the ladder order survives the
-            // funnel and no two ribbons cross while taper^2 exceeds
-            // the product of their depths. A member's own turn over a
-            // straight reference is a join/leave fan and never fires
-            // here; the rendering-side hairpin decays handle a
-            // member's own-path reversals.
-            var cornerArcCache: [CorridorStrandKey: [Double]] = [:]
-
-            func cornerArcs(
-                of strandKey: CorridorStrandKey,
-                journeyID: Int
-            ) -> [Double] {
-                if let cached = cornerArcCache[strandKey] {
-                    return cached
-                }
-                var out: [Double] = []
-                var k0 = Int.max
-                var k1 = Int.min
-                for si in s0..<s1 {
-                    guard let location = ownLocation(journeyID, si),
-                          location.polylineIndex == strandKey.polylineIndex
-                    else { continue }
-                    k0 = min(k0, location.segmentIndex)
-                    k1 = max(k1, location.segmentIndex)
-                }
-                if k0 <= k1, let strand = strands[strandKey] {
-                    let points = strand.points
-                    var r = max(1, k0 + 1)
-                    let limit = min(points.count - 1, k1 - 1)
-                    while r < limit {
-                        let u0x = points[r].x - points[r - 1].x
-                        let u0y = points[r].y - points[r - 1].y
-                        let u1x = points[r + 1].x - points[r].x
-                        let u1y = points[r + 1].y - points[r].y
-                        let q0 = hypot(u0x, u0y)
-                        let q1 = hypot(u1x, u1y)
-                        if q0 > 1e-6, q1 > 1e-6,
-                           (u0x * u1x + u0y * u1y) / (q0 * q1)
-                               < CorridorLaneScheduling.cornerDot {
-                            out.append(strand.arc[r])
-                        }
-                        r += 1
-                    }
-                }
-                cornerArcCache[strandKey] = out
-                return out
-            }
-
-            func cornerFactor(_ referenceID: Int, at si: Int) -> Double {
-                guard let location = ownLocation(referenceID, si)
-                else { return 1.0 }
-                let strandKey = CorridorStrandKey(
-                    journeyID: referenceID,
-                    polylineIndex: location.polylineIndex
-                )
-                let corners = cornerArcs(
-                    of: strandKey,
-                    journeyID: referenceID
-                )
-                guard !corners.isEmpty, let strand = strands[strandKey]
-                else { return 1.0 }
-                let a = strand.arc[location.segmentIndex]
-                var factor = 1.0
-                for c in corners {
-                    let d = abs(a - c)
-                    if d < CorridorLaneScheduling.cornerTaper {
-                        factor = min(
-                            factor,
-                            d / CorridorLaneScheduling.cornerTaper
-                        )
-                    }
-                }
-                return factor
-            }
-
             func record(_ bstart: Int, _ bend: Int, _ siRef: Int) {
                 let present = presentJourneys(siRef)
                 let referenceKeys = Set(
@@ -2785,13 +2699,12 @@ struct WayboundMapView: UIViewRepresentable {
                 guard let referenceID = stickyReferenceID else { return }
                 for si in bstart..<bend {
                     let direction = segmentDirection(at: si)
-                    let funnel = cornerFactor(referenceID, at: si)
                     let spineKey = corridorPublicRouteKey(for: key.journeyID)
                     if let spineSlot = slots[spineKey],
                        schedule[key]?[si] == nil {
                         schedule[key, default: [:]][si] =
                             CorridorScheduledLaneSample(
-                                offset: spineSlot * funnel,
+                                offset: spineSlot,
                                 directionX: direction.0,
                                 directionY: direction.1,
                                 referenceID: referenceID
@@ -2811,7 +2724,7 @@ struct WayboundMapView: UIViewRepresentable {
                             == nil else { continue }
                         schedule[memberKey, default: [:]][location.segmentIndex] =
                             CorridorScheduledLaneSample(
-                                offset: offset * funnel,
+                                offset: offset,
                                 directionX: direction.0,
                                 directionY: direction.1,
                                 referenceID: referenceID

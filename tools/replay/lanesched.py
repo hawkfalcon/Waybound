@@ -34,8 +34,7 @@ DEBUG = bool(os.environ.get("LANESCHED_DEBUG"))
 
 sys.path.insert(0, ".")
 from corridor2 import LS
-from corridor3 import (membership_scan, sorted_members, MIN_SHARED_DISTANCE,
-                       TAPER_DISTANCE, CORNER_DOT)
+from corridor3 import membership_scan, sorted_members, MIN_SHARED_DISTANCE
 from geo import mpm, dist
 
 JOIN_MIN = 30.0            # presence stretch shorter than this is not a join
@@ -838,60 +837,6 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                 slots[x[1]] = slot
                 slot += LS * sign
 
-    # Corner funnels — the sticky reference's path is the street the
-    # bundle rides, and its sharp turns are where a lane bundle wider
-    # than the corner's inscribed radius breaks: the inside flanks of
-    # ribbons d1/d2 metres out cross about (d1+d2) from the vertex,
-    # and the outside sweep cuts across any member peeling off at the
-    # junction. Decay every emitted slot toward the corner and regrow
-    # past it — linear in the reference's arc, the SAME factor for
-    # every member at a sample (the one frame all co-members share),
-    # so the ladder order survives the funnel and no two ribbons cross
-    # while TAPER_DISTANCE^2 exceeds the product of their depths. A
-    # member's own turn over a straight reference is a join/leave fan
-    # and never fires here; the rendering-side hairpin decays handle a
-    # member's own-path reversals.
-    _corner_cache = {}
-
-    def corner_arcs_of(cid):
-        if cid in _corner_cache:
-            return _corner_cache[cid]
-        gp = geoms[cid].points
-        ga = arcs[cid]
-        ks = [own_index(cid, si) for si in range(s0, s1)]
-        ks = [k for k in ks if k is not None]
-        out = []
-        if ks:
-            k0, k1 = min(ks), max(ks)
-            for r in range(max(1, k0 + 1), min(len(gp) - 1, k1 - 1)):
-                u0x, u0y = (gp[r][0] - gp[r - 1][0],
-                            gp[r][1] - gp[r - 1][1])
-                u1x, u1y = (gp[r + 1][0] - gp[r][0],
-                            gp[r + 1][1] - gp[r][1])
-                q0 = math.hypot(u0x, u0y)
-                q1 = math.hypot(u1x, u1y)
-                if q0 < 1e-6 or q1 < 1e-6:
-                    continue
-                if (u0x * u1x + u0y * u1y) / (q0 * q1) < CORNER_DOT:
-                    out.append(ga[r])
-        _corner_cache[cid] = out
-        return out
-
-    def corner_factor(ref, si):
-        cs = corner_arcs_of(ref)
-        if not cs:
-            return 1.0
-        k = own_index(ref, si)
-        if k is None:
-            return 1.0
-        a = arcs[ref][k]
-        f = 1.0
-        for c in cs:
-            d = abs(a - c)
-            if d < TAPER_DISTANCE:
-                f = min(f, d / TAPER_DISTANCE)
-        return f
-
     def record(bstart, bend, si_ref):
         present = present_journeys(si_ref)
         ref_keys = {key_of(c) for c in present}
@@ -902,11 +847,9 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
             return
         for si in range(bstart, bend):
             d = seg_dir(si)
-            f = corner_factor(ref_jid, si)
             spine_slot = slots.get(key_of(jid))
             if spine_slot is not None and (jid, si) not in schedule:
-                schedule[(jid, si)] = LaneSample(
-                    spine_slot * f, d[0], d[1], ref_jid)
+                schedule[(jid, si)] = LaneSample(spine_slot, d[0], d[1], ref_jid)
             for cid in present:
                 offset = slots.get(key_of(cid))
                 if offset is None:
@@ -916,8 +859,7 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                     continue
                 if (cid, k) in schedule:
                     continue
-                schedule[(cid, k)] = LaneSample(
-                    offset * f, d[0], d[1], ref_jid)
+                schedule[(cid, k)] = LaneSample(offset, d[0], d[1], ref_jid)
 
     # A winding street: the spine's direction rotates across the run
     # (circulators, TC loops). "Left" and "right" then flip at every bend,
