@@ -1345,6 +1345,10 @@ struct WayboundMapView: UIViewRepresentable {
             let segments: [MapRouteSegment?]
             let arc: [Double]
             let metersPerMapPoint: Double
+            // For sums of x/y coordinate deltas (normal projections), which
+            // are Mercator units, not whatever MKMapPoint.distance() returns
+            // on the current SDK world. See TripPathGeometry's two scales.
+            let planarMetersPerMapPoint: Double
         }
 
         private struct CorridorMemberMatch {
@@ -1381,6 +1385,10 @@ struct WayboundMapView: UIViewRepresentable {
                     let points = coordinates.map { MKMapPoint($0) }
                     let metersPerMapPoint = TripPathGeometry
                         .metersPerMapPoint(atLatitude: coordinates[0].latitude)
+                    let planarMetersPerMapPoint = TripPathGeometry
+                        .planarMetersPerMapPoint(
+                            atLatitude: coordinates[0].latitude
+                        )
                     var segments: [MapRouteSegment?] = []
                     var arc: [Double] = [0]
                     for index in 0..<(points.count - 1) {
@@ -1405,7 +1413,8 @@ struct WayboundMapView: UIViewRepresentable {
                         points: points,
                         segments: segments,
                         arc: arc,
-                        metersPerMapPoint: metersPerMapPoint
+                        metersPerMapPoint: metersPerMapPoint,
+                        planarMetersPerMapPoint: planarMetersPerMapPoint
                     )
 
                     var directions: [(x: Double, y: Double)] = []
@@ -1789,7 +1798,7 @@ struct WayboundMapView: UIViewRepresentable {
                 let leftY = direction.0
                 let side = (point.x - origin.x) * leftX
                     + (point.y - origin.y) * leftY
-                if abs(side) * strand.metersPerMapPoint < 2 {
+                if abs(side) * strand.planarMetersPerMapPoint < 2 {
                     return nil
                 }
                 return side > 0 ? 1 : -1
@@ -1862,7 +1871,7 @@ struct WayboundMapView: UIViewRepresentable {
                     CorridorLaneScheduling.sideDeadband,
                     CorridorLaneScheduling.exitAngle * netDistance
                 )
-                if abs(netSide) * strand.metersPerMapPoint >= threshold {
+                if abs(netSide) * strand.planarMetersPerMapPoint >= threshold {
                     return netSide > 0 ? 1 : -1
                 }
                 return nil
@@ -1985,7 +1994,7 @@ struct WayboundMapView: UIViewRepresentable {
                     1.5 * CorridorLaneScheduling.exitAngle * netDistance
                 )
                 let side: Int?
-                if abs(netSide) * strand.metersPerMapPoint >= threshold {
+                if abs(netSide) * strand.planarMetersPerMapPoint >= threshold {
                     side = netSide > 0 ? 1 : -1
                 } else {
                     side = nil
@@ -1993,10 +2002,10 @@ struct WayboundMapView: UIViewRepresentable {
                 #if DEBUG
                 print(
                     "[lanes] departureSide cid=\(cid) spine=\(key.journeyID)"
-                    + " outSi=\(outSi) probe=\(probe)"
-                    + " remaining=\(remaining.count)"
-                    + " net=\(netSide * strand.metersPerMapPoint)m"
-                    + " over=\(netDistance)m -> \(String(describing: side))"
+                        + " outSi=\(outSi) probe=\(probe)"
+                        + " remaining=\(remaining.count)"
+                        + " net=\(netSide * strand.planarMetersPerMapPoint)m"
+                        + " over=\(netDistance)m -> \(String(describing: side))"
                 )
                 #endif
                 return side
@@ -2038,7 +2047,10 @@ struct WayboundMapView: UIViewRepresentable {
                     // Net displacement along the pre-turn normal over the
                     // window, from this polyline's own start point (immune
                     // to the few-metre baseline offsets between matched
-                    // polylines).
+                    // polylines). The lateral is a sum of coordinate
+                    // deltas — Mercator units — so it takes the planar
+                    // scale; travelled is an MKMapPoint.distance() sum, so
+                    // it takes the distance-calibrated one.
                     let origin = points[start]
                     var forward = start
                     var travelled = 0.0
@@ -2052,7 +2064,7 @@ struct WayboundMapView: UIViewRepresentable {
                         lateral = (points[forward].x - origin.x) * leftX
                             + (points[forward].y - origin.y) * leftY
                     }
-                    return lateral * strand.metersPerMapPoint
+                    return lateral * strand.planarMetersPerMapPoint
                 }
 
                 let memberSide = netDisplacement(
