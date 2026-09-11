@@ -2523,11 +2523,56 @@ struct WayboundMapView: UIViewRepresentable {
             func birth(_ si: Int) {
                 if !slots.isEmpty {
                     // Chained sweep start where earlier lanes exist.
+                    let spineKey = key
                     for cid in presentJourneys(si) {
                         let key = corridorPublicRouteKey(for: cid)
                         guard slots[key] == nil else { continue }
                         let gsign = groupSign(cid, si)
                         slotGroups[key] = gsign
+                        // Continue this strand's prior ribbon when it has
+                        // one: the nearest existing entry, converted into
+                        // this spine's frame (see adoptExisting). A leaver
+                        // always continues it. A stayer continues it when
+                        // the entry's reference journey rides this sweep:
+                        // the entry was then recorded against a street this
+                        // sweep covers, and re-deriving the slot from this
+                        // spine's reads can pick the opposite side at the
+                        // record seam, swinging the ribbon across its
+                        // companions at the boundary (a terminal served by
+                        // one spine per route: two sweeps of the same
+                        // {routes} must agree on every side). A
+                        // context-foreign entry -- its reference not
+                        // present here -- still falls through to
+                        // placement.
+                        let own: CorridorSegmentLocation?
+                        if cid == spineKey.journeyID {
+                            own = CorridorSegmentLocation(
+                                polylineIndex: spineKey.polylineIndex,
+                                segmentIndex: si
+                            )
+                        } else {
+                            own = ownLocation(cid, si)
+                                ?? nearestOwnLocation(cid, si)
+                        }
+                        if let own,
+                           let sample = nearestScheduledSample(cid, own) {
+                            let direction = segmentDirection(at: si)
+                            let sign: Double = sample.directionX
+                                * direction.0 + sample.directionY
+                                * direction.1 >= 0 ? 1 : -1
+                            let candidate = sample.offset * sign
+                            let clear = occupied().allSatisfy {
+                                abs(candidate - $0)
+                                    >= CorridorLaneScheduling.slotClearance
+                            }
+                            if clear {
+                                if !travelsFar(cid, si)
+                                        || presence[sample.referenceID] != nil {
+                                    slots[key] = candidate
+                                    continue
+                                }
+                            }
+                        }
                         let rank = numericRank(presentJourneys(si), cid)
                         var side = exitAwareSide(for: cid, at: si)
                         if snake, side != nil {

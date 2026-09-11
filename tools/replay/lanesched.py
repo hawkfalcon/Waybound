@@ -711,6 +711,29 @@ def _sweep(geoms, scan, arcs, m, runs, run_idx, schedule, memory):
                            for v in occupied()):
                         slots[k] = cand
                         continue
+                if entry is not None and travels_far(cid, si):
+                    # A stayer re-derives its slot from THIS spine's reads
+                    # below -- unless its prior ribbon already rides this
+                    # same street. When the prior entry's reference journey
+                    # is itself present in this sweep, the entry was
+                    # recorded against a street this sweep covers (a
+                    # terminal served by one spine per route: 3's sweep and
+                    # 5's own sweep share {3, 5, 7}); re-deriving the slot
+                    # from this spine's reads can pick the opposite side at
+                    # the record seam, and the ribbon swings across its
+                    # companions at the boundary (5's west-end terminus
+                    # flapping). A context-foreign entry -- set in some
+                    # other corridor's lattice, whose reference is not here
+                    # -- still falls through to placement.
+                    if entry.ref_id in presence:
+                        d = seg_dir(si)
+                        sign = (1 if entry.dx * d[0] + entry.dy * d[1] >= 0
+                                else -1)
+                        cand = entry.offset * sign
+                        if all(abs(cand - v) >= SLOT_CLEARANCE
+                               for v in occupied()):
+                            slots[k] = cand
+                            continue
                 rank = _numeric_rank(geoms, present_journeys(si), cid, slots,
                                      key_of)
                 side = join_side(cid, si)
