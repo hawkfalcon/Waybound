@@ -1,0 +1,69 @@
+name: swift-build
+
+on:
+  push:
+    branches: [main, arena/01a05bbd-waybound]
+  pull_request:
+
+jobs:
+  build:
+    # iOS builds require macOS (Apple tooling license); public repos
+    # get free macOS minutes.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios || true
+
+      - name: Build (iOS Simulator, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Waybound.xcodeproj \
+            -scheme Waybound \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | xcbeautify || \
+          xcodebuild \
+            -project Waybound.xcodeproj \
+            -scheme Waybound \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: xcodebuild-log
+          path: build/**/*.log
+          if-no-files-found: ignore
+
+  tests:
+    runs-on: macos-26
+    continue-on-error: true   # experimental: needs a simulator runtime
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick an available simulator
+        id: sim
+        run: |
+          dev=$(xcrun simctl list devices available | grep -oE 'iPhone [^ (]+' | head -1)
+          echo "device=${dev}" >> "$GITHUB_OUTPUT"
+          echo "using: ${dev:-NONE}"
+
+      - name: Unit tests
+        if: steps.sim.outputs.device != ''
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Waybound.xcodeproj \
+            -scheme Waybound \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.device }}" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            test

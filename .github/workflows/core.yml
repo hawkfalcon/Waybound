@@ -1,0 +1,72 @@
+name: core
+
+on:
+  push:
+    branches: [main, arena/01a05bbd-waybound]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    # The pure core (WayboundCore SPM package): no Apple frameworks, so it
+    # builds and tests on Linux — free, fast, no macOS queue. The golden
+    # tests recompute the lane membership scan over every committed export
+    # fixture and hold it to the device's own schedule.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: swift test
+        run: |
+          set -o pipefail
+          swift test --package-path WayboundCore 2>&1 | tee test.log
+
+      # The agent's sandbox cannot reach the Actions log/artifact hosts, but
+      # it CAN read PR comments through the GitHub API — so the branch's PR
+      # comment thread is the report channel for the iterate-from-CI loop.
+      # (checkout@v4 leaves a detached HEAD, so `gh pr view` cannot infer the
+      # branch — resolve it explicitly from the event env.)
+      - name: report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          n=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" \
+                --state open --json number --jq '.[0].number' 2>&1 || true)
+          case "$n" in
+            ''|*[!0-9]*) n=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+                              --head "$branch" --state all \
+                              --json number --jq '.[0].number' 2>/dev/null || true);;
+          esac
+          {
+            echo "## core — run ${GITHUB_RUN_NUMBER} (\`${GITHUB_SHA:0:7}\`, branch ${branch})"
+            echo
+            echo '```'
+            grep 'SCAN-GOLDEN' test.log || echo "(no scan-golden lines)"
+            echo '```'
+            echo
+            if grep -q 'error:' test.log; then
+              echo "### compiler/test errors"
+              echo '```'
+              grep 'error:' test.log | sort -u | head -30
+              echo '```'
+            fi
+            echo '```'
+            tail -n 4 test.log
+            echo '```'
+          } > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$n" ]; then
+            gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --edit-last --body-file report.md \
+              || gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --body-file report.md \
+              || echo "(could not post PR comment)"
+          else
+            echo "(no PR found for branch ${branch}; report left in the step summary)"
+          fi

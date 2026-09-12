@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import WayboundCore
 
 /// Typed rider-facing identity keeps discovery, deduplication, and the final
 /// route budget from quietly using different string formats for the same

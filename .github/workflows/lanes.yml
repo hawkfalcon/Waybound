@@ -1,0 +1,51 @@
+name: lanes
+
+on:
+  push:
+    branches: [main, arena/01a05bbd-waybound]
+  pull_request:
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: lane_check on every export fixture
+        working-directory: tools/replay
+        run: |
+          status=0
+          for f in data/waybound-lanes-*.json; do
+            echo "::group::lane_check $f"
+            python3 lane_check.py "$f" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: ingest newest export (port check must be clean)
+        working-directory: tools/replay
+        run: |
+          f=$(ls -1 data/waybound-lanes-*.json | sort | tail -1)
+          echo "newest fixture: $f"
+          python3 ingest.py "$f" | tee ingest.log
+          if grep -q "PORT DIVERGENCE" ingest.log; then
+            echo "::error::Swift/pipeline port divergence on $f"
+            exit 1
+          fi
+          grep "scheduler check" ingest.log || true
+
+      - name: scheduler fuzz (gate 45 problem seeds, baseline 42)
+        working-directory: tools/replay
+        run: |
+          set +e
+          python3 lane_fuzz.py > fuzz.log 2>&1
+          tail -5 fuzz.log
+          n=$(sed -n 's/.*fuzz: \([0-9][0-9]*\) problem seeds.*/\1/p' fuzz.log | tail -1)
+          echo "problem seeds: ${n:-unknown} (gate 45, baseline 42)"
+          if [ -z "$n" ] || [ "$n" -gt 45 ]; then
+            echo "::error::lane fuzz regressed"
+            exit 1
+          fi

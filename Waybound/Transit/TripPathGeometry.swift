@@ -44,6 +44,32 @@ enum TripPathGeometry {
         return meterDistance / pointDistance
     }
 
+    /// Meters per unit of MKMapPoint coordinate difference. The runtime
+    /// calibration above converts `MKMapPoint.distance()` — on the
+    /// meter-based MapKit world of the Xcode 26 SDKs that already returns
+    /// ground-true meters — but coordinate differences themselves are still
+    /// Web Mercator, so a sum of x/y deltas converted with it overcounts by
+    /// ~1/cos(latitude) (21% in Santa Barbara). Lane-side reads that
+    /// project geometry onto a corridor normal are exactly that
+    /// arithmetic; this scale, calibrated from the coordinate differences
+    /// themselves, converts them. The two agree wherever
+    /// `MKMapPoint.distance` is planar.
+    static func planarMetersPerMapPoint(atLatitude latitude: CLLocationDegrees) -> Double {
+        let origin = CLLocationCoordinate2D(latitude: latitude, longitude: 0)
+        let sample = CLLocationCoordinate2D(latitude: latitude, longitude: 0.01)
+        let componentDX = abs(MKMapPoint(sample).x - MKMapPoint(origin).x)
+        let meterDistance = CLLocation(
+            latitude: origin.latitude,
+            longitude: origin.longitude
+        ).distance(
+            from: CLLocation(latitude: sample.latitude, longitude: sample.longitude)
+        )
+        guard componentDX > 0, meterDistance > 0 else {
+            return 1.0 / MKMapPointsPerMeterAtLatitude(latitude)
+        }
+        return meterDistance / componentDX
+    }
+
     /// Very large jumps are almost always malformed coordinates. These high
     /// thresholds intentionally favor retaining legitimate intercity service.
     static func maximumGeometryJump(for routeType: Int) -> CLLocationDistance {
