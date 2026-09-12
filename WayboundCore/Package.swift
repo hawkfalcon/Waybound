@@ -8,10 +8,19 @@ let package = Package(
     ],
     products: [
         .library(name: "WayboundCore", targets: ["WayboundCore"]),
+        .executable(
+            name: "waybound-lanelab",
+            targets: ["waybound-lanelab"]
+        ),
     ],
     targets: [
         .target(
             name: "WayboundCore",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "waybound-lanelab",
+            dependencies: ["WayboundCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
