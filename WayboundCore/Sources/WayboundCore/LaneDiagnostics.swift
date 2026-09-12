@@ -46,6 +46,10 @@ public struct LaneDiagnosticsDocument {
     public let schedule: [ScheduleStrand]
     public let layouts: [LayoutStrand]
     public let laneSpacingPoints: Double
+    /// The journey selected on the device at export time (-1 encodes
+    /// "none"): it pins corridor dominance in the layout pass, so the
+    /// golden tests replay it.
+    public let selectedJourneyID: Int?
 
     public init(data: Data) throws {
         let obj = try JSONSerialization.jsonObject(with: data)
@@ -161,6 +165,12 @@ public struct LaneDiagnosticsDocument {
         self.layouts = layouts
         self.laneSpacingPoints =
             (root["laneSpacingPoints"] as? NSNumber)?.doubleValue ?? 4.2
+        if let rawSelected = (root["selectedJourneyID"] as? NSNumber)?.intValue,
+           rawSelected >= 0 {
+            selectedJourneyID = rawSelected
+        } else {
+            selectedJourneyID = nil
+        }
     }
 
     public init(url: URL) throws {

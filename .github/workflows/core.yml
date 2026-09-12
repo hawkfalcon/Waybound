@@ -56,6 +56,10 @@ jobs:
             grep 'SCHED-GOLDEN' test.log | head -70 || echo "(no sched-golden lines)"
             echo '```'
             echo
+            echo '```'
+            grep 'LAYOUT-GOLDEN' test.log | head -40 || echo "(no layout-golden lines)"
+            echo '```'
+            echo
             if grep -q 'error:' test.log; then
               echo "### compiler/test errors"
               echo '```'
