@@ -794,7 +794,8 @@ enum LaneHarness {
                 }
                 let anchorStart: ProjectedPoint
                 let anchorEnd: ProjectedPoint
-                if let reference = lane.reference, lane.referenceID != index {
+                let reference = lane.reference
+                if lane.referenceID != index {
                     anchorStart = adoptionProjection(
                         of: strand.segments[si]!.start,
                         onto: reference,
