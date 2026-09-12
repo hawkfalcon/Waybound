@@ -413,11 +413,9 @@ enum LaneHarness {
             strands[strandIndex],
             cache: &heldCache
         )
-        if segmentIndex >= held.count {
-            print("SCHEDLANE DBG strand \(strandIndex) id \(strands[strandIndex].id) si \(segmentIndex) held \(held.count) segs \(strands[strandIndex].segments.count) scan \(scan[strandIndex].count) schedKeys \(schedule[strandIndex]?.keys.count ?? -1) maxSched \(schedule[strandIndex]?.keys.max() ?? -1)")
-            return nil
-        }
-        let basis = held[segmentIndex]
+        let basis = segmentIndex < held.count
+            ? held[segmentIndex]
+            : (x: segment.unitX, y: segment.unitY)
         let sign: Double = basis.x * entry.directionX
             + basis.y * entry.directionY >= 0 ? 1 : -1
         let reference = scan[strandIndex][segmentIndex].first {
@@ -1560,9 +1558,13 @@ enum LaneHarness {
 
 extension LaneHarness.Strand {
     var identifierKey: Int {
-        // Stable per-strand hash for the held-direction cache.
-        var hasher = Hasher()
-        hasher.combine(id)
-        return hasher.finalize()
+        // Deterministic per-strand key for the held-direction cache
+        // (djb2 over the id's UTF-8; Hasher's seed is random per process,
+        // which once let two ids collide on one run and not the next).
+        var hash: UInt64 = 5381
+        for byte in id.utf8 {
+            hash = ((hash &<< 5) &+ hash) &+ UInt64(byte)
+        }
+        return Int(bitPattern: hash >> 1)
     }
 }

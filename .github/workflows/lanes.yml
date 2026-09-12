@@ -54,7 +54,7 @@ jobs:
             echo
             echo '```'
             grep -hE 'LANE-CHECK|LANE-FUZZ|PROBE' check.log fuzz.log \
-              | head -70 || echo "(no lane lines)"
+              | head -140 || echo "(no lane lines)"
             echo '```'
             echo
             echo '```'

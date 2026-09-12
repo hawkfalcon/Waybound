@@ -383,6 +383,35 @@ final class LaneCheckTests: XCTestCase {
             LaneScenarios.strandGeometry("c", "3", 0, LaneScenarios.strand(trunk, trunkArcs, 150, 400, sideIn: -1)),
         ])
         run("8-state_trunk", LaneScenarios.stateTrunk())
+
+        // dropout schedule profile: python gives every strand a perfectly
+        // constant offset (j1 -6.3, j2 -2.1, j3 +2.1, j5 +6.3, all ref j1)
+        let dropoutStrands = LaneScenarios.dropout()
+        print("PROBE 9-dropout begin")
+        let dropoutJourneys = dropoutStrands.enumerated().map { index, strand in
+            LaneDiagnosticsDocument.Journey(
+                id: index,
+                routeNumber: strand.num,
+                agency: strand.agency,
+                directionID: strand.direction,
+                stackOrder: index,
+                departures: strand.departures,
+                polylines: [strand.coords]
+            )
+        }
+        let dropoutSchedule = CorridorLaneSchedule.schedule(
+            journeys: dropoutJourneys,
+            laneSpacingPoints: LaneHarness.laneSpacing
+        )
+        for (key, entries) in dropoutSchedule.sorted(by: {
+            $0.key.journeyID < $1.key.journeyID
+        }) {
+            let offsets = entries.values.map { $0.offset }
+            let refs = Set(entries.values.map { $0.referenceID })
+            print("PROBE 9-dropout j\(key.journeyID) n \(entries.count) "
+                + "offsets [\(offsets.min() ?? 0), \(offsets.max() ?? 0)] "
+                + "refs \(refs.sorted())")
+        }
         print("PROBE all ok")
     }
 
