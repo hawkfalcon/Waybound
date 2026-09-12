@@ -65,8 +65,8 @@ public struct LaneDiagnosticsDocument {
                         var coords: [GeoCoordinate] = []
                         for pair in rawPolyline {
                             guard pair.count == 2,
-                                  let lat = LaneDiagnostics.number(pair[0]),
-                                  let lon = LaneDiagnostics.number(pair[1])
+                                  let lat = LaneDiagnosticsDocument.number(pair[0]),
+                                  let lon = LaneDiagnosticsDocument.number(pair[1])
                             else { throw LaneDiagnosticsError.badCoordinate }
                             coords.append(
                                 GeoCoordinate(latitude: lat, longitude: lon)
@@ -101,9 +101,9 @@ public struct LaneDiagnosticsDocument {
                 for rawEntry in rawEntries {
                     guard rawEntry.count == 5,
                           let seg = (rawEntry[0] as? NSNumber)?.intValue,
-                          let offset = LaneDiagnostics.number(rawEntry[1]),
-                          let dx = LaneDiagnostics.number(rawEntry[2]),
-                          let dy = LaneDiagnostics.number(rawEntry[3]),
+                          let offset = LaneDiagnosticsDocument.number(rawEntry[1]),
+                          let dx = LaneDiagnosticsDocument.number(rawEntry[2]),
+                          let dy = LaneDiagnosticsDocument.number(rawEntry[3]),
                           let ref = (rawEntry[4] as? NSNumber)?.intValue
                     else { throw LaneDiagnosticsError.badEntry }
                     entries.append(
@@ -136,7 +136,7 @@ public struct LaneDiagnosticsDocument {
                       let rawShared = raw["shared"] as? [Any]
                 else { throw LaneDiagnosticsError.badLayout }
                 let offsets = rawOffsets.compactMap {
-                    LaneDiagnostics.number($0)
+                    LaneDiagnosticsDocument.number($0)
                 }
                 let shared = rawShared.map {
                     ($0 as? NSNumber)?.boolValue ?? false

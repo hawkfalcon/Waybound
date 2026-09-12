@@ -185,8 +185,9 @@ public enum CorridorMembership {
             }
         }
 
-        private func cellKey(_ x: Int, _ y: Int) -> Int64 {
-            (Int64(x) << 32) ^ Int64(bitPattern: Int64(y))
+        private func cellKey(_ x: Int, _ y: Int) -> UInt64 {
+            UInt64(UInt32(bitPattern: Int32(x))) << 32
+                | UInt64(UInt32(bitPattern: Int32(y)))
         }
 
         func candidateIndices(near point: ProjectedPoint) -> [Int] {
