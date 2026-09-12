@@ -61,7 +61,14 @@ final class LaneScheduleGoldenTests: XCTestCase {
     /// Fixtures exported from a build of current main. These are held to
     /// the full golden contract: offset share <= 0.5%, reference share
     /// <= 1%, row agreement >= 99%.
-    private static let pinnedFixtures: Set<String> = []
+    ///
+    /// 1789193224: exported 2026-09-12 06:07 UTC from a build of main
+    /// (post-af04f20). The scheduler spec agrees with the device on
+    /// 12087/12087 schedule rows, so this fixture pins the port to the
+    /// device exactly.
+    private static let pinnedFixtures: Set<String> = [
+        "waybound-lanes-1789193224.json",
+    ]
 
     func testLaneOrderIsNumericOnRouteNumbers() {
         // The lateral ladder is defined by public identity order; numeric
