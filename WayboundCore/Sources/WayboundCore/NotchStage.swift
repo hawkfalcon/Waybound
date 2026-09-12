@@ -80,7 +80,11 @@ public enum NotchStage {
                 if pathLength > maxPath { break }
                 let chord = distance(pts[a], pts[r]) * metersPerUnit
                 if chord > maxChord || chord < 1.0 { continue }
-                let interior = pts[(a + 1)..<r]
+                // Fresh array: python's pts[a+1:r] is indexed from zero;
+                // an ArraySlice would inherit the parent's indices and
+                // interior[apexIndex] would read (or trap at) the wrong
+                // vertex.
+                let interior = Array(pts[(a + 1)..<r])
                 if interior.isEmpty { continue }
                 let depths = interior.map { point in
                     perpDistance(point, pts[a], pts[r]) * metersPerUnit
@@ -136,10 +140,9 @@ public enum NotchStage {
         let dx = b.x - a.x
         let dy = b.y - a.y
         let l2 = dx * dx + dy * dy
-        if l2 == 0 { return distance(p, a).squareRoot() }
+        if l2 == 0 { return distance(p, a) }
         let t = max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2))
         return distance(p, ProjectedPoint(x: a.x + t * dx, y: a.y + t * dy))
-            .squareRoot()
     }
 
     static func distanceToPolyline(
