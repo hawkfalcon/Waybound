@@ -483,7 +483,8 @@ final class LaneCheckTests: XCTestCase {
             let schedLayouts = LaneHarness.scheduledLayouts(
                 strands: strands,
                 scan: scan,
-                schedule: rekeyed
+                schedule: rekeyed,
+                traceStrand: label == "10-couplet" ? 3 : nil
             )
             for index in 0..<strands.count {
                 guard let layout = schedLayouts[index] else {

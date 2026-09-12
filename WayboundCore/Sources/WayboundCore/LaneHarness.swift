@@ -466,10 +466,24 @@ enum LaneHarness {
         var referenceIDs: [Int?]
     }
 
+    static func traceOffsets(_ stage: String, _ offs: [Double]) {
+        var runs: [(Double, Int)] = []
+        for offset in offs {
+            let rounded = (offset * 100).rounded() / 100
+            if let last = runs.last, last.0 == rounded {
+                runs[runs.count - 1].1 += 1
+            } else {
+                runs.append((rounded, 1))
+            }
+        }
+        print("PIPELINE \(stage) n \(offs.count) runs \(runs.prefix(14))")
+    }
+
     static func pipeline(
         _ strand: Strand,
         _ segmentLayouts: [SegmentLane?],
-        rateClamp: Double = 0.08
+        rateClamp: Double = 0.08,
+        trace: Bool = false
     ) -> Layout {
         let points = strand.points
         let m = strand.metersPerUnit
@@ -527,6 +541,7 @@ enum LaneHarness {
                 offsets.append(0.0)
             }
         }
+        if trace { traceOffsets("avg", offsets) }
         var stacked = offsetCounts.map { $0 > 0 }
         var trunk = trunkVotes.map { $0 > 0 }
         var referenceIDs: [Int?] = []
@@ -577,6 +592,7 @@ enum LaneHarness {
             offsets[index] = weightedSum / weightTotal
         }
 
+        if trace { traceOffsets("stab72", offsets) }
         // bridgeShortCorridorGaps
         var left = 0
         while left < n - 1 {
@@ -686,6 +702,7 @@ enum LaneHarness {
             }
         }
 
+        if trace { traceOffsets("tapers", offsets) }
         // hairpin decays
         let hairpinTaper = 58.0
         if n > 2 {
@@ -720,6 +737,7 @@ enum LaneHarness {
             }
         }
 
+        if trace { traceOffsets("hairpin", offsets) }
         // alignment rate clamp — two symmetric passes
         if rateClamp > 0 {
             for index in 1..<n {
@@ -933,7 +951,8 @@ enum LaneHarness {
         scan: [[[Match]]],
         schedule: [Int: [Int: CorridorLaneSchedule.Sample]],
         selected: Int? = nil,
-        highlighted: [Int]? = nil
+        highlighted: [Int]? = nil,
+        traceStrand: Int? = nil
     ) -> [Int: Layout] {
         var layouts: [Int: Layout] = [:]
         var heldCache: [Int: [(x: Double, y: Double)]] = [:]
@@ -991,7 +1010,11 @@ enum LaneHarness {
                 strands: strands,
                 scan: scan
             )
-            layouts[index] = pipeline(strand, segments)
+            layouts[index] = pipeline(
+                strand,
+                segments,
+                trace: index == traceStrand
+            )
         }
         return layouts
     }
