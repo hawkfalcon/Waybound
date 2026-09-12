@@ -10,10 +10,11 @@ import Foundation
 /// Kept in a standalone enum (not as statics of the scheduler enum) so nested
 /// types can reference them explicitly — Swift nested types do not see outer
 /// enum statics.
-enum LaneScheduleConstants {
+public enum LaneScheduleConstants {
 
     /// `RouteMapStyle.laneSpacingPoints` = standardLineWidth + separatorWidth.
-    static let laneSpacing: Double = 4.2
+    /// Public because it is the scheduler entry point's default argument.
+    public static let laneSpacing: Double = 4.2
 
     /// Presence stretches shorter than this (ground meters) are not joins.
     static let joinMinimum: Double = 30
@@ -311,6 +312,11 @@ public enum CorridorLaneSchedule {
         identities: [Int: JourneyIdentity]
     ) -> [StrandKey: [Int: Sample]] {
         guard !strands.isEmpty else { return [:] }
+
+        // Entries recorded so far, keyed per strand segment. Sweeps adopt
+        // from it (chained sweep starts, prior-ribbon continuation) and
+        // record into it first-write-wins.
+        var schedule: [StrandKey: [Int: Sample]] = [:]
 
         // Runs: maximal sharing stretches per strand, >= 30 m.
         var runs: [Run] = []
@@ -1774,7 +1780,7 @@ public enum CorridorLaneSchedule {
                 let bend = orderedBounds[index + 1]
                 guard bend > bstart else { continue }
                 let si = bstart
-                adoptExisting(si: si)
+                adoptExisting(si)
                 if previous == nil {
                     birth(si)
                 } else {
