@@ -18,6 +18,24 @@ public struct LaneDiagnosticsDocument {
         public let stackOrder: Int
         public let departures: Int
         public let polylines: [[GeoCoordinate]]
+
+        public init(
+            id: Int,
+            routeNumber: String,
+            agency: String,
+            directionID: Int?,
+            stackOrder: Int,
+            departures: Int,
+            polylines: [[GeoCoordinate]]
+        ) {
+            self.id = id
+            self.routeNumber = routeNumber
+            self.agency = agency
+            self.directionID = directionID
+            self.stackOrder = stackOrder
+            self.departures = departures
+            self.polylines = polylines
+        }
     }
 
     public struct ScheduleEntry {
