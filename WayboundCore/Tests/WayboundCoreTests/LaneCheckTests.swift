@@ -412,6 +412,31 @@ final class LaneCheckTests: XCTestCase {
                 + "offsets [\(offsets.min() ?? 0), \(offsets.max() ?? 0)] "
                 + "refs \(refs.sorted())")
         }
+        for (label, strands) in [("10-couplet", LaneScenarios.couplet()),
+                                 ("11-reversed_spine", LaneScenarios.reversedSpine())] {
+            print("PROBE \(label) begin")
+            let js = strands.enumerated().map { index, strand in
+                LaneDiagnosticsDocument.Journey(
+                    id: index,
+                    routeNumber: strand.num,
+                    agency: strand.agency,
+                    directionID: strand.direction,
+                    stackOrder: index,
+                    departures: strand.departures,
+                    polylines: [strand.coords]
+                )
+            }
+            let sched = CorridorLaneSchedule.schedule(
+                journeys: js,
+                laneSpacingPoints: LaneHarness.laneSpacing
+            )
+            for (key, entries) in sched.sorted(by: { $0.key.journeyID < $1.key.journeyID }) {
+                let offsets = Set(entries.values.map { Double(round($0.offset * 100) / 100) })
+                let refs = Set(entries.values.map { $0.referenceID })
+                print("PROBE \(label) j\(key.journeyID) n \(entries.count) "
+                    + "offsets \(offsets.sorted()) refs \(refs.sorted())")
+            }
+        }
         print("PROBE all ok")
     }
 
