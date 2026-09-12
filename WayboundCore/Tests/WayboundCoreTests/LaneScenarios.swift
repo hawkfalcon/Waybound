@@ -165,11 +165,14 @@ enum LaneScenarios {
         agency: String = "SBMTD",
         departures: Int = 4
     ) -> LaneHarness.Strand {
+        // One 18 m densify for everything, exactly like the Python
+        // harness's polyline_m: the harness scan, the scheduler's rows and
+        // the metrics all read the same strand geometry.
         LaneHarness.Strand(
             id: id,
             num: num,
             direction: direction,
-            coords: polyline(points),
+            coords: CorridorMembership.densify(polyline(points)),
             agency: agency,
             departures: departures
         )

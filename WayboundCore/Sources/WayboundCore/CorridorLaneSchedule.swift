@@ -259,7 +259,12 @@ public enum CorridorLaneSchedule {
         for journey in journeys {
             for (polylineIndex, polyline) in journey.polylines.enumerated() {
                 guard polyline.count >= 2 else { continue }
-                let points = polyline.map { $0.projected }
+                // The scan rows are indexed per densified segment; the
+                // sweep's arc/points must walk the same densified polyline
+                // (device exports arrive pre-densified, synthetic strands
+                // do not).
+                let points = CorridorMembership.densify(polyline)
+                    .map { $0.projected }
                 let metersPerUnit = GeoProjection.metersPerUnit(
                     atLatitude: polyline[0].latitude
                 )
@@ -339,7 +344,6 @@ public enum CorridorLaneSchedule {
                 }
                 if strand.arc[end] - strand.arc[index]
                     >= LaneScheduleConstants.joinMinimum {
-                    print("TRACE run \(key.journeyID)/\(key.polylineIndex) [\(index),\(end)) arc \(strand.arc.count) rows \(rows.count)")
                     runs.append(Run(strand: key, start: index, end: end))
                 }
                 index = end
