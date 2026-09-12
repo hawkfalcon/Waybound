@@ -196,7 +196,7 @@ final class LaneCheckTests: XCTestCase {
         let sepFloor = min(0.75, sepMain ?? 0.75) - 0.02 - scenario.sepSlack
         if let separation, separation < sepFloor {
             problems.append(
-                "lanes overlap (\(separation), main \(sepMain.map(String.init) ?? "nil"))"
+                "lanes overlap (\(separation), main \(sepMain != nil ? String(format: "%.2f", sepMain!) : "nil"))"
             )
         }
         if kinkSched > max(0.5, kinkMain) {

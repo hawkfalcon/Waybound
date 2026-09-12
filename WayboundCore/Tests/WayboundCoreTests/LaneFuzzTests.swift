@@ -180,7 +180,7 @@ final class LaneFuzzTests: XCTestCase {
         }
         let floor = min(0.75, sepMain ?? 0.75) - 0.05
         if let separation, separation < floor {
-            problems.append("lane separation \(separation) (main \(sepMain.map(String.init) ?? "nil"))")
+            problems.append("lane separation \(separation) (main \(sepMain != nil ? String(format: "%.2f", sepMain!) : "nil"))")
         }
         if !problems.isEmpty {
             let pairText = pairs.map { pair in
