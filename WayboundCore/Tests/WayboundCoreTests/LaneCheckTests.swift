@@ -442,9 +442,16 @@ final class LaneCheckTests: XCTestCase {
                            y: strands[3].segments[si]?.unitY ?? 0)
                     let sign: Int = basis.x * entry.directionX
                         + basis.y * entry.directionY >= 0 ? 1 : -1
-                    rows.append("(\(si),\(sign),\((basis.x * 100).rounded() / 100),\((basis.y * 100).rounded() / 100),\((entry.directionX * 100).rounded() / 100),\((entry.directionY * 100).rounded() / 100))")
+                    let bx = (basis.x * 100).rounded() / 100
+                    let by = (basis.y * 100).rounded() / 100
+                    let ex = (entry.directionX * 100).rounded() / 100
+                    let ey = (entry.directionY * 100).rounded() / 100
+                    rows.append("(\(si),\(sign),\(bx),\(by),\(ex),\(ey))")
                 }
-                print("PROBE 10-couplet j3 entries \(rows.count): \(rows.joined(separator: \" \"))")
+                print("PROBE 10-couplet j3 entries \(rows.count)")
+                for row in rows {
+                    print("PROBE 10-couplet j3 row \(row)")
+                }
             }
             let scan = LaneHarness.membershipScan(strands)
             let schedLayouts = LaneHarness.scheduledLayouts(
