@@ -414,7 +414,7 @@ enum LaneHarness {
             cache: &heldCache
         )
         if segmentIndex >= held.count {
-            print("SCHEDLANE DBG strand \(strandIndex) id \(strand.id) si \(segmentIndex) held \(held.count) segs \(strand.segments.count) scan \(scan[strandIndex].count) schedKeys \(schedule[strandIndex]?.keys.count ?? -1) maxSched \(schedule[strandIndex]?.keys.max() ?? -1)")
+            print("SCHEDLANE DBG strand \(strandIndex) id \(strands[strandIndex].id) si \(segmentIndex) held \(held.count) segs \(strands[strandIndex].segments.count) scan \(scan[strandIndex].count) schedKeys \(schedule[strandIndex]?.keys.count ?? -1) maxSched \(schedule[strandIndex]?.keys.max() ?? -1)")
             return nil
         }
         let basis = held[segmentIndex]
