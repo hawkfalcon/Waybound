@@ -25,7 +25,8 @@ public enum NotchStage {
     }
 
     static func distance(_ a: ProjectedPoint, _ b: ProjectedPoint) -> Double {
-        (b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y)
+        ((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y))
+            .squareRoot()
     }
 
     /// Travel heading at i, over up to ~60 m / 3 vertices. Normalized to
