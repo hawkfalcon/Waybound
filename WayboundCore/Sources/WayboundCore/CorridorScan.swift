@@ -149,7 +149,7 @@ public enum CorridorMembership {
             var locations: [CandidateLocation] = []
             for (polylineIndex, polyline) in journey.polylines.enumerated() {
                 guard polyline.count >= 2 else { continue }
-                let densified = densify(polyline)
+                let densified = CorridorMembership.densify(polyline)
                 for segmentIndex in 0..<(densified.count - 1) {
                     guard let segment = CorridorSegment(
                         start: densified[segmentIndex].projected,
@@ -168,8 +168,8 @@ public enum CorridorMembership {
             self.locations = locations
 
             let pointsPerUnit = 1 / GeoProjection.metersPerUnit(atLatitude: latitude)
-            cellSize = max(1, gridCellMeters * pointsPerUnit)
-            let padding = gridPaddingMeters * pointsPerUnit
+            cellSize = max(1, CorridorMembership.gridCellMeters * pointsPerUnit)
+            let padding = CorridorMembership.gridPaddingMeters * pointsPerUnit
 
             for (index, segment) in segments.enumerated() {
                 let minX = Int(((min(segment.start.x, segment.end.x) - padding) / cellSize).rounded(.down))
