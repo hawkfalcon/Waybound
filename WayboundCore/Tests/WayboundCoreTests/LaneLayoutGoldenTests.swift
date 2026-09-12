@@ -35,17 +35,29 @@ final class LaneLayoutGoldenTests: XCTestCase {
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }()
 
-    /// Fixtures exported from a build whose layout passes match current
-    /// main. Held to scan-noise tolerances: offset share <= 0.5%, shared
-    /// <= 0.5%, trunk <= 1%.
+    /// Fixtures whose layout passes match current main when they were
+    /// drawn (everything after the hairpin decays, 4561799 on 09-08).
+    /// Held to scan-noise tolerances: offset share <= 0.5%, shared
+    /// <= 0.5%, trunk <= 1%. CI run 21 measured all three at exactly
+    /// 0.00/0.00/0.00.
     private static let pinnedFixtures: Set<String> = [
+        "waybound-lanes-1789010609.json",
+        "waybound-lanes-1789020636.json",
         "waybound-lanes-1789193224.json",
     ]
 
-    /// Measured offset-mismatch shares for fixtures drawn before the last
-    /// layout-pass changes (baseline gates: a regression gets worse and
-    /// trips). Updated from the first CI run's table.
-    private static let baselineOffsetMismatchShare: [String: Double] = [:]
+    /// Measured offset-mismatch shares for fixtures drawn before the
+    /// street-anchored anchors (8da64de, 09-07) and hairpin decays
+    /// (4561799, 09-08) landed (CI run 21). The layout stage barely moved
+    /// across those fixes — all four measure under 1%, with zero
+    /// shared/trunk mismatches — so the baselines pin that near-exactness:
+    /// a regression gets worse and trips.
+    private static let baselineOffsetMismatchShare: [String: Double] = [
+        "waybound-lanes-1788731470.json": 0.007,
+        "waybound-lanes-1788762232.json": 0.004,
+        "waybound-lanes-1788812167.json": 0.008,
+        "waybound-lanes-1788827186.json": 0.004,
+    ]
 
     /// Default staleness allowance for an unpinned, unmeasured fixture.
     private static let defaultBaseline = 0.35
