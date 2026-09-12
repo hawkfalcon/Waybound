@@ -488,6 +488,23 @@ enum LaneHarness {
         let points = strand.points
         let m = strand.metersPerUnit
         let n = points.count
+        if trace {
+            var laneRuns: [(Double, Int)] = []
+            var nilCount = 0
+            for layout in segmentLayouts {
+                guard let layout else {
+                    nilCount += 1
+                    continue
+                }
+                let rounded = (layout.offset * 100).rounded() / 100
+                if let last = laneRuns.last, last.0 == rounded {
+                    laneRuns[laneRuns.count - 1].1 += 1
+                } else {
+                    laneRuns.append((rounded, 1))
+                }
+            }
+            print("PIPELINE input nils \(nilCount) lanes \(laneRuns)")
+        }
 
         // removeShortCorridorRuns
         var layouts = segmentLayouts

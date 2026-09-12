@@ -460,6 +460,16 @@ final class LaneCheckTests: XCTestCase {
             let scan = LaneHarness.membershipScan(strands)
             let rekeyed = LaneHarness.rekeySchedule(sched)
             if label == "10-couplet" {
+                let pts = strands[3].points
+                var first: [String] = []
+                var last: [String] = []
+                for index in 0..<min(5, pts.count) {
+                    first.append(String(format: "(%.1f,%.1f)", pts[index].x, pts[index].y))
+                }
+                for index in max(0, pts.count - 5)..<pts.count {
+                    last.append(String(format: "(%.1f,%.1f)", pts[index].x, pts[index].y))
+                }
+                print("PROBE 10-couplet j4 pts n \(pts.count) first \(first.joined(separator: \" \")) last \(last.joined(separator: \" \"))")
                 var heldCache: [Int: [(x: Double, y: Double)]] = [:]
                 for si in 0..<12 {
                     let members = scan[3][si].map {
