@@ -413,7 +413,11 @@ enum LaneHarness {
             strands[strandIndex],
             cache: &heldCache
         )
-        let basis = held[segmentIndex] ?? (x: segment.unitX, y: segment.unitY)
+        if segmentIndex >= held.count {
+            print("SCHEDLANE DBG strand \(strandIndex) id \(strand.id) si \(segmentIndex) held \(held.count) segs \(strand.segments.count) scan \(scan[strandIndex].count) schedKeys \(schedule[strandIndex]?.keys.count ?? -1) maxSched \(schedule[strandIndex]?.keys.max() ?? -1)")
+            return nil
+        }
+        let basis = held[segmentIndex]
         let sign: Double = basis.x * entry.directionX
             + basis.y * entry.directionY >= 0 ? 1 : -1
         let reference = scan[strandIndex][segmentIndex].first {
