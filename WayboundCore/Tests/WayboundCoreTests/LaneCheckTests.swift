@@ -430,6 +430,22 @@ final class LaneCheckTests: XCTestCase {
                 journeys: js,
                 laneSpacingPoints: LaneHarness.laneSpacing
             )
+            if label == "10-couplet" {
+                var heldCache: [Int: [(x: Double, y: Double)]] = [:]
+                let held = LaneHarness.heldDirections(strands[3], cache: &heldCache)
+                var rows: [String] = []
+                for si in 0..<strands[3].segments.count {
+                    guard let entry = sched[3]?[si] else { continue }
+                    let basis = si < held.count
+                        ? held[si]
+                        : (x: strands[3].segments[si]?.unitX ?? 0,
+                           y: strands[3].segments[si]?.unitY ?? 0)
+                    let sign: Int = basis.x * entry.directionX
+                        + basis.y * entry.directionY >= 0 ? 1 : -1
+                    rows.append("(\(si),\(sign),\((basis.x * 100).rounded() / 100),\((basis.y * 100).rounded() / 100),\((entry.directionX * 100).rounded() / 100),\((entry.directionY * 100).rounded() / 100))")
+                }
+                print("PROBE 10-couplet j3 entries \(rows.count): \(rows.joined(separator: \" \"))")
+            }
             let scan = LaneHarness.membershipScan(strands)
             let schedLayouts = LaneHarness.scheduledLayouts(
                 strands: strands,
