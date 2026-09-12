@@ -1565,6 +1565,6 @@ extension LaneHarness.Strand {
         for byte in id.utf8 {
             hash = ((hash &<< 5) &+ hash) &+ UInt64(byte)
         }
-        return Int(bitPattern: hash >> 1)
+        return Int(truncatingIfNeeded: hash >> 1)
     }
 }
