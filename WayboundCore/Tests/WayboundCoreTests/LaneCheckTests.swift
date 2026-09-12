@@ -314,6 +314,78 @@ final class LaneCheckTests: XCTestCase {
     // The gate
     // ------------------------------------------------------------------
 
+    /// TEMPORARY bisect probe: schedule() on progressively complex
+    /// synthetic corridors; the last PROBE line before a crash names the
+    /// triggering feature. Delete once lane_check is green.
+    func testBisectProbe() {
+        setvbuf(stdout, nil, _IONBF, 0)
+
+        func run(_ label: String, _ strands: [LaneHarness.Strand]) {
+            print("PROBE \(label) begin")
+            let journeys = strands.enumerated().map { index, strand in
+                LaneDiagnosticsDocument.Journey(
+                    id: index,
+                    routeNumber: strand.num,
+                    agency: strand.agency,
+                    directionID: strand.direction,
+                    stackOrder: index,
+                    departures: strand.departures,
+                    polylines: [strand.coords]
+                )
+            }
+            _ = CorridorLaneSchedule.schedule(
+                journeys: journeys,
+                laneSpacingPoints: LaneHarness.laneSpacing
+            )
+            print("PROBE \(label) ok")
+        }
+
+        let straight = LaneScenarios.spinePoints([
+            (x: 0, y: 0),
+            (x: 400, y: 0),
+        ])
+        let arcs = LaneScenarios.arcOf(straight)
+
+        run("1-two-full-share", [
+            LaneScenarios.strandGeometry("a", "1", 0, LaneScenarios.strand(straight, arcs, 0, 400)),
+            LaneScenarios.strandGeometry("b", "2", 0, LaneScenarios.strand(straight, arcs, 0, 400)),
+        ])
+        run("2-two-share-to-end", [
+            LaneScenarios.strandGeometry("a", "1", 0, LaneScenarios.strand(straight, arcs, 0, 400)),
+            LaneScenarios.strandGeometry("b", "2", 0, LaneScenarios.strand(straight, arcs, 100, 400)),
+        ])
+        run("3-three-full-share", [
+            LaneScenarios.strandGeometry("a", "1", 0, LaneScenarios.strand(straight, arcs, 0, 400)),
+            LaneScenarios.strandGeometry("b", "2", 0, LaneScenarios.strand(straight, arcs, 0, 400)),
+            LaneScenarios.strandGeometry("c", "3", 0, LaneScenarios.strand(straight, arcs, 0, 400)),
+        ])
+        run("4-join-mid", [
+            LaneScenarios.strandGeometry("a", "1", 0, LaneScenarios.strand(straight, arcs, 0, 400)),
+            LaneScenarios.strandGeometry("b", "2", 0, LaneScenarios.strand(straight, arcs, 150, 400, sideIn: 1)),
+        ])
+        run("5-leave-mid", [
+            LaneScenarios.strandGeometry("a", "1", 0, LaneScenarios.strand(straight, arcs, 0, 400)),
+            LaneScenarios.strandGeometry("b", "2", 0, LaneScenarios.strand(straight, arcs, 0, 250, sideOut: 1)),
+        ])
+        run("6-reverse-pair", [
+            LaneScenarios.strandGeometry("a", "1", 0, LaneScenarios.strand(straight, arcs, 0, 400)),
+            LaneScenarios.strandGeometry("b", "1", 1, LaneScenarios.strand(straight, arcs, 0, 400)),
+        ])
+        let trunk = LaneScenarios.spinePoints([
+            (x: 0, y: 0),
+            (x: 200, y: 8),
+            (x: 400, y: 4),
+        ])
+        let trunkArcs = LaneScenarios.arcOf(trunk)
+        run("7-staggered-3", [
+            LaneScenarios.strandGeometry("a", "1", 0, LaneScenarios.strand(trunk, trunkArcs, 0, 400)),
+            LaneScenarios.strandGeometry("b", "2", 0, LaneScenarios.strand(trunk, trunkArcs, 100, 300, sideOut: 1)),
+            LaneScenarios.strandGeometry("c", "3", 0, LaneScenarios.strand(trunk, trunkArcs, 150, 400, sideIn: -1)),
+        ])
+        run("8-state_trunk", LaneScenarios.stateTrunk())
+        print("PROBE all ok")
+    }
+
     func testLaneCheckScenarios() {
         setvbuf(stdout, nil, _IONBF, 0)
         var failures: [String] = []
