@@ -434,8 +434,12 @@ final class LaneCheckTests: XCTestCase {
                 var heldCache: [Int: [(x: Double, y: Double)]] = [:]
                 let held = LaneHarness.heldDirections(strands[3], cache: &heldCache)
                 var rows: [String] = []
+                let probeKey = CorridorLaneSchedule.StrandKey(
+                    journeyID: 3,
+                    polylineIndex: 0
+                )
                 for si in 0..<strands[3].segments.count {
-                    guard let entry = sched[3]?[si] else { continue }
+                    guard let entry = sched[probeKey]?[si] else { continue }
                     let basis = si < held.count
                         ? held[si]
                         : (x: strands[3].segments[si]?.unitX ?? 0,
