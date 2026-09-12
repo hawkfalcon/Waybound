@@ -213,7 +213,7 @@ enum LaneScenarios {
             strandGeometry("j1", "1", 0, strand(spine, arcs, 50, 1100)),
             strandGeometry("j3", "3", 0, strand(spine, arcs, 150, 1100, sideIn: 1)),
             strandGeometry("j2", "2", 1, strand(spine, arcs, 200, 1050, reverse: true)),
-            strandGeometry("j4", "4", 1, strand(spine, arcs, 400, 1050, reverse: true, sideIn: -1)),
+            strandGeometry("j4", "4", 1, strand(spine, arcs, 400, 1050, sideIn: -1, reverse: true)),
         ]
     }
 

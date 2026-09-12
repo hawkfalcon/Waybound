@@ -183,8 +183,8 @@ final class LaneFuzzTests: XCTestCase {
             problems.append("lane separation \(separation) (main \(sepMain.map(String.init) ?? "nil"))")
         }
         if !problems.isEmpty {
-            let pairText = pairs.map { _, pair, count in
-                "\(strands[pair.0].num)/\(strands[pair.1].num)×\(count)"
+            let pairText = pairs.map { pair in
+                "\(strands[pair.0].num)/\(strands[pair.1].num)×\(pair.2)"
             }.joined(separator: ",")
             print(
                 "LANE-FUZZ seed \(seed) main=\(bundleMain) sched=\(bundleSched) "

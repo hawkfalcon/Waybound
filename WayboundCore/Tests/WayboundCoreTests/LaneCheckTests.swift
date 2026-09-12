@@ -141,8 +141,8 @@ final class LaneCheckTests: XCTestCase {
             LaneHarness.alignmentKink($0)
         }.max() ?? 0
 
-        let pairText = pairsSched.map { _, pair, count in
-            "\(strands[pair.0].num)/\(strands[pair.1].num)×\(count)"
+        let pairText = pairsSched.map { pair in
+            "\(strands[pair.0].num)/\(strands[pair.1].num)×\(pair.2)"
         }.joined(separator: ",")
         print(
             "LANE-CHECK \(scenario.name) crossings main=\(crossingsMain) "
@@ -279,11 +279,11 @@ final class LaneCheckTests: XCTestCase {
                 guard relation == -1 else { continue }
                 let la = layouts[a]!
                 let lb = layouts[b]!
-                let lanesA = Set(
+                let lanesA: Set<Double> = Set(
                     zip(la.offsets, la.stacked).filter { $0.1 }
                         .map { ($0.0 / 2.1).rounded(.toNearestOrEven) }
                 )
-                let lanesB = Set(
+                let lanesB: Set<Double> = Set(
                     zip(lb.offsets, lb.stacked).filter { $0.1 }
                         .map { ($0.0 / 2.1).rounded(.toNearestOrEven) }
                 )

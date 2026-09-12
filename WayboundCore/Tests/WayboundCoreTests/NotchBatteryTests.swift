@@ -130,7 +130,8 @@ final class NotchBatteryTests: XCTestCase {
             expectCount: 4
         )
         var comb: [GeoCoordinate] = [coordinate(north: 0, east: 0)]
-        for east in stride(from: 80, through: 400, by: 80) {
+        for eastInt in stride(from: 80, through: 400, by: 80) {
+            let east = Double(eastInt)
             comb += [
                 coordinate(north: 0, east: east),
                 coordinate(north: 12, east: east),
@@ -142,7 +143,7 @@ final class NotchBatteryTests: XCTestCase {
             "comb of five (pass iterates)",
             comb,
             stride(from: 80, through: 400, by: 80).map {
-                coordinate(north: 12, east: $0)
+                coordinate(north: 12, east: Double($0))
             },
             expectCount: 8
         )
