@@ -66,8 +66,14 @@ final class LaneScheduleGoldenTests: XCTestCase {
     /// (post-af04f20). The scheduler spec agrees with the device on
     /// 12087/12087 schedule rows, so this fixture pins the port to the
     /// device exactly.
+    ///
+    /// 1789254859: fresh export from the package-backed device build,
+    /// 2026-09-12 23:14 UTC. This is the post-flip moment-of-truth fixture:
+    /// it must agree with the package scheduler, not merely stay within the
+    /// stale-export allowance.
     private static let pinnedFixtures: Set<String> = [
         "waybound-lanes-1789193224.json",
+        "waybound-lanes-1789254859.json",
     ]
 
     func testLaneOrderIsNumericOnRouteNumbers() {

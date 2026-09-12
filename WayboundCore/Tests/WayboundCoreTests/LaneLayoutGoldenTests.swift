@@ -12,11 +12,11 @@ import XCTest
 /// builds whose LAYOUT passes also moved since (street-anchored anchors
 /// 8da64de on 09-07, hairpin decays 4561799 on 09-08), so those diverge
 /// where those passes changed and are held to measured baselines. The
-/// newest fixture (1789193224, exported from current main) is pinned:
-/// the layout passes have not changed since it was drawn, so the port
-/// must match it at scan-noise tolerances (the package's membership scan
-/// differs from the device's on <=0.5% of rows, which is the one
-/// remaining divergence source).
+/// newest fixture (1789254859, exported from the package-backed
+/// device build) is pinned: the layout passes have not changed since it was
+/// drawn, so the port must match it at scan-noise tolerances (the package's
+/// membership scan differs from the device's on <=0.5% of rows, which is the
+/// one remaining divergence source).
 final class LaneLayoutGoldenTests: XCTestCase {
 
     private static let fixtures: [URL] = {
@@ -44,6 +44,7 @@ final class LaneLayoutGoldenTests: XCTestCase {
         "waybound-lanes-1789010609.json",
         "waybound-lanes-1789020636.json",
         "waybound-lanes-1789193224.json",
+        "waybound-lanes-1789254859.json",
     ]
 
     /// Measured offset-mismatch shares for fixtures drawn before the
