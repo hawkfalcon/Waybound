@@ -17,9 +17,9 @@ import Foundation
 /// delta smoothing, alignment rate clamp). Deltas never feed the offset,
 /// shared, or trunk outputs — they only shape the drawn centerline — and
 /// they are not part of the lane-diagnostics export, so this port omits
-/// them. The centerline-alignment machinery stays app-side until the app
-/// flips to importing this package, at which point the draw path consumes
-/// it directly.
+/// them. The app's draw path consumes the package's lane fields directly;
+/// only the centerline-alignment deltas remain app-side because they are
+/// MapKit anchor geometry rather than lane decisions.
 ///
 /// Faithfulness notes (behavior-preserving on the fixtures):
 ///  - Membership, reference matching, and the sticky-reference selection
@@ -77,12 +77,16 @@ public enum CorridorLaneLayoutEngine {
     /// Build lane layouts for every strand. `schedule` is the anchored
     /// schedule — the device's export or `CorridorLaneSchedule.schedule`'s
     /// output. `selectedJourneyID` (nil when none) pins corridor dominance
-    /// to the user's selected route, exactly as the app does.
+    /// to the user's selected route, exactly as the app does. When
+    /// `highlightedJourneyIDs` is non-nil, it narrows dominance to those
+    /// members, matching the map's highlighted-route state; an empty
+    /// intersection falls back to all corridor members.
     public static func layouts(
         journeys: [LaneDiagnosticsDocument.Journey],
         schedule: [CorridorLaneSchedule.StrandKey: [Int: CorridorLaneSchedule.Sample]],
         selectedJourneyID: Int?,
-        laneSpacingPoints: Double
+        laneSpacingPoints: Double,
+        highlightedJourneyIDs: Set<Int>? = nil
     ) -> [CorridorLaneSchedule.StrandKey: VertexLayout] {
         guard !journeys.isEmpty else { return [:] }
 
@@ -174,7 +178,8 @@ public enum CorridorLaneLayoutEngine {
                         identities: identities,
                         departures: departures,
                         held: held,
-                        selectedJourneyID: selectedJourneyID
+                        selectedJourneyID: selectedJourneyID,
+                        highlightedJourneyIDs: highlightedJourneyIDs
                     )
                 }
             output[key] = assembleLayout(
@@ -206,7 +211,8 @@ public enum CorridorLaneLayoutEngine {
         identities: [Int: CorridorLaneSchedule.JourneyIdentity],
         departures: [Int: Int],
         held: [CorridorLaneSchedule.StrandKey: [(x: Double, y: Double)]],
-        selectedJourneyID: Int?
+        selectedJourneyID: Int?,
+        highlightedJourneyIDs: Set<Int>?
     ) -> SegmentLayout? {
         guard segmentIndex < strand.segments.count,
               let segment = strand.segments[segmentIndex],
@@ -251,6 +257,12 @@ public enum CorridorLaneLayoutEngine {
         if let selectedID = selectedJourneyID,
            memberIDs.contains(selectedID) {
             dominanceCandidates = [selectedID]
+        } else if let highlightedJourneyIDs {
+            let highlightedMembers = memberIDs.filter {
+                highlightedJourneyIDs.contains($0)
+            }
+            dominanceCandidates = highlightedMembers.isEmpty
+                ? memberIDs : highlightedMembers
         } else {
             dominanceCandidates = memberIDs
         }

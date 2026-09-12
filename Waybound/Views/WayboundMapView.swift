@@ -362,7 +362,14 @@ struct WayboundMapView: UIViewRepresentable {
             // strands. A strand keeps the lane it was given when it entered
             // a corridor for as long as it continues — the re-centring slide
             // that made shared-street ribbons braid is gone.
-            recomputeCorridorLaneSchedule()
+            let laneJourneys = recomputeCorridorLaneSchedule()
+            let packageLayouts = CorridorLaneLayoutEngine.layouts(
+                journeys: laneJourneys,
+                schedule: corridorLaneSchedule,
+                selectedJourneyID: parent.selectedJourneyID,
+                laneSpacingPoints: RouteMapStyle.laneSpacingPoints,
+                highlightedJourneyIDs: parent.highlightedJourneyIDs
+            )
 
             laneLayoutsByJourneyID = [:]
             for journey in parent.journeys {
@@ -371,10 +378,17 @@ struct WayboundMapView: UIViewRepresentable {
                 laneLayoutsByJourneyID[journey.id] = densified.enumerated()
                     .compactMap { polylineIndex, coordinates in
                         guard coordinates.count >= 2 else { return nil }
+                        let key = CorridorLaneSchedule.StrandKey(
+                            journeyID: journey.id,
+                            polylineIndex: polylineIndex
+                        )
+                        guard let packageLayout = packageLayouts[key]
+                        else { return nil }
                         return sharedCorridorLaneLayout(
                             for: coordinates,
                             journeyID: journey.id,
-                            polylineIndex: polylineIndex
+                            polylineIndex: polylineIndex,
+                            packageLayout: packageLayout
                         )
                     }
             }
@@ -1302,7 +1316,9 @@ struct WayboundMapView: UIViewRepresentable {
             let segmentIndex: Int
         }
 
-        private func recomputeCorridorLaneSchedule() {
+        private func recomputeCorridorLaneSchedule()
+            -> [LaneDiagnosticsDocument.Journey]
+        {
             var held: [CorridorLaneSchedule.StrandKey: [(x: Double, y: Double)]] = [:]
             var journeys: [LaneDiagnosticsDocument.Journey] = []
 
@@ -1364,13 +1380,19 @@ struct WayboundMapView: UIViewRepresentable {
                 journeys: journeys,
                 laneSpacingPoints: RouteMapStyle.laneSpacingPoints
             )
+            return journeys
         }
         private func sharedCorridorLaneLayout(
             for coordinates: [CLLocationCoordinate2D],
             journeyID: Int,
-            polylineIndex: Int
+            polylineIndex: Int,
+            packageLayout: CorridorLaneLayoutEngine.VertexLayout
         ) -> CorridorLaneLayout {
-            guard coordinates.count >= 2 else {
+            guard coordinates.count >= 2,
+                  packageLayout.offsets.count == coordinates.count,
+                  packageLayout.shared.count == coordinates.count,
+                  packageLayout.trunk.count == coordinates.count
+            else {
                 return CorridorLaneLayout(
                     coordinates: coordinates,
                     offsets: Array(repeating: 0, count: coordinates.count),
@@ -1386,22 +1408,25 @@ struct WayboundMapView: UIViewRepresentable {
             }
 
             let points = coordinates.map { MKMapPoint($0) }
-            // All physical thresholds in the corridor pass are meters; map
-            // points are projected units (~8.1 per meter in Santa Barbara).
+            // The package owns membership, lane offsets, dropout bridging,
+            // taper, hairpin decay, and trunk ownership. The app keeps only
+            // the centerline correction: its anchors are allowed to follow a
+            // locally matched reference street without changing the package's
+            // slot-valued lane fields.
             let metersPerMapPoint = TripPathGeometry.metersPerMapPoint(
                 atLatitude: coordinates[0].latitude
             )
-            var segmentLayouts: [CorridorSegmentLayout?] = []
-            segmentLayouts.reserveCapacity(points.count - 1)
+            var alignmentLayouts: [CorridorSegmentLayout?] = []
+            alignmentLayouts.reserveCapacity(points.count - 1)
             for index in 0..<(points.count - 1) {
                 guard let segment = MapRouteSegment(
                     start: points[index],
                     end: points[index + 1]
                 ) else {
-                    segmentLayouts.append(nil)
+                    alignmentLayouts.append(nil)
                     continue
                 }
-                segmentLayouts.append(
+                alignmentLayouts.append(
                     sharedCorridorSegmentLayout(
                         for: segment,
                         journeyID: journeyID,
@@ -1412,217 +1437,125 @@ struct WayboundMapView: UIViewRepresentable {
                 )
             }
 
-            // A parallel shape seen for only a few meters is normally an
-            // intersection, a terminal bay, or a near-parallel turn—not a shared
-            // road. Refusing those tiny runs removes one-vertex side-steps without
-            // deleting any authoritative route geometry.
-            removeShortCorridorRuns(
-                points: points,
-                layouts: &segmentLayouts,
-                metersPerMapPoint: metersPerMapPoint
-            )
-
-            var offsetSums = Array(repeating: 0.0, count: points.count)
-            var offsetCounts = Array(repeating: 0, count: points.count)
             var alignmentDeltaX = Array(repeating: 0.0, count: points.count)
             var alignmentDeltaY = Array(repeating: 0.0, count: points.count)
-            var trunkOwnerVotes = Array(repeating: 0, count: points.count)
+            var baseSharedVertices = Array(
+                repeating: false,
+                count: points.count
+            )
             var referenceVotes = Array(
                 repeating: [Int: Int](),
                 count: points.count
             )
-
-            for (index, optionalLayout) in segmentLayouts.enumerated() {
-                guard let layout = optionalLayout else { continue }
-                offsetSums[index] += layout.offset
-                offsetSums[index + 1] += layout.offset
-                offsetCounts[index] += 1
-                offsetCounts[index + 1] += 1
-                alignmentDeltaX[index] += layout.alignedStart.x - points[index].x
-                alignmentDeltaY[index] += layout.alignedStart.y - points[index].y
-                alignmentDeltaX[index + 1] += layout.alignedEnd.x - points[index + 1].x
-                alignmentDeltaY[index + 1] += layout.alignedEnd.y - points[index + 1].y
+            for (index, layout) in alignmentLayouts.enumerated() {
+                // A layout segment can be found by the app's local scan even
+                // when the package has rejected its short/noisy run. Only
+                // package-shared endpoints are allowed to seed alignment.
+                guard let layout,
+                      packageLayout.shared[index],
+                      packageLayout.shared[index + 1]
+                else { continue }
+                baseSharedVertices[index] = true
+                baseSharedVertices[index + 1] = true
+                alignmentDeltaX[index] += layout.alignedStart.x
+                    - points[index].x
+                alignmentDeltaY[index] += layout.alignedStart.y
+                    - points[index].y
+                alignmentDeltaX[index + 1] += layout.alignedEnd.x
+                    - points[index + 1].x
+                alignmentDeltaY[index + 1] += layout.alignedEnd.y
+                    - points[index + 1].y
                 referenceVotes[index][layout.referenceID, default: 0] += 1
                 referenceVotes[index + 1][layout.referenceID, default: 0] += 1
-                if layout.isTrunkOwner {
-                    trunkOwnerVotes[index] += 1
-                    trunkOwnerVotes[index + 1] += 1
-                }
             }
 
-            var offsets = offsetSums.indices.map { index in
-                guard offsetCounts[index] > 0 else { return 0.0 }
-                alignmentDeltaX[index] /= Double(offsetCounts[index])
-                alignmentDeltaY[index] /= Double(offsetCounts[index])
-                return offsetSums[index] / Double(offsetCounts[index])
+            for index in points.indices where baseSharedVertices[index] {
+                let count = referenceVotes[index].values.reduce(0, +)
+                guard count > 0 else { continue }
+                alignmentDeltaX[index] /= Double(count)
+                alignmentDeltaY[index] /= Double(count)
             }
-            var explicitlyStacked = offsetCounts.map { $0 > 0 }
-            var trunkOwnerVertices = trunkOwnerVotes.map { $0 > 0 }
-            var corridorReferenceIDs = referenceVotes.map { votes -> Int? in
-                votes.keys.sorted { firstID, secondID in
-                    let firstVotes = votes[firstID] ?? 0
-                    let secondVotes = votes[secondID] ?? 0
-                    if firstVotes != secondVotes {
-                        return firstVotes > secondVotes
-                    }
-                    return corridorLaneComesBefore(firstID, secondID)
-                }.first
-            }
-
-            // The first shared section establishes this strand's lane. Hold that
-            // lane for the whole contiguous corridor: another route entering or
-            // leaving is not allowed to recenter continuing strands. A route that
-            // joins later takes an outside lane of its own and tapers into it.
-            stabilizeCorridorRunOffsets(
+            // The package has already made the membership decision for a
+            // dropout. Fill only the centerline correction across vertices it
+            // bridged, using the same arc-distance interpolation as the
+            // pre-port path. No lane field is recomputed here.
+            bridgeAlignmentGaps(
                 points: points,
-                layouts: segmentLayouts,
-                offsets: &offsets,
-                metersPerMapPoint: metersPerMapPoint
-            )
-
-            // Fill only small misses that return to the same physical spine and
-            // nearly the same lane. Broad bridging was able to pull a strand across
-            // a downtown turn and create the diagonal jogs visible in testing.
-            bridgeShortCorridorGaps(
-                points: points,
-                explicitlyStacked: &explicitlyStacked,
-                trunkOwnerVertices: &trunkOwnerVertices,
-                corridorReferenceIDs: &corridorReferenceIDs,
-                offsets: &offsets,
+                baseSharedVertices: baseSharedVertices,
+                packageSharedVertices: packageLayout.shared,
                 deltaX: &alignmentDeltaX,
                 deltaY: &alignmentDeltaY,
                 metersPerMapPoint: metersPerMapPoint
             )
 
-            // Centerline corrections still follow bends, but cannot jump laterally
-            // when the locally preferred reference shape changes.
             stabilizeSharedAlignmentTransitions(
                 points: points,
-                explicitlyStacked: explicitlyStacked,
+                explicitlyStacked: packageLayout.shared,
                 deltaX: &alignmentDeltaX,
                 deltaY: &alignmentDeltaY
             )
 
-            // Fade both the lane and the small centerline correction back to the
-            // route's own shape. Branches peel away gradually instead of gaining a
-            // diagonal connector where a shared corridor starts or ends.
+            // Fade the centerline correction at the ends of every package-owned
+            // shared run. The lane taper itself is deliberately not repeated.
             let taperDistance: CLLocationDistance = 58
-            if offsets.count > 1 {
-                var i = 0
-                while i < offsets.count {
-                    while i < offsets.count && !explicitlyStacked[i] {
-                        i += 1
-                    }
-                    guard i < offsets.count else { break }
-                    let runStart = i
-                    while i < offsets.count && explicitlyStacked[i] {
-                        i += 1
-                    }
-                    let runEnd = i - 1
+            var index = 0
+            while index < points.count {
+                while index < points.count && !packageLayout.shared[index] {
+                    index += 1
+                }
+                guard index < points.count else { break }
+                let runStart = index
+                while index < points.count && packageLayout.shared[index] {
+                    index += 1
+                }
+                let runEnd = index - 1
 
-                    // Backward taper before runStart
-                    var backwardAccumulated: CLLocationDistance = 0
-                    let startOffset = offsets[runStart]
-                    let startDeltaX = alignmentDeltaX[runStart]
-                    let startDeltaY = alignmentDeltaY[runStart]
-                    for backIndex in stride(from: runStart - 1, through: 0, by: -1) {
-                        if explicitlyStacked[backIndex] { break }
-                        backwardAccumulated += points[backIndex].distance(
-                            to: points[backIndex + 1]
-                        ) * metersPerMapPoint
-                        if backwardAccumulated >= taperDistance { break }
-                        let factor = 1.0 - (backwardAccumulated / taperDistance)
-                        applyTaperedLayout(
-                            factor: factor,
-                            sourceOffset: startOffset,
-                            sourceDeltaX: startDeltaX,
-                            sourceDeltaY: startDeltaY,
-                            destinationIndex: backIndex,
-                            offsets: &offsets,
-                            deltaX: &alignmentDeltaX,
-                            deltaY: &alignmentDeltaY
-                        )
-                    }
+                var backwardDistance: CLLocationDistance = 0
+                let startDeltaX = alignmentDeltaX[runStart]
+                let startDeltaY = alignmentDeltaY[runStart]
+                for destination in stride(
+                    from: runStart - 1,
+                    through: 0,
+                    by: -1
+                ) {
+                    if packageLayout.shared[destination] { break }
+                    backwardDistance += points[destination].distance(
+                        to: points[destination + 1]
+                    ) * metersPerMapPoint
+                    if backwardDistance >= taperDistance { break }
+                    applyTaperedAlignment(
+                        factor: 1 - backwardDistance / taperDistance,
+                        sourceDeltaX: startDeltaX,
+                        sourceDeltaY: startDeltaY,
+                        destinationIndex: destination,
+                        deltaX: &alignmentDeltaX,
+                        deltaY: &alignmentDeltaY
+                    )
+                }
 
-                    // Forward taper after runEnd
-                    var forwardAccumulated: CLLocationDistance = 0
-                    let endOffset = offsets[runEnd]
-                    let endDeltaX = alignmentDeltaX[runEnd]
-                    let endDeltaY = alignmentDeltaY[runEnd]
-                    for forwardIndex in (runEnd + 1)..<offsets.count {
-                        if explicitlyStacked[forwardIndex] { break }
-                        forwardAccumulated += points[forwardIndex - 1].distance(
-                            to: points[forwardIndex]
-                        ) * metersPerMapPoint
-                        if forwardAccumulated >= taperDistance { break }
-                        let factor = 1.0 - (forwardAccumulated / taperDistance)
-                        applyTaperedLayout(
-                            factor: factor,
-                            sourceOffset: endOffset,
-                            sourceDeltaX: endDeltaX,
-                            sourceDeltaY: endDeltaY,
-                            destinationIndex: forwardIndex,
-                            offsets: &offsets,
-                            deltaX: &alignmentDeltaX,
-                            deltaY: &alignmentDeltaY
-                        )
-                    }
+                var forwardDistance: CLLocationDistance = 0
+                let endDeltaX = alignmentDeltaX[runEnd]
+                let endDeltaY = alignmentDeltaY[runEnd]
+                for destination in (runEnd + 1)..<points.count {
+                    if packageLayout.shared[destination] { break }
+                    forwardDistance += points[destination - 1].distance(
+                        to: points[destination]
+                    ) * metersPerMapPoint
+                    if forwardDistance >= taperDistance { break }
+                    applyTaperedAlignment(
+                        factor: 1 - forwardDistance / taperDistance,
+                        sourceDeltaX: endDeltaX,
+                        sourceDeltaY: endDeltaY,
+                        destinationIndex: destination,
+                        deltaX: &alignmentDeltaX,
+                        deltaY: &alignmentDeltaY
+                    )
                 }
             }
 
-            // Hairpin decays — a ribbon holding lanes through a ~180°
-            // turn of its own street loops off the road: the lane offset
-            // exceeds the turn radius, so the innermost arc inverts.
-            // Bring the offset to zero at the reversal vertex and let it
-            // regrow on the far side, so the ribbon traces its own street
-            // through the turn.
-            if points.count > 2 {
-                let hairpinTaper: CLLocationDistance = 58
-                for reversal in 1..<(points.count - 1) {
-                    let u0x = points[reversal].x - points[reversal - 1].x
-                    let u0y = points[reversal].y - points[reversal - 1].y
-                    let u1x = points[reversal + 1].x - points[reversal].x
-                    let u1y = points[reversal + 1].y - points[reversal].y
-                    let l0 = hypot(u0x, u0y)
-                    let l1 = hypot(u1x, u1y)
-                    guard l0 > 1e-6, l1 > 1e-6 else { continue }
-                    if (u0x / l0) * (u1x / l1) + (u0y / l0) * (u1y / l1)
-                            >= -0.6 {
-                        continue  // not a reversal
-                    }
-                    offsets[reversal] = 0
-                    var accumulated: CLLocationDistance = 0
-                    for backIndex in stride(
-                        from: reversal - 1,
-                        through: 0,
-                        by: -1
-                    ) {
-                        accumulated += points[backIndex].distance(
-                            to: points[backIndex + 1]
-                        ) * metersPerMapPoint
-                        if accumulated >= hairpinTaper { break }
-                        offsets[backIndex] *= accumulated / hairpinTaper
-                    }
-                    accumulated = 0
-                    for forwardIndex in (reversal + 1)..<points.count {
-                        accumulated += points[forwardIndex - 1].distance(
-                            to: points[forwardIndex]
-                        ) * metersPerMapPoint
-                        if accumulated >= hairpinTaper { break }
-                        offsets[forwardIndex] *= accumulated / hairpinTaper
-                    }
-                }
-            }
-
-            // The locally preferred reference shape can change where a
-            // companion route turns off (route 6 leaves Chapala at Sola, so
-            // the 12x/24x corridor re-references there). The correction
-            // itself is bounded to six meters, but without a rate limit it
-            // steps by that full amount within a vertex or two — a one-sided
-            // diagonal jog at the corner. Limit the correction to a gentle
-            // ramp; a sustained feed-drift correction is unaffected because
-            // only the rate of change is clamped. Two passes (forward, then
-            // backward) make the limiter symmetric.
+            // Reference changes can be several meters at a street corner. Keep
+            // that correction continuous along the route; this is geometry-only
+            // smoothing and cannot alter the package's crossing decisions.
             let maximumAlignmentRamp = 0.08  // meters of correction per meter
             if points.count > 2 {
                 for index in 1..<points.count {
@@ -1630,8 +1563,10 @@ struct WayboundMapView: UIViewRepresentable {
                         to: points[index]
                     ) * metersPerMapPoint
                     let budget = maximumAlignmentRamp * segmentMeters
-                    let stepX = alignmentDeltaX[index] - alignmentDeltaX[index - 1]
-                    let stepY = alignmentDeltaY[index] - alignmentDeltaY[index - 1]
+                    let stepX = alignmentDeltaX[index]
+                        - alignmentDeltaX[index - 1]
+                    let stepY = alignmentDeltaY[index]
+                        - alignmentDeltaY[index - 1]
                     let step = hypot(stepX, stepY)
                     if step > budget, budget > 0 {
                         let scale = budget / step
@@ -1646,8 +1581,10 @@ struct WayboundMapView: UIViewRepresentable {
                         to: points[index + 1]
                     ) * metersPerMapPoint
                     let budget = maximumAlignmentRamp * segmentMeters
-                    let stepX = alignmentDeltaX[index] - alignmentDeltaX[index + 1]
-                    let stepY = alignmentDeltaY[index] - alignmentDeltaY[index + 1]
+                    let stepX = alignmentDeltaX[index]
+                        - alignmentDeltaX[index + 1]
+                    let stepY = alignmentDeltaY[index]
+                        - alignmentDeltaY[index + 1]
                     let step = hypot(stepX, stepY)
                     if step > budget, budget > 0 {
                         let scale = budget / step
@@ -1667,186 +1604,66 @@ struct WayboundMapView: UIViewRepresentable {
             }
             return CorridorLaneLayout(
                 coordinates: alignedCoordinates,
-                offsets: offsets,
-                sharedVertices: explicitlyStacked,
-                trunkOwnerVertices: trunkOwnerVertices
+                offsets: packageLayout.offsets,
+                sharedVertices: packageLayout.shared,
+                trunkOwnerVertices: packageLayout.trunk
             )
         }
 
-        private func removeShortCorridorRuns(
+        private func bridgeAlignmentGaps(
             points: [MKMapPoint],
-            layouts: inout [CorridorSegmentLayout?],
-            metersPerMapPoint: Double
-        ) {
-            let minimumSharedDistance: CLLocationDistance = 30
-            guard layouts.count == points.count - 1 else { return }
-            var runStart = 0
-
-            while runStart < layouts.count {
-                while runStart < layouts.count, layouts[runStart] == nil {
-                    runStart += 1
-                }
-                guard runStart < layouts.count else { break }
-                var runEnd = runStart + 1
-                while runEnd < layouts.count, layouts[runEnd] != nil {
-                    runEnd += 1
-                }
-                let runDistance = (runStart..<runEnd).reduce(0.0) {
-                    distance, index in
-                    distance + points[index].distance(to: points[index + 1])
-                        * metersPerMapPoint
-                }
-                if runDistance < minimumSharedDistance {
-                    for index in runStart..<runEnd {
-                        layouts[index] = nil
-                    }
-                }
-                runStart = runEnd
-            }
-        }
-
-        private func stabilizeCorridorRunOffsets(
-            points: [MKMapPoint],
-            layouts: [CorridorSegmentLayout?],
-            offsets: inout [Double],
-            metersPerMapPoint: Double
-        ) {
-            guard offsets.count == layouts.count + 1,
-                  points.count == offsets.count,
-                  points.count > 1
-            else { return }
-
-            // `offsets` already holds the compact local stack at each vertex.
-            // Freezing the first shared lane for the whole run is what left
-            // ribbons on the sidewalk after companions turned off — the lane
-            // never moved back. Blend only among still-shared vertices so a
-            // shrinking stack slides onto the street, while run edges still
-            // hand off to the existing centerline taper.
-            func vertexIsShared(_ index: Int) -> Bool {
-                (index < layouts.count && layouts[index] != nil)
-                    || (index > 0 && layouts[index - 1] != nil)
-            }
-
-            let transitionDistance: CLLocationDistance = 72
-            let original = offsets
-            for index in original.indices {
-                guard vertexIsShared(index) else { continue }
-                var weightedSum = original[index]
-                var weightTotal = 1.0
-
-                var distance: CLLocationDistance = 0
-                var back = index
-                while back > 0 {
-                    distance += points[back - 1].distance(to: points[back])
-                        * metersPerMapPoint
-                    if distance > transitionDistance { break }
-                    guard vertexIsShared(back - 1) else { break }
-                    let weight = 1.0 - distance / transitionDistance
-                    weightedSum += original[back - 1] * weight
-                    weightTotal += weight
-                    back -= 1
-                }
-
-                distance = 0
-                var forward = index
-                while forward < original.count - 1 {
-                    distance += points[forward].distance(to: points[forward + 1])
-                        * metersPerMapPoint
-                    if distance > transitionDistance { break }
-                    guard vertexIsShared(forward + 1) else { break }
-                    let weight = 1.0 - distance / transitionDistance
-                    weightedSum += original[forward + 1] * weight
-                    weightTotal += weight
-                    forward += 1
-                }
-
-                offsets[index] = weightedSum / weightTotal
-            }
-        }
-        
-        private func bridgeShortCorridorGaps(
-            points: [MKMapPoint],
-            explicitlyStacked: inout [Bool],
-            trunkOwnerVertices: inout [Bool],
-            corridorReferenceIDs: inout [Int?],
-            offsets: inout [Double],
+            baseSharedVertices: [Bool],
+            packageSharedVertices: [Bool],
             deltaX: inout [Double],
             deltaY: inout [Double],
             metersPerMapPoint: Double
         ) {
-            // Matches the corridor-continuation distance used when stabilizing
-            // run offsets: a dropout short enough to hold its lane through is
-            // also short enough to bridge, so the ribbon stays straight instead
-            // of pinching to the centerline and fanning back out. The gates
-            // below (same reference shape, same side, at most one lane of
-            // change, and a path that actually runs straight along the
-            // corridor) still prevent bridging across a genuine turn.
-            let maximumGapDistance: CLLocationDistance = 150
-            let maximumLaneChange = RouteMapStyle.laneSpacingPoints * 1.1
-            guard points.count > 2,
-                  points.count == explicitlyStacked.count,
-                  points.count == trunkOwnerVertices.count,
-                  points.count == corridorReferenceIDs.count
+            guard points.count == baseSharedVertices.count,
+                  points.count == packageSharedVertices.count,
+                  points.count == deltaX.count,
+                  points.count == deltaY.count
             else { return }
 
-            var leftIndex = 0
-            while leftIndex < points.count - 1 {
-                guard explicitlyStacked[leftIndex] else {
-                    leftIndex += 1
+            var start = 0
+            while start < points.count {
+                guard packageSharedVertices[start],
+                      !baseSharedVertices[start]
+                else {
+                    start += 1
                     continue
                 }
-
-                var rightIndex = leftIndex + 1
-                var gapDistance: CLLocationDistance = 0
-                while rightIndex < points.count {
-                    gapDistance += points[rightIndex - 1].distance(
-                        to: points[rightIndex]
-                    ) * metersPerMapPoint
-                    if explicitlyStacked[rightIndex] { break }
-                    rightIndex += 1
+                let gapStart = start
+                while start < points.count,
+                      packageSharedVertices[start],
+                      !baseSharedVertices[start] {
+                    start += 1
                 }
-
-                guard rightIndex < points.count else { break }
-                defer { leftIndex = rightIndex }
-                // A dropout the strand never leaves runs nearly straight along
-                // the shared street, so its path length is close to the chord
-                // between the stacked anchors. When the path is much longer
-                // than that chord the strand swung away — a real detour around
-                // a block or a one-way pair — and holding the lane through it
-                // would draw the ribbon off the bus's street.
-                let gapChordDistance = points[leftIndex].distance(
-                    to: points[rightIndex]
-                ) * metersPerMapPoint
-                guard rightIndex > leftIndex + 1,
-                      gapDistance <= maximumGapDistance,
-                      gapChordDistance >= 0.75 * gapDistance,
-                      let leftReferenceID = corridorReferenceIDs[leftIndex],
-                      corridorReferenceIDs[rightIndex] == leftReferenceID
+                let gapEnd = start
+                let left = gapStart - 1
+                let right = gapEnd
+                guard left >= 0,
+                      right < points.count,
+                      baseSharedVertices[left],
+                      baseSharedVertices[right]
                 else { continue }
 
-                let leftOffset = offsets[leftIndex]
-                let rightOffset = offsets[rightIndex]
-                guard leftOffset * rightOffset >= 0,
-                      abs(leftOffset - rightOffset) <= maximumLaneChange
-                else { continue }
-
-                let bridgesSameTrunkOwner = trunkOwnerVertices[leftIndex]
-                    && trunkOwnerVertices[rightIndex]
+                var gapDistance: CLLocationDistance = 0
+                for index in left..<right {
+                    gapDistance += points[index].distance(
+                        to: points[index + 1]
+                    ) * metersPerMapPoint
+                }
+                guard gapDistance > 0 else { continue }
                 var distanceFromLeft: CLLocationDistance = 0
-                for index in (leftIndex + 1)..<rightIndex {
-                    distanceFromLeft += points[index - 1].distance(to: points[index])
-                        * metersPerMapPoint
-                    let progress = gapDistance > 0
-                        ? distanceFromLeft / gapDistance : 0
-                    offsets[index] = leftOffset
-                        + (rightOffset - leftOffset) * progress
-                    deltaX[index] = deltaX[leftIndex]
-                        + (deltaX[rightIndex] - deltaX[leftIndex]) * progress
-                    deltaY[index] = deltaY[leftIndex]
-                        + (deltaY[rightIndex] - deltaY[leftIndex]) * progress
-                    explicitlyStacked[index] = true
-                    trunkOwnerVertices[index] = bridgesSameTrunkOwner
-                    corridorReferenceIDs[index] = leftReferenceID
+                for index in gapStart..<gapEnd {
+                    distanceFromLeft += points[index - 1].distance(
+                        to: points[index]
+                    ) * metersPerMapPoint
+                    let progress = distanceFromLeft / gapDistance
+                    deltaX[index] = deltaX[left]
+                        + (deltaX[right] - deltaX[left]) * progress
+                    deltaY[index] = deltaY[left]
+                        + (deltaY[right] - deltaY[left]) * progress
                 }
             }
         }
@@ -1879,21 +1696,14 @@ struct WayboundMapView: UIViewRepresentable {
             }
         }
 
-        private func applyTaperedLayout(
+        private func applyTaperedAlignment(
             factor: Double,
-            sourceOffset: Double,
             sourceDeltaX: Double,
             sourceDeltaY: Double,
             destinationIndex: Int,
-            offsets: inout [Double],
             deltaX: inout [Double],
             deltaY: inout [Double]
         ) {
-            let candidateOffset = sourceOffset * factor
-            if abs(candidateOffset) > abs(offsets[destinationIndex]) {
-                offsets[destinationIndex] = candidateOffset
-            }
-
             let candidateX = sourceDeltaX * factor
             let candidateY = sourceDeltaY * factor
             if hypot(candidateX, candidateY) > hypot(
@@ -1953,11 +1763,9 @@ struct WayboundMapView: UIViewRepresentable {
 
             for (candidateID, geometry) in corridorGeometryByJourneyID
             where candidateID != journeyID {
-                // A true shared road remains close and parallel across this entire
-                // short sample. Requiring both endpoints eliminates incidental
-                // matches at crossings and the inside edge of unrelated turns.
-                // The spatial index narrows each test to the handful of
-                // candidate segments actually near that point.
+                // Alignment uses the same local membership gates as the old
+                // renderer, but the package owns the authoritative lane
+                // membership and all subsequent lane passes.
                 guard let midpointSegment = parallelCorridorSegment(
                     near: midpoint,
                     direction: segment,
@@ -1983,72 +1791,20 @@ struct WayboundMapView: UIViewRepresentable {
             }
 
             guard localSegmentByJourneyID.count > 1 else { return nil }
-            // Public route identity—not live utility ranking—defines lateral order.
-            // The sheet can reorder by usefulness without making map colors swap.
             let memberIDs = localSegmentByJourneyID.keys.sorted(
                 by: corridorLaneComesBefore
             )
-            // Both directions of one numbered route are one visual strand.
-            func publicRouteKey(for memberID: Int) -> String {
-                guard let geometry = corridorGeometryByJourneyID[memberID] else {
-                    return "id:\(memberID)"
-                }
-                return "\(geometry.agencyName)|\(geometry.routeNumber)"
-            }
-            let dominanceCandidates: [Int]
-            if let selectedID = parent.selectedJourneyID,
-               memberIDs.contains(selectedID) {
-                dominanceCandidates = [selectedID]
-            } else if let highlightedIDs = parent.highlightedJourneyIDs {
-                let highlightedMembers = memberIDs.filter {
-                    highlightedIDs.contains($0)
-                }
-                dominanceCandidates = highlightedMembers.isEmpty
-                    ? memberIDs : highlightedMembers
-            } else {
-                dominanceCandidates = memberIDs
-            }
-            guard let dominantID = dominanceCandidates.min(by: {
-                firstID, secondID in
-                let first = corridorGeometryByJourneyID[firstID]
-                let second = corridorGeometryByJourneyID[secondID]
-                let firstFrequency = first?.observedDepartureCount ?? 0
-                let secondFrequency = second?.observedDepartureCount ?? 0
-                if firstFrequency != secondFrequency {
-                    return firstFrequency > secondFrequency
-                }
-                let firstOrder = first?.stackOrder ?? .max
-                let secondOrder = second?.stackOrder ?? .max
-                if firstOrder != secondOrder { return firstOrder < secondOrder }
-                return firstID < secondID
-            }) else { return nil }
 
-            // Anchored lane: this segment's lane comes from the global
-            // schedule, chosen once when the strand entered this corridor and
-            // held while it continues. The previously re-derived stack slid
-            // every continuing strand by half a lane at each join or leave —
-            // the braiding defect this replaces.
             let strandKey = CorridorLaneSchedule.StrandKey(
                 journeyID: journeyID,
                 polylineIndex: polylineIndex
             )
             guard let sample = corridorLaneSchedule[strandKey]?[segmentIndex]
             else { return nil }
-            // The schedule stores the offset against the sweeping spine's
-            // travel direction; convert into this journey's frame using its
-            // held direction chain — the same reversal hold the renderer's
-            // offset pass applies — so hairpins keep the physical side.
-            let heldDirection = heldUnitDirectionsByStrand[
-                strandKey
-            ]?[segmentIndex] ?? (x: segment.unitX, y: segment.unitY)
-            let frameSign: Double = heldDirection.0 * sample.directionX
-                + heldDirection.1 * sample.directionY >= 0 ? 1 : -1
-            let localOffset = sample.offset * frameSign
 
             // Alignment anchors follow the schedule's sticky corridor
             // reference when it is locally matched; a reference not visible
-            // from this sample keeps the observer's own vertices (no
-            // adoption), matching the scheduler's spine choice downstream.
+            // from this sample falls back to the first public-identity member.
             let referenceID: Int
             let referenceSegment: MapRouteSegment?
             let stickyReferenceMatched: Bool
@@ -2085,33 +1841,18 @@ struct WayboundMapView: UIViewRepresentable {
                 )
             }
 
-            // Street-anchored ribbons: move the adopted anchors laterally
-            // back onto the reference street. Slots are defined against
-            // the street, but the ribbon is drawn from the own path: a
-            // joiner converging from a different starting point (or two
-            // polylines on opposite roads of a divided highway) would
-            // draw its slot shifted by that wander, and where the paths
-            // part at corners, visibly kinked. Shifting the anchors —
-            // not the offsets — keeps slots slot-valued so the bridge
-            // and taper passes interpolate lanes. The displacement is
-            // measured on the adopted anchor (the adoption snap is not
-            // double-counted) against the exact matched segment.
+            // Keep the street-anchor correction from the shipped renderer.
+            // It changes only the drawn centerline; package lane slots remain
+            // untouched and are returned by CorridorLaneLayoutEngine.
             if referenceID != journeyID, stickyReferenceMatched,
                let reference = referenceSegment {
                 let refX = reference.unitX, refY = reference.unitY
-                // anchors are left of the OWN travel: flip the reference
-                // frame when this segment runs against the reference
                 let frame = (segment.unitX * refX + segment.unitY * refY) >= 0
                     ? 1.0 : -1.0
                 let normalX = -refY, normalY = refX
                 let spanX = reference.end.x - reference.start.x
                 let spanY = reference.end.y - reference.start.y
                 let norm2 = spanX * spanX + spanY * spanY
-                // Legitimate corrections are sub-lane (a few metres of
-                // polyline parallax); anything larger means the anchor
-                // was measured against the wrong piece of street (a
-                // fallback reference, a far-away parallel segment) and
-                // would throw the ribbon off the road. Cap at 30 m.
                 let maxShift = 30.0 / metersPerMapPoint
                 if norm2 > 0 {
                     func streetAnchored(_ anchor: MKMapPoint) -> MKMapPoint {
@@ -2133,18 +1874,18 @@ struct WayboundMapView: UIViewRepresentable {
                 }
             }
 
-            // Trunk ownership belongs to the dominant public route, not to one
-            // journey of it: both directions project onto the same reference
-            // centerline and would otherwise each leave the consolidated
-            // city-scale trunk to the other.
+            // These lane fields are intentionally inert: the package layout
+            // engine supplies offsets/shared/trunk for the whole corridor.
+            // Keeping one record type lets the geometry-only pass carry the
+            // two aligned anchors and its sticky reference without a second
+            // parallel representation.
             return CorridorSegmentLayout(
-                offset: localOffset,
-                enteringOffset: localOffset,
+                offset: 0,
+                enteringOffset: 0,
                 alignedStart: alignedStart,
                 alignedEnd: alignedEnd,
                 referenceID: referenceID,
-                isTrunkOwner: publicRouteKey(for: journeyID)
-                    == publicRouteKey(for: dominantID)
+                isTrunkOwner: false
             )
         }
 
