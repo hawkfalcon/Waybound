@@ -1019,6 +1019,12 @@ enum LaneHarness {
                         highlighted: highlighted
                     )
                 ))
+                if index == traceStrand, si < 8 {
+                    print(
+                        "SCHEDLAYOUTS j\(index) si\(si) laneOff \(lane.offset) "
+                            + "ref \(lane.referenceID)"
+                    )
+                }
             }
             applyPathDelta(
                 strand,
@@ -1027,6 +1033,18 @@ enum LaneHarness {
                 strands: strands,
                 scan: scan
             )
+            if index == traceStrand {
+                var post: [String] = []
+                for si in 0..<min(8, segments.count) {
+                    if let segment = segments[si] {
+                        post.append(
+                            "si\(si):\((segment.offset * 100).rounded() / 100)"
+                        )
+                    }
+                }
+                let postText = post.joined(separator: " ")
+                print("SCHEDLAYOUTS j\(index) postDelta \(postText)")
+            }
             layouts[index] = pipeline(
                 strand,
                 segments,
