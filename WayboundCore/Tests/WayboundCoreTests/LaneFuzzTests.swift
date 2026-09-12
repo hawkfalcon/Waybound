@@ -208,7 +208,10 @@ final class LaneFuzzTests: XCTestCase {
                 badSeeds.append(seed)
             }
         }
-        let gate = 55
+        // Pinned to the measured clean-tree run after the held-cache key
+        // fix (SplitMix64's own baseline; python's 42/45 never transferred).
+        // Deliberate pin — only raise it with a deliberate improvement.
+        let gate = 35
         print(
             "LANE-FUZZ summary problemSeeds=\(bad) of \(seedCount) "
                 + "gate=\(gate) bad=[\(badSeeds.map(String.init).joined(separator: ","))]"
