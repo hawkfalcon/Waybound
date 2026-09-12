@@ -1,5 +1,6 @@
 import XCTest
 @testable import Waybound
+import WayboundCore
 
 final class StopClusteringTests: XCTestCase {
 

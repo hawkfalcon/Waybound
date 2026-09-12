@@ -3,6 +3,7 @@ import Combine
 import CoreLocation
 import MapKit
 import SwiftUI
+import WayboundCore
 
 private struct JourneyBoardingOption {
     let route: TransitRoute

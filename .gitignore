@@ -1,3 +1,6 @@
 Secrets.plist
 __pycache__/
 tools/replay/out/
+
+# Swift package build artifacts (WayboundCore)
+WayboundCore/.build/

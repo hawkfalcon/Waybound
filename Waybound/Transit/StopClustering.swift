@@ -1,5 +1,6 @@
 import CoreLocation
 import Foundation
+import WayboundCore
 
 /// Groups Transitland stop records that refer to the same physical boarding
 /// place. Exact coordinate duplicates are always merged; differently named

@@ -103,6 +103,7 @@
 			);
 			name = Waybound;
 			packageProductDependencies = (
+				62AA00020000000000000011 /* WayboundCore */,
 			);
 			productName = Waybound;
 			productReference = 625C1C46303129C700F8E02D /* Waybound.app */;
@@ -126,6 +127,7 @@
 			);
 			name = WayboundTests;
 			packageProductDependencies = (
+				62AA00020000000000000012 /* WayboundCore */,
 			);
 			productName = WayboundTests;
 			productReference = 62AA00020000000000000001 /* WayboundTests.xctest */;
@@ -159,6 +161,9 @@
 			);
 			mainGroup = 625C1C3D303129C700F8E02D;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				62AA00020000000000000010 /* XCLocalSwiftPackageReference: WayboundCore */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 625C1C47303129C700F8E02D /* Products */;
 			projectDirPath = "";
@@ -489,6 +494,26 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		62AA00020000000000000010 /* XCLocalSwiftPackageReference: WayboundCore */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = WayboundCore;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		62AA00020000000000000011 /* WayboundCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 62AA00020000000000000010 /* XCLocalSwiftPackageReference: WayboundCore */;
+			productName = WayboundCore;
+		};
+		62AA00020000000000000012 /* WayboundCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 62AA00020000000000000010 /* XCLocalSwiftPackageReference: WayboundCore */;
+			productName = WayboundCore;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 625C1C3E303129C700F8E02D /* Project object */;
 }

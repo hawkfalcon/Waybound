@@ -1,6 +1,7 @@
 import CoreLocation
 import Foundation
 import MapKit
+import WayboundCore
 
 /// Ranking and rider-facing deduplication for boardable journeys. Pure
 /// functions over `RouteJourney` values, so overview ordering and the
