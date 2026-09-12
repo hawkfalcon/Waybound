@@ -430,11 +430,28 @@ final class LaneCheckTests: XCTestCase {
                 journeys: js,
                 laneSpacingPoints: LaneHarness.laneSpacing
             )
-            for (key, entries) in sched.sorted(by: { $0.key.journeyID < $1.key.journeyID }) {
-                let offsets = Set(entries.values.map { Double(round($0.offset * 100) / 100) })
-                let refs = Set(entries.values.map { $0.referenceID })
-                print("PROBE \(label) j\(key.journeyID) n \(entries.count) "
-                    + "offsets \(offsets.sorted()) refs \(refs.sorted())")
+            let scan = LaneHarness.membershipScan(strands)
+            let schedLayouts = LaneHarness.scheduledLayouts(
+                strands: strands,
+                scan: scan,
+                schedule: LaneHarness.rekeySchedule(sched)
+            )
+            for index in 0..<strands.count {
+                guard let layout = schedLayouts[index] else {
+                    print("PROBE \(label) j\(index) NO LAYOUT")
+                    continue
+                }
+                var runs: [(Double, Int)] = []
+                for offset in layout.offsets {
+                    let rounded = (offset * 100).rounded() / 100
+                    if let last = runs.last, last.0 == rounded {
+                        runs[runs.count - 1].1 += 1
+                    } else {
+                        runs.append((rounded, 1))
+                    }
+                }
+                print("PROBE \(label) j\(index) n \(layout.offsets.count) "
+                    + "runs \(runs.prefix(12))")
             }
         }
         print("PROBE all ok")
