@@ -863,8 +863,12 @@ enum LaneHarness {
             let reference = match.segment
             let referenceStrand = strands[referenceID]
             let held = heldDirections(referenceStrand, cache: &heldCache)
-            let rh = held[match.ownIndex]
-                ?? (x: reference.unitX, y: reference.unitY)
+            if match.ownIndex >= held.count {
+                print("PATHDELTA DBG observer \(strand.id) si \(si) ref \(referenceStrand.id) ownIndex \(match.ownIndex) heldCount \(held.count) refSegs \(referenceStrand.segments.count) refPoints \(referenceStrand.points.count)")
+            }
+            let rh = match.ownIndex < held.count
+                ? held[match.ownIndex]
+                : (x: reference.unitX, y: reference.unitY)
             let frame: Double = segment.unitX * rh.x + segment.unitY * rh.y
                 >= 0 ? 1.0 : -1.0
             let nx = -rh.y
