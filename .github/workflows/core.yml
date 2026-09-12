@@ -60,10 +60,23 @@ jobs:
             grep 'LAYOUT-GOLDEN' test.log | head -40 || echo "(no layout-golden lines)"
             echo '```'
             echo
+            echo '```'
+            grep -E 'LANE-CHECK|LANE-FUZZ' test.log | head -50 || true
+            echo '```'
+            echo
             if grep -q 'error:' test.log; then
               echo "### compiler/test errors"
               echo '```'
               grep 'error:' test.log | sort -u | head -30
+              echo '```'
+            fi
+            if grep -q 'Fatal error' test.log; then
+              echo "### runtime crash — last test cases seen"
+              echo '```'
+              grep -B2 'Fatal error' test.log | tail -8
+              echo '```'
+              echo '```'
+              grep 'Test Case' test.log | tail -6
               echo '```'
             fi
             echo '```'
@@ -72,9 +85,17 @@ jobs:
           } > report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$n" ]; then
-            gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --edit-last --body-file report.md \
-              || gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --body-file report.md \
-              || echo "(could not post PR comment)"
+            # edit OUR last comment (header-matched) instead of --edit-last,
+            # so the core and lanes workflows never overwrite each other
+            cid=$(gh api "repos/$GITHUB_REPOSITORY/issues/$n/comments" \
+                    --jq '.[] | select(.body | startswith("## core —")) | .id' 2>/dev/null | tail -1)
+            if [ -n "$cid" ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" \
+                -f body="$(cat report.md)" > /dev/null
+            else
+              gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --body-file report.md \
+                || echo "(could not post PR comment)"
+            fi
           else
             echo "(no PR found for branch ${branch}; report left in the step summary)"
           fi
