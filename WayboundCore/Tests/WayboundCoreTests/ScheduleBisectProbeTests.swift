@@ -79,8 +79,7 @@ final class ScheduleBisectProbeTests: XCTestCase {
         ])
 
         // The real first scenario, verbatim.
-        let check = LaneCheckTests()
-        run("8-state_trunk", check.scenarios().first { $0.name == "state_trunk" }!.strands)
+        run("8-state_trunk", LaneScenarios.stateTrunk())
         print("PROBE all ok")
     }
 }
