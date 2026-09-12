@@ -458,10 +458,32 @@ final class LaneCheckTests: XCTestCase {
                 }
             }
             let scan = LaneHarness.membershipScan(strands)
+            let rekeyed = LaneHarness.rekeySchedule(sched)
+            if label == "10-couplet" {
+                var heldCache: [Int: [(x: Double, y: Double)]] = [:]
+                var laneRows: [String] = []
+                for si in 0..<strands[3].segments.count {
+                    let lane = LaneHarness.scheduledLane(
+                        strandIndex: 3,
+                        segmentIndex: si,
+                        strands: strands,
+                        scan: scan,
+                        schedule: rekeyed,
+                        heldCache: &heldCache
+                    )
+                    if let lane {
+                        laneRows.append("(\(si),\((lane.offset * 100).rounded() / 100))")
+                    }
+                }
+                print("PROBE 10-couplet j3 lanes \(laneRows.count)")
+                for row in laneRows {
+                    print("PROBE 10-couplet j3 lane \(row)")
+                }
+            }
             let schedLayouts = LaneHarness.scheduledLayouts(
                 strands: strands,
                 scan: scan,
-                schedule: LaneHarness.rekeySchedule(sched)
+                schedule: rekeyed
             )
             for index in 0..<strands.count {
                 guard let layout = schedLayouts[index] else {
