@@ -398,7 +398,9 @@ enum LaneHarness {
         scan: [[[Match]]],
         schedule: [Int: [Int: CorridorLaneSchedule.Sample]],
         heldCache: inout [Int: [(x: Double, y: Double)]]
-    ) -> (offset: Double, referenceID: Int, reference: CorridorMembership.CorridorSegment)? {
+    ) -> (offset: Double,
+          referenceID: Int,
+          reference: CorridorMembership.CorridorSegment?)? {
         guard segmentIndex < scan[strandIndex].count,
               !scan[strandIndex][segmentIndex].isEmpty,
               let entry = schedule[strandIndex]?[segmentIndex],
