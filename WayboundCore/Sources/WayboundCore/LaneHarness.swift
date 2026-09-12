@@ -476,7 +476,7 @@ enum LaneHarness {
                 runs.append((rounded, 1))
             }
         }
-        print("PIPELINE \(stage) n \(offs.count) runs \(runs.prefix(14))")
+        print("PROBE PIPELINE \(stage) n \(offs.count) runs \(runs.prefix(14))")
     }
 
     static func pipeline(
@@ -1021,7 +1021,7 @@ enum LaneHarness {
                 ))
                 if index == traceStrand, si < 8 {
                     print(
-                        "SCHEDLAYOUTS j\(index) si\(si) laneOff \(lane.offset) "
+                        "PROBE SCHEDLAYOUTS j\(index) si\(si) laneOff \(lane.offset) "
                             + "ref \(lane.referenceID)"
                     )
                 }
@@ -1043,7 +1043,7 @@ enum LaneHarness {
                     }
                 }
                 let postText = post.joined(separator: " ")
-                print("SCHEDLAYOUTS j\(index) postDelta \(postText)")
+                print("PROBE SCHEDLAYOUTS j\(index) postDelta \(postText)")
             }
             layouts[index] = pipeline(
                 strand,
