@@ -63,6 +63,9 @@ enum LaneHarness {
             self.stack = id
             self.coords = coords
             self.latitude = coords[0].latitude
+            self.metersPerUnit = GeoProjection.metersPerUnit(
+                atLatitude: coords[0].latitude
+            )
             self.points = coords.map { $0.projected }
             var segments: [CorridorMembership.CorridorSegment?] = []
             segments.reserveCapacity(points.count - 1)
