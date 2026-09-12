@@ -197,6 +197,7 @@ final class LaneFuzzTests: XCTestCase {
     }
 
     func testFuzz() {
+        setvbuf(stdout, nil, _IONBF, 0)
         let seedCount = 120
         var bad = 0
         var badSeeds: [UInt64] = []

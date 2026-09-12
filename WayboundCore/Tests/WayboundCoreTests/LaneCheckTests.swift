@@ -313,6 +313,7 @@ final class LaneCheckTests: XCTestCase {
     // ------------------------------------------------------------------
 
     func testLaneCheckScenarios() {
+        setvbuf(stdout, nil, _IONBF, 0)
         var failures: [String] = []
         for scenario in scenarios() {
             let problems = evaluate(scenario)
