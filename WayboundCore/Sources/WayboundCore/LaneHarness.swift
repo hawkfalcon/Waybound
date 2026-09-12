@@ -466,47 +466,15 @@ enum LaneHarness {
         var referenceIDs: [Int?]
     }
 
-    static func traceOffsets(_ stage: String, _ offs: [Double]) {
-        var runs: [(Double, Int)] = []
-        for offset in offs {
-            let rounded = (offset * 100).rounded() / 100
-            if let last = runs.last, last.0 == rounded {
-                runs[runs.count - 1].1 += 1
-            } else {
-                runs.append((rounded, 1))
-            }
-        }
-        print("PROBE PIPELINE \(stage) n \(offs.count) runs \(runs.prefix(14))")
-    }
-
     static func pipeline(
         _ strand: Strand,
         _ segmentLayouts: [SegmentLane?],
-        rateClamp: Double = 0.08,
-        trace: Bool = false
+        rateClamp: Double = 0.08
     ) -> Layout {
         let points = strand.points
         let m = strand.metersPerUnit
         let n = points.count
-        if trace {
-            var laneRuns: [(Double, Int)] = []
-            var nilCount = 0
-            for layout in segmentLayouts {
-                guard let layout else {
-                    nilCount += 1
-                    continue
-                }
-                let rounded = (layout.offset * 100).rounded() / 100
-                if let last = laneRuns.last, last.0 == rounded {
-                    laneRuns[laneRuns.count - 1].1 += 1
-                } else {
-                    laneRuns.append((rounded, 1))
-                }
-            }
-            print("PIPELINE input nils \(nilCount) lanes \(laneRuns)")
-        }
-
-        // removeShortCorridorRuns
+// removeShortCorridorRuns
         var layouts = segmentLayouts
         var i = 0
         while i < layouts.count {
@@ -558,7 +526,6 @@ enum LaneHarness {
                 offsets.append(0.0)
             }
         }
-        if trace { traceOffsets("avg", offsets) }
         var stacked = offsetCounts.map { $0 > 0 }
         var trunk = trunkVotes.map { $0 > 0 }
         var referenceIDs: [Int?] = []
@@ -609,7 +576,6 @@ enum LaneHarness {
             offsets[index] = weightedSum / weightTotal
         }
 
-        if trace { traceOffsets("stab72", offsets) }
         // bridgeShortCorridorGaps
         var left = 0
         while left < n - 1 {
@@ -719,7 +685,6 @@ enum LaneHarness {
             }
         }
 
-        if trace { traceOffsets("tapers", offsets) }
         // hairpin decays
         let hairpinTaper = 58.0
         if n > 2 {
@@ -754,7 +719,6 @@ enum LaneHarness {
             }
         }
 
-        if trace { traceOffsets("hairpin", offsets) }
         // alignment rate clamp — two symmetric passes
         if rateClamp > 0 {
             for index in 1..<n {
@@ -898,9 +862,6 @@ enum LaneHarness {
             let reference = match.segment
             let referenceStrand = strands[referenceID]
             let held = heldDirections(referenceStrand, cache: &heldCache)
-            if match.ownIndex >= held.count {
-                print("PATHDELTA DBG observer \(strand.id) si \(si) ref \(referenceStrand.id) ownIndex \(match.ownIndex) heldCount \(held.count) refSegs \(referenceStrand.segments.count) refPoints \(referenceStrand.points.count)")
-            }
             let rh = match.ownIndex < held.count
                 ? held[match.ownIndex]
                 : (x: reference.unitX, y: reference.unitY)
@@ -968,8 +929,7 @@ enum LaneHarness {
         scan: [[[Match]]],
         schedule: [Int: [Int: CorridorLaneSchedule.Sample]],
         selected: Int? = nil,
-        highlighted: [Int]? = nil,
-        traceStrand: Int? = nil
+        highlighted: [Int]? = nil
     ) -> [Int: Layout] {
         var layouts: [Int: Layout] = [:]
         var heldCache: [Int: [(x: Double, y: Double)]] = [:]
@@ -1019,12 +979,6 @@ enum LaneHarness {
                         highlighted: highlighted
                     )
                 ))
-                if index == traceStrand, si < 8 {
-                    print(
-                        "PROBE SCHEDLAYOUTS j\(index) si\(si) laneOff \(lane.offset) "
-                            + "ref \(lane.referenceID)"
-                    )
-                }
             }
             applyPathDelta(
                 strand,
@@ -1033,23 +987,7 @@ enum LaneHarness {
                 strands: strands,
                 scan: scan
             )
-            if index == traceStrand {
-                var post: [String] = []
-                for si in 0..<min(8, segments.count) {
-                    if let segment = segments[si] {
-                        post.append(
-                            "si\(si):\((segment.offset * 100).rounded() / 100)"
-                        )
-                    }
-                }
-                let postText = post.joined(separator: " ")
-                print("PROBE SCHEDLAYOUTS j\(index) postDelta \(postText)")
-            }
-            layouts[index] = pipeline(
-                strand,
-                segments,
-                trace: index == traceStrand
-            )
+            layouts[index] = pipeline(strand, segments)
         }
         return layouts
     }
