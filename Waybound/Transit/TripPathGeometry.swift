@@ -210,6 +210,103 @@ enum TripPathGeometry {
         ).map { $0.cl }
     }
 
+    private static func firstOutAndBackSpurRange(
+        in coordinates: [CLLocationCoordinate2D],
+        metersPerPoint: Double
+    ) -> Range<Int>? {
+        let points = coordinates.map { MKMapPoint($0) }
+        // Below ~20 m a wobble is invisible; above ~150 m a returning path is
+        // far more likely a legitimate loop around a small block.
+        let minimumSpurLength: CLLocationDistance = 20
+        let maximumSpurLength: CLLocationDistance = 150
+        // The spur must actually leave the street it belongs to.
+        let minimumSpurDepth: CLLocationDistance = 12
+
+        for anchorIndex in 1..<(points.count - 1) {
+            var spurLength: CLLocationDistance = 0
+            for returnIndex in (anchorIndex + 1)..<points.count - 1 {
+                spurLength += points[returnIndex - 1].distance(
+                    to: points[returnIndex]
+                ) * metersPerPoint
+                if spurLength > maximumSpurLength { break }
+                guard spurLength >= minimumSpurLength else { continue }
+
+                // The path must come back to almost exactly where it left.
+                let returnDistance = points[anchorIndex].distance(
+                    to: points[returnIndex]
+                ) * metersPerPoint
+                guard returnDistance <= min(12, max(6, spurLength * 0.08))
+                else { continue }
+
+                // …and then continue onward in the same direction it arrived.
+                // A turnaround that comes back facing the other way is real
+                // service, not an artifact.
+                guard let incomingHeading = unitHeading(
+                    from: points[anchorIndex - 1],
+                    to: points[anchorIndex]
+                ),
+                    let outgoingHeading = unitHeading(
+                        from: points[returnIndex],
+                        to: points[returnIndex + 1]
+                    ),
+                    incomingHeading.x * outgoingHeading.x
+                        + incomingHeading.y * outgoingHeading.y >= 0.5
+                else { continue }
+
+                var spurDepth: CLLocationDistance = 0
+                for index in (anchorIndex + 1)..<returnIndex {
+                    spurDepth = max(
+                        spurDepth,
+                        perpendicularDistance(
+                            of: points[index],
+                            from: points[anchorIndex],
+                            to: points[returnIndex]
+                        ) * metersPerPoint
+                    )
+                }
+                guard spurDepth >= minimumSpurDepth else { continue }
+
+                return (anchorIndex + 1)..<returnIndex
+            }
+        }
+        return nil
+    }
+
+    private static func unitHeading(
+        from start: MKMapPoint,
+        to end: MKMapPoint
+    ) -> (x: Double, y: Double)? {
+        let deltaX = end.x - start.x
+        let deltaY = end.y - start.y
+        let length = hypot(deltaX, deltaY)
+        guard length > 0.000_001 else { return nil }
+        return (deltaX / length, deltaY / length)
+    }
+
+    private static func perpendicularDistance(
+        of point: MKMapPoint,
+        from start: MKMapPoint,
+        to end: MKMapPoint
+    ) -> Double {
+        let deltaX = end.x - start.x
+        let deltaY = end.y - start.y
+        let lengthSquared = deltaX * deltaX + deltaY * deltaY
+        guard lengthSquared > 0 else {
+            return point.distance(to: start)
+        }
+        let progress = max(
+            0,
+            min(1, ((point.x - start.x) * deltaX
+                + (point.y - start.y) * deltaY) / lengthSquared)
+        )
+        let projection = MKMapPoint(
+            x: start.x + progress * deltaX,
+            y: start.y + progress * deltaY
+        )
+        return point.distance(to: projection)
+    }
+
+
     /// Breaks a polyline wherever a consecutive jump is implausibly large, so
     /// a single bad vertex can no longer draw a line across the map.
     static func splitPolyline(
