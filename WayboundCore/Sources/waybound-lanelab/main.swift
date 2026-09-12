@@ -46,7 +46,10 @@ func stationReport(_ doc: LaneDiagnosticsDocument) {
     for (key, strandLayout) in byStrand {
         guard strandLayout.layout.offsets.count >= 2 else { continue }
         var arc = 0.0
-        let coordinates = journeyPolylines(doc, strandLayout)
+        let coordinates = journeyPolylines(
+            strandLayout.journey,
+            strandLayout.layout.polylineIndex
+        )
         for index in 1..<coordinates.count {
             arc += coordinates[index - 1].projected
                 .distance(to: coordinates[index].projected)
@@ -75,7 +78,10 @@ func stationReport(_ doc: LaneDiagnosticsDocument) {
                 + "\(Int(spine.arc)) m:"
         )
         let fractions = [0.08, 0.2, 0.35, 0.5, 0.65, 0.8, 0.92]
-        let coordinates = journeyPolylines(doc, spineLayout)
+        let coordinates = journeyPolylines(
+            spineLayout.journey,
+            spineLayout.layout.polylineIndex
+        )
         var arc = 0.0
         var arcs = [0.0]
         for index in 1..<coordinates.count {
@@ -131,12 +137,11 @@ func stationReport(_ doc: LaneDiagnosticsDocument) {
 }
 
 func journeyPolylines(
-    _ doc: LaneDiagnosticsDocument,
-    _ strandLayout: (journey: LaneDiagnosticsDocument.Journey, layout: LaneDiagnosticsDocument.LayoutStrand)
+    _ journey: LaneDiagnosticsDocument.Journey,
+    _ polylineIndex: Int
 ) -> [GeoCoordinate] {
-    let index = strandLayout.layout.polylineIndex
-    guard index < strandLayout.journey.polylines.count else { return [] }
-    return strandLayout.journey.polylines[index]
+    guard polylineIndex < journey.polylines.count else { return [] }
+    return journey.polylines[polylineIndex]
 }
 
 let paths = fixturePaths()
