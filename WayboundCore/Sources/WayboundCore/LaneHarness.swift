@@ -1627,6 +1627,8 @@ extension LaneHarness.Strand {
         for byte in id.utf8 {
             hash = ((hash &<< 5) &+ hash) &+ UInt64(byte)
         }
-        return Int(truncatingIfNeeded: hash >> 1)
+        // No shift: ids differing in their final bit ("j1"/"j2") must not
+        // share a slot — truncatingIfNeeded handles the sign bit.
+        return Int(truncatingIfNeeded: hash)
     }
 }
