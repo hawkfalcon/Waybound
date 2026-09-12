@@ -469,7 +469,9 @@ final class LaneCheckTests: XCTestCase {
                 for index in max(0, pts.count - 5)..<pts.count {
                     last.append(String(format: "(%.1f,%.1f)", pts[index].x, pts[index].y))
                 }
-                print("PROBE 10-couplet j4 pts n \(pts.count) first \(first.joined(separator: \" \")) last \(last.joined(separator: \" \"))")
+                let firstText = first.joined(separator: " ")
+                let lastText = last.joined(separator: " ")
+                print("PROBE 10-couplet j4 pts n \(pts.count) first \(firstText) last \(lastText)")
                 var heldCache: [Int: [(x: Double, y: Double)]] = [:]
                 for si in 0..<12 {
                     let members = scan[3][si].map {
