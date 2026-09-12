@@ -2,7 +2,7 @@ name: lanes
 
 on:
   push:
-    branches: [main, arena/01a05bbd-waybound]
+    branches: [main, arena/01a05bbd-waybound, arena/01a093c3-waybound]
   pull_request:
 
 jobs:
