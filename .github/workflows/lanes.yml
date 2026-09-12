@@ -68,9 +68,9 @@ jobs:
               echo '```'
             fi
             if grep -h 'Fatal error' check.log fuzz.log | head -1 > /dev/null; then
-              echo "### runtime crash"
+              echo "### runtime crash (raw neighbourhood)"
               echo '```'
-              grep -hB2 'Fatal error' check.log fuzz.log | tail -12
+              grep -hA30 -B8 'Fatal error' check.log fuzz.log | head -60
               echo '```'
             fi
           } > report.md

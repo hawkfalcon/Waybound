@@ -339,6 +339,7 @@ public enum CorridorLaneSchedule {
                 }
                 if strand.arc[end] - strand.arc[index]
                     >= LaneScheduleConstants.joinMinimum {
+                    print("TRACE run \(key.journeyID)/\(key.polylineIndex) [\(index),\(end)) arc \(strand.arc.count) rows \(rows.count)")
                     runs.append(Run(strand: key, start: index, end: end))
                 }
                 index = end
