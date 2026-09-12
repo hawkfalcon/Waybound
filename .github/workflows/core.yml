@@ -5,15 +5,49 @@ on:
     branches: [main, arena/01a05bbd-waybound]
   pull_request:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   test:
     # The pure core (WayboundCore SPM package): no Apple frameworks, so it
-    # builds and tests on Linux — free, fast, no macOS queue.
+    # builds and tests on Linux — free, fast, no macOS queue. The golden
+    # tests recompute the lane membership scan over every committed export
+    # fixture and hold it to the device's own schedule.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: "6.0"
+
       - name: swift test
-        run: swift test --package-path WayboundCore
+        run: |
+          set -o pipefail
+          swift test --package-path WayboundCore 2>&1 | tee test.log
+
+      # The agent's sandbox cannot reach the Actions log/artifact hosts, but
+      # it CAN read PR comments through the GitHub API — so the branch's PR
+      # comment thread is the report channel for the iterate-from-CI loop.
+      - name: report to PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh pr view --repo "$GITHUB_REPOSITORY" --json number --jq .number 2>/dev/null || true)
+          if [ -z "$n" ]; then
+            echo "no PR for this branch; skipping comment"
+            exit 0
+          fi
+          {
+            echo "## core — run ${GITHUB_RUN_NUMBER} (\`${GITHUB_SHA:0:7}\`)"
+            echo
+            echo '```'
+            grep 'SCAN-GOLDEN' test.log || echo "(no scan-golden lines)"
+            echo '```'
+            echo
+            tail -n 4 test.log || true
+          } > report.md
+          gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --edit-last --body-file report.md \
+            || gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --body-file report.md
