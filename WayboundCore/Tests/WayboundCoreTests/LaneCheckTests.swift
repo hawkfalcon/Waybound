@@ -70,13 +70,14 @@ final class LaneCheckTests: XCTestCase {
 
     func evaluate(_ scenario: Scenario) -> [String] {
         let strands = scenario.strands
-        print("LANE-CHECK \\(scenario.name) phase scan")
+        print("LANE-CHECK \(scenario.name) phase scan")
         let scan = LaneHarness.membershipScan(strands)
-        print("LANE-CHECK \\(scenario.name) phase main")
+        print("LANE-CHECK \(scenario.name) phase main")
         let mainLayouts = LaneHarness.mainLayouts(
             strands: strands,
             scan: scan
         )
+        print("LANE-CHECK \(scenario.name) phase journeys")
         let journeys = strands.enumerated().map { index, strand in
             LaneDiagnosticsDocument.Journey(
                 id: index,
@@ -92,13 +93,14 @@ final class LaneCheckTests: XCTestCase {
             journeys: journeys,
             laneSpacingPoints: LaneHarness.laneSpacing
         )
-        print("LANE-CHECK \\(scenario.name) phase sched")
+        print("LANE-CHECK \(scenario.name) phase schedule ok")
+        print("LANE-CHECK \(scenario.name) phase sched")
         let schedLayouts = LaneHarness.scheduledLayouts(
             strands: strands,
             scan: scan,
             schedule: LaneHarness.rekeySchedule(schedule)
         )
-        print("LANE-CHECK \\(scenario.name) phase ribbons")
+        print("LANE-CHECK \(scenario.name) phase ribbons")
 
         let ribbonsMain = mainLayouts.mapValues { LaneHarness.ribbon($0) }
         let ribbonsSched = schedLayouts.mapValues { LaneHarness.ribbon($0) }
