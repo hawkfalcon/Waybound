@@ -1230,8 +1230,21 @@ private final class LiveAreaVerifier {
         }
 
         var patternRepresentatives: [DepartureCandidate] = []
-        for (key, candidates) in candidatesByPattern {
-            guard let first = candidates.min(by: candidatePrecedes) else { continue }
+        // Dictionary iteration order changes on every launch because Swift seeds
+        // its hasher randomly per process. candidatePrecedes is deliberately
+        // tolerant -- its one-metre distance deadband lets A tie with B and B tie
+        // with C while A beats C on distance -- so it is not transitive, and
+        // Swift's sort is not stable. Feeding that sort an unordered array made
+        // the winning representative for a direction, and therefore the trip
+        // shapes handed to the lane pipeline, vary between runs over identical
+        // snapshots: scheduledSegmentCount and trunkVertexCount moved while every
+        // count stayed the same. Iterating patterns in a fixed order and
+        // canonically ordering the representatives makes the selection
+        // reproducible without changing what the comparator prefers.
+        for key in candidatesByPattern.keys.sorted() {
+            guard let first = candidatesByPattern[key]?
+                .min(by: candidatePrecedes)
+            else { continue }
             patternRepresentatives.append(DepartureCandidate(
                 routeID: first.routeID,
                 tripID: first.tripID,
@@ -1244,6 +1257,7 @@ private final class LiveAreaVerifier {
                 observedDepartureCount: tripIDsByPattern[key]?.count ?? 0
             ))
         }
+        patternRepresentatives.sort(by: candidateIdentityPrecedes)
 
         var selected: [DepartureCandidate] = []
         for routeID in routeIDs.sorted() {
@@ -1270,13 +1284,23 @@ private final class LiveAreaVerifier {
                 }
             }
         }
-        return selected.sorted {
-            if $0.routeID != $1.routeID { return $0.routeID < $1.routeID }
-            if $0.directionKey != $1.directionKey {
-                return $0.directionKey < $1.directionKey
-            }
-            return $0.tripID < $1.tripID
+        return selected.sorted(by: candidateIdentityPrecedes)
+    }
+
+    /// Canonical, transitive order over candidates: route, then direction, then
+    /// trip. `candidatePrecedes` expresses the audit's preference (proximity,
+    /// then departure time) but its distance deadband makes it intransitive, so
+    /// it cannot define a reproducible sequence on its own. Anything whose order
+    /// is observable has to go through this instead.
+    private func candidateIdentityPrecedes(
+        _ first: DepartureCandidate,
+        _ second: DepartureCandidate
+    ) -> Bool {
+        if first.routeID != second.routeID { return first.routeID < second.routeID }
+        if first.directionKey != second.directionKey {
+            return first.directionKey < second.directionKey
         }
+        return first.tripID < second.tripID
     }
 
     private func candidatePrecedes(

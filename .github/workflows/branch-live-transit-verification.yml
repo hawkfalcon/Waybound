@@ -161,6 +161,43 @@ jobs:
         env:
           TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
 
+      # Swift reseeds its hasher per process, so a second process over the same
+      # cached snapshots is the only way to observe ordering nondeterminism --
+      # two runs inside one process always agree, which is why no unit test can
+      # catch it. Both passes read the cache, so this makes no Transitland
+      # requests. generatedAt is a timestamp and is expected to differ.
+      - name: Determinism check (second process, same snapshots)
+        run: |
+          set +e
+          : > determinism.txt
+          for D in 2026-09-12 2026-09-13 2026-09-14; do
+            swift run --package-path WayboundCore --configuration release \
+              waybound-transit-verify \
+              --areas-file areas.txt \
+              --date "$D" \
+              --cache-dir .transitland-cache \
+              --output-dir "verification-output-repeat/$D" \
+              > "ci-diagnostics/repeat-$D.log" 2>&1
+            RC=$?
+            A="verification-output/$D/report.json"
+            B="verification-output-repeat/$D/report.json"
+            if [ $RC -ne 0 ] || [ ! -f "$A" ] || [ ! -f "$B" ]; then
+              echo "$D INCONCLUSIVE (repeat exit=$RC)" | tee -a determinism.txt
+              continue
+            fi
+            if diff <(grep -v '"generatedAt"' "$A") \
+                    <(grep -v '"generatedAt"' "$B") > /dev/null 2>&1; then
+              echo "$D IDENTICAL" | tee -a determinism.txt
+            else
+              echo "$D DIFFERS" | tee -a determinism.txt
+              diff <(grep -v '"generatedAt"' "$A") \
+                   <(grep -v '"generatedAt"' "$B") | head -60 >> determinism.txt
+            fi
+          done
+          echo "---- determinism ----"
+          cat determinism.txt
+          exit 0
+
       # Publish everything through the PR comment thread, the only channel this
       # sandbox can read. Header-matched edit so repeated runs update in place
       # instead of stacking comments (same pattern as core.yml).
@@ -201,6 +238,11 @@ jobs:
             echo "### verifier exit codes"
             echo '```'
             cat exit-codes.txt 2>/dev/null || cat verify-skipped.txt 2>/dev/null || echo "(none)"
+            echo '```'
+            echo
+            echo "### determinism (second process, identical cached snapshots)"
+            echo '```'
+            cat determinism.txt 2>/dev/null || echo "(did not run)"
             echo '```'
             for D in 2026-09-12 2026-09-13 2026-09-14; do
               echo
@@ -270,6 +312,7 @@ jobs:
           path: |
             verification-output
             ci-diagnostics
+            determinism.txt
             exit-codes.txt
             pr-report.md
             areas.txt
