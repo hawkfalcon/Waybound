@@ -1,0 +1,132 @@
+name: branch-live-transit-verification
+
+# BRANCH-ONLY VERIFICATION SCAFFOLDING -- DO NOT MERGE TO MAIN.
+#
+# The merged live-transit-verification.yml is deliberately gated to
+# workflow_dispatch + schedule. This session's GitHub token has actions:read
+# but not actions:write, so it cannot create a dispatch event (HTTP 403
+# "Resource not accessible by integration"). It does have contents:write, so this
+# mirror is triggered by pushing this file to the session branch instead.
+#
+# It runs the exact same `swift run waybound-transit-verify` invocation as the
+# merged workflow, over the same three areas, for the three requested service
+# dates, sequentially inside a single job so that:
+#   * Swift is built once instead of three times;
+#   * the three dates share one .transitland-cache (the cache is keyed by
+#     area slug + date, so dates cannot contaminate each other);
+#   * only one live Transitland job is ever in flight.
+#
+# The `paths:` filter means this fires only when this file itself changes, so
+# ordinary commits cannot accidentally start another rate-limited live run.
+on:
+  push:
+    branches:
+      - arena/01a09c71-waybound
+    paths:
+      - .github/workflows/branch-live-transit-verification.yml
+
+permissions:
+  contents: read
+
+# Same intent as the merged workflow: never run two live Transitland jobs at
+# once. cancel-in-progress is false here so a queued run waits rather than
+# cancelling a job that is already talking to a rate-limited external API.
+concurrency:
+  group: waybound-live-transitland
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: Select areas
+        run: |
+          set -eu
+          cat > areas.txt <<'EOF'
+          Downtown Santa Barbara=34.4209,-119.7033
+          UCSB=34.4139,-119.8489
+          Carpinteria=34.3989,-119.5185
+          EOF
+          printf 'areas:\n'
+          cat areas.txt
+
+      - name: Restore raw Transitland snapshots
+        uses: actions/cache@v4
+        with:
+          path: .transitland-cache
+          key: transitland-snapshots-branch-3dates-${{ hashFiles('areas.txt') }}
+          restore-keys: |
+            transitland-snapshots-
+
+      - name: Fetch and verify sequentially
+        env:
+          TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
+        run: |
+          # Not `set -e`: one date failing must not hide the other two.
+          set -uo pipefail
+          : > exit-codes.txt
+          for D in 2026-09-12 2026-09-13 2026-09-14; do
+            echo "::group::service date $D"
+            swift run --package-path WayboundCore --configuration release \
+              waybound-transit-verify \
+              --areas-file areas.txt \
+              --date "$D" \
+              --cache-dir .transitland-cache \
+              --output-dir "verification-output/$D"
+            RC=$?
+            echo "::endgroup::"
+            echo "$D exit=$RC" | tee -a exit-codes.txt
+          done
+          echo "---- exit codes ----"
+          cat exit-codes.txt
+
+      - name: Add reports to run summary
+        if: always()
+        run: |
+          for D in 2026-09-12 2026-09-13 2026-09-14; do
+            if [ -f "verification-output/$D/report.md" ]; then
+              {
+                echo "## Service date $D"
+                echo
+                cat "verification-output/$D/report.md"
+                echo
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "## Service date $D" >> "$GITHUB_STEP_SUMMARY"
+              echo "The verifier did not produce a report." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          if [ -f exit-codes.txt ]; then
+            {
+              echo "## Verifier exit codes"
+              echo '```'
+              cat exit-codes.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Report artifact size
+        if: always()
+        run: |
+          du -sh verification-output 2>/dev/null || true
+          find verification-output -type f -printf '%s\t%p\n' 2>/dev/null \
+            | sort -rn | head -20 || true
+
+      - name: Upload snapshots and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: branch-transitland-verification-${{ github.run_number }}
+          path: |
+            verification-output
+            exit-codes.txt
+            areas.txt
+          if-no-files-found: warn
+          retention-days: 14
