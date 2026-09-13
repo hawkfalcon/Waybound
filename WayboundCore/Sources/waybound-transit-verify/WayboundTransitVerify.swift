@@ -1181,16 +1181,21 @@ private final class LiveAreaVerifier {
         var tripIDsByPattern: [String: Set<Int>] = [:]
         let stopByID = Dictionary(uniqueKeysWithValues: selectedStops.map { ($0.id, $0) })
 
+        // A `for ... where` clause takes a single boolean expression, so the
+        // per-response bindings have to live in a guard inside the body.
         for response in snapshot.responses
-        where response.name.hasPrefix("departures-"),
-              response.succeeded,
-              let stopID = Int(String(response.name.dropFirst("departures-".count))),
-              let stop = stopByID[stopID],
-              let data = response.bodyData,
-              let document = try? JSONDecoder().decode(
-                  TransitlandDeparturesResponse.self,
-                  from: data
-              ) {
+        where response.name.hasPrefix("departures-") {
+            guard response.succeeded,
+                  let stopID = Int(
+                      String(response.name.dropFirst("departures-".count))
+                  ),
+                  let stop = stopByID[stopID],
+                  let data = response.bodyData,
+                  let document = try? JSONDecoder().decode(
+                      TransitlandDeparturesResponse.self,
+                      from: data
+                  )
+            else { continue }
             let departures = document.stops.first { $0.id == stopID }?.departures ?? []
             for departure in departures {
                 guard let trip = departure.trip else { continue }
