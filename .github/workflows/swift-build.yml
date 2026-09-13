@@ -2,8 +2,11 @@ name: swift-build
 
 on:
   push:
-    branches: [main, arena/01a05bbd-waybound]
-  pull_request:
+    branches: [main, arena/01a05bbd-waybound, arena/01a093c3-waybound]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:

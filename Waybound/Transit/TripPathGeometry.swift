@@ -1,6 +1,7 @@
 import CoreLocation
 import Foundation
 import MapKit
+import WayboundCore
 
 /// Pure polyline cleanup, clipping, and stop-to-shape alignment. Turns raw
 /// GTFS trip shapes into rider-facing approach / flagship / continuation
@@ -200,285 +201,15 @@ enum TripPathGeometry {
         from coordinates: [CLLocationCoordinate2D],
         nearStops stops: [CLLocationCoordinate2D]
     ) -> [CLLocationCoordinate2D] {
-        guard coordinates.count >= 4, !stops.isEmpty else { return coordinates }
-        let metersPerPoint = metersPerMapPoint(atLatitude: coordinates[0].latitude)
-        let stopPoints = stops.map { MKMapPoint($0) }
-
-        var result = coordinates
-        var passes = 0
-        while passes < 128 {
-            passes += 1
-            let points = result.map { MKMapPoint($0) }
-            guard let notchRange = firstStopConnectorNotchRange(
-                in: points,
-                stopPoints: stopPoints,
-                metersPerPoint: metersPerPoint
-            ) else { break }
-            result.removeSubrange(notchRange)
-        }
-
-        // A journey endpoint that is just the stop coordinate reached
-        // sideways is the same artifact with no interior span to scan. A
-        // connector can carry more than one baked vertex, so each end is
-        // trimmed repeatedly while every gate keeps holding.
-        for end in [ShapeEnd.last, .first] {
-            var drops = 0
-            while drops < 3, result.count >= 4 {
-                let points = result.map { MKMapPoint($0) }
-                guard isTerminalStopConnector(
-                    in: points,
-                    stopPoints: stopPoints,
-                    metersPerPoint: metersPerPoint,
-                    atEnd: end
-                ) else { break }
-                switch end {
-                case .last: result.removeLast()
-                case .first: result.removeFirst()
-                }
-                drops += 1
-            }
-        }
-        return result
+        // The stage lives in WayboundCore, where the Linux CI battery
+        // (NotchBatteryTests) exercises it on every push; this wrapper
+        // keeps the app call sites unchanged.
+        WayboundCore.NotchStage.removingStopConnectorNotches(
+            coordinates.map { GeoCoordinate($0) },
+            stops.map { GeoCoordinate($0) }
+        ).map { $0.cl }
     }
 
-    private enum ShapeEnd {
-        case first
-        case last
-    }
-
-    /// True when the polyline's terminal vertex is a stop coordinate reached
-    /// steeply off the street line the shape was traveling — the one-segment
-    /// form of a stop connector. The street line is measured from *outside*
-    /// the connector, so a tail of several baked vertices cannot supply its
-    /// own direction as the street. A genuine terminal turn or a stop
-    /// straight down the street is kept.
-    private static func isTerminalStopConnector(
-        in points: [MKMapPoint],
-        stopPoints: [MKMapPoint],
-        metersPerPoint: Double,
-        atEnd end: ShapeEnd
-    ) -> Bool {
-        let maximumStopDistance: CLLocationDistance = 12
-        let maximumDepartureDot = 0.34  // at least 70 degrees off the street
-        let maximumConnectorNeighborhood: CLLocationDistance = 25
-        let maximumSkippedVertices = 8
-
-        guard points.count >= 3 else { return false }
-        let vertex: MKMapPoint
-        let approach: MKMapPoint
-        let approachIndex: Int
-        let step: Int
-        switch end {
-        case .last:
-            vertex = points[points.count - 1]
-            approach = points[points.count - 2]
-            approachIndex = points.count - 2
-            step = -1
-        case .first:
-            vertex = points[0]
-            approach = points[1]
-            approachIndex = 1
-            step = 1
-        }
-        guard stopPoints.contains(where: { stop in
-            stop.distance(to: vertex) * metersPerPoint <= maximumStopDistance
-        }) else { return false }
-
-        // Walk inward past vertices within one notch depth of the terminal
-        // vertex — the connector and its baked points live in that
-        // neighborhood — and measure the street at the first vertex beyond
-        // it, always leaving at least one vertex ahead of the baseline: a
-        // short terminal stretch can sit entirely within that neighborhood.
-        var baselineIndex = approachIndex
-        var skippedVertices = 0
-        while baselineIndex >= 0, baselineIndex < points.count,
-              points[baselineIndex].distance(to: vertex) * metersPerPoint
-                <= maximumConnectorNeighborhood,
-              skippedVertices < maximumSkippedVertices {
-            let nextIndex = baselineIndex + step
-            if end == .last, nextIndex < 1 { break }
-            if end == .first, nextIndex > points.count - 2 { break }
-            baselineIndex = nextIndex
-            skippedVertices += 1
-        }
-        guard baselineIndex >= 0, baselineIndex < points.count,
-              let streetHeading = travelHeading(
-                in: points,
-                at: baselineIndex,
-                backward: end == .last,
-                metersPerPoint: metersPerPoint
-              ),
-              let departureHeading = unitHeading(from: approach, to: vertex)
-        else { return false }
-        let departureDot = abs(
-            departureHeading.x * streetHeading.x
-                + departureHeading.y * streetHeading.y
-        )
-        return departureDot <= maximumDepartureDot
-    }
-
-    /// Finds the first interior excursion that enters a stop connector-side
-    /// and returns to the same street. All gates are true meters. The
-    /// excursion is bounded by how far it travels (260 m — a sparsely
-    /// sampled shape's re-entry vertex can be two hundred meters ahead) and
-    /// how deep it goes (3–25 m); its apex must sit within 12 m of a trip
-    /// stop. The street must continue straight: the return vertex
-    /// stays within 8 m of the incoming line, the anchor within 8 m of the
-    /// outgoing line, and travel keeps its heading (dot ≥ 0.9) — feed
-    /// sampling noise between those vertices is tolerated, a jogged or
-    /// curving street is not. Finally the excursion must reach its stop
-    /// steeply (at least one leg ≥ 40° off the street), which is what
-    /// separates a connector from a gradual crest that happens to peak at a
-    /// stop. The 240 m chord is a backstop, not the load-bearing gate: with
-    /// both span ends gated onto the street's lines, a long chord is the
-    /// street itself, and a street that curves inside the span fails the
-    /// depth or heading gates first. Every deletion is street-aligned by
-    /// construction; redundant collinear street vertices inside a deleted
-    /// span go with it, leaving the drawn line unchanged.
-    private static func firstStopConnectorNotchRange(
-        in points: [MKMapPoint],
-        stopPoints: [MKMapPoint],
-        metersPerPoint: Double
-    ) -> Range<Int>? {
-        let maximumNotchPathDistance: CLLocationDistance = 260
-        let maximumNotchChordDistance: CLLocationDistance = 240
-        let minimumNotchDepth: CLLocationDistance = 3
-        let maximumNotchDepth: CLLocationDistance = 25
-        let maximumStopDistance: CLLocationDistance = 12
-        let maximumStreetLineOffset: CLLocationDistance = 8
-        let minimumStraightThroughDot = 0.9
-        let maximumLegAlongStreetDot = 0.766  // cos(40°)
-
-        for anchorIndex in 1..<(points.count - 1) {
-            guard let incomingHeading = travelHeading(
-                in: points,
-                at: anchorIndex,
-                backward: true,
-                metersPerPoint: metersPerPoint
-            ) else { continue }
-            var pathDistance: CLLocationDistance = 0
-            for returnIndex in (anchorIndex + 1)..<(points.count - 1) {
-                pathDistance += points[returnIndex - 1].distance(
-                    to: points[returnIndex]
-                ) * metersPerPoint
-                if pathDistance > maximumNotchPathDistance { break }
-
-                let chordDistance = points[anchorIndex].distance(
-                    to: points[returnIndex]
-                ) * metersPerPoint
-                guard chordDistance >= 1, chordDistance <= maximumNotchChordDistance
-                else { continue }
-
-                var notchDepth: CLLocationDistance = 0
-                var apexIndex = anchorIndex + 1
-                for index in (anchorIndex + 1)..<returnIndex {
-                    let depth = perpendicularDistance(
-                        of: points[index],
-                        from: points[anchorIndex],
-                        to: points[returnIndex]
-                    ) * metersPerPoint
-                    if depth > notchDepth {
-                        notchDepth = depth
-                        apexIndex = index
-                    }
-                }
-                guard notchDepth >= minimumNotchDepth,
-                      notchDepth <= maximumNotchDepth
-                else { continue }
-                guard stopPoints.contains(where: { stop in
-                    stop.distance(to: points[apexIndex]) * metersPerPoint
-                        <= maximumStopDistance
-                }) else { continue }
-
-                guard let outgoingHeading = travelHeading(
-                    in: points,
-                    at: returnIndex,
-                    backward: false,
-                    metersPerPoint: metersPerPoint
-                ) else { continue }
-
-                // The street itself continues straight through the span,
-                // tested against both legs: the return sits on the incoming
-                // line and the anchor sits on the outgoing line. The stop
-                // itself cannot qualify as the return point.
-                let returnDeltaX = points[returnIndex].x - points[anchorIndex].x
-                let returnDeltaY = points[returnIndex].y - points[anchorIndex].y
-                guard abs(
-                    returnDeltaX * incomingHeading.y
-                        - returnDeltaY * incomingHeading.x
-                ) * metersPerPoint <= maximumStreetLineOffset else { continue }
-                guard abs(
-                    returnDeltaX * outgoingHeading.y
-                        - returnDeltaY * outgoingHeading.x
-                ) * metersPerPoint <= maximumStreetLineOffset else { continue }
-                guard incomingHeading.x * outgoingHeading.x
-                    + incomingHeading.y * outgoingHeading.y
-                    >= minimumStraightThroughDot
-                else { continue }
-
-                // A connector reaches its stop steeply off the street; a
-                // curve's legs diverge from the chord gradually.
-                guard let inboundLeg = unitHeading(
-                    from: points[anchorIndex],
-                    to: points[apexIndex]
-                ),
-                    let outboundLeg = unitHeading(
-                        from: points[apexIndex],
-                        to: points[returnIndex]
-                    )
-                else { continue }
-                let inboundAlongStreet = abs(
-                    inboundLeg.x * incomingHeading.x
-                        + inboundLeg.y * incomingHeading.y
-                )
-                let outboundAlongStreet = abs(
-                    outboundLeg.x * incomingHeading.x
-                        + outboundLeg.y * incomingHeading.y
-                )
-                guard inboundAlongStreet <= maximumLegAlongStreetDot
-                    || outboundAlongStreet <= maximumLegAlongStreetDot
-                else { continue }
-
-                return (anchorIndex + 1)..<returnIndex
-            }
-        }
-        return nil
-    }
-
-    /// Direction of travel at a vertex, measured over up to three vertices
-    /// and 60 meters so a single duplicated survey point or lane-shift jog
-    /// cannot flip it. `backward` looks upstream, but the returned heading
-    /// always points in the direction of travel.
-    private static func travelHeading(
-        in points: [MKMapPoint],
-        at index: Int,
-        backward: Bool,
-        metersPerPoint: Double
-    ) -> (x: Double, y: Double)? {
-        let step = backward ? -1 : 1
-        var farIndex = index
-        var traveled: CLLocationDistance = 0
-        var stepsTaken = 0
-        while stepsTaken < 3 {
-            let nextIndex = farIndex + step
-            guard nextIndex >= 0, nextIndex < points.count else { break }
-            let segment = points[farIndex].distance(to: points[nextIndex])
-                * metersPerPoint
-            if traveled > 0, traveled + segment > 60 { break }
-            traveled += segment
-            farIndex = nextIndex
-            stepsTaken += 1
-        }
-        guard farIndex != index else { return nil }
-        return backward
-            ? unitHeading(from: points[farIndex], to: points[index])
-            : unitHeading(from: points[index], to: points[farIndex])
-    }
-
-    /// Finds the first interior sub-path that leaves a vertex and returns to
-    /// it. Returns the interior index range to delete, keeping both anchor
-    /// vertices (they are a few meters apart at most, and later stages
-    /// deduplicate near-coincident samples).
     private static func firstOutAndBackSpurRange(
         in coordinates: [CLLocationCoordinate2D],
         metersPerPoint: Double
@@ -574,6 +305,7 @@ enum TripPathGeometry {
         )
         return point.distance(to: projection)
     }
+
 
     /// Breaks a polyline wherever a consecutive jump is implausibly large, so
     /// a single bad vertex can no longer draw a line across the map.
