@@ -96,8 +96,8 @@ struct WayboundMapView: UIViewRepresentable {
     let onSelectStop: (Int, Set<Int>, Set<Int>) -> Void
     /// Bump to make the coordinator dump its lane state (densified strand
     /// coordinates, the anchored-lane schedule, and the final per-vertex
-    /// layouts) to a JSON file and present a share sheet for it.
-    /// Diagnostics only — never set from production UI.
+    /// layouts) to a JSON file and present a share sheet for it. The debug
+    /// Settings action is the only caller.
     var diagnosticsRequestID: Int = 0
 
     func makeCoordinator() -> Coordinator {
@@ -140,7 +140,8 @@ struct WayboundMapView: UIViewRepresentable {
             context.coordinator.lastCameraRequestID = cameraRequest.id
             mapView.setRegion(cameraRequest.region, animated: true)
         }
-        if context.coordinator.lastDiagnosticsRequestID != diagnosticsRequestID {
+        if diagnosticsRequestID > 0,
+           context.coordinator.lastDiagnosticsRequestID != diagnosticsRequestID {
             context.coordinator.lastDiagnosticsRequestID = diagnosticsRequestID
             context.coordinator.shareLaneDiagnostics(from: mapView)
         }
@@ -158,7 +159,10 @@ struct WayboundMapView: UIViewRepresentable {
         private var lastPulsedJourneyID: Int?
         private var pulseTimer: Timer?
         private var corridorSignature: Int?
-        var lastDiagnosticsRequestID: Int?
+        /// Zero means no export has been requested. Matching the SwiftUI request
+    /// counter prevents the coordinator's first update from presenting a
+    /// share sheet at app launch.
+    var lastDiagnosticsRequestID = 0
         /// Full-polyline lane layouts, computed once per corridor-content change
         /// and only clipped per viewport tick. Recomputing these on every pan
         /// frame was O(routes² × segments²) and drove the memory spikes that got
@@ -423,9 +427,9 @@ struct WayboundMapView: UIViewRepresentable {
         /// diagnosis: per journey the densified flagship coordinates (the
         /// scheduler's exact input), the anchored-lane schedule (offset,
         /// spine direction, reference per strand segment), and the final
-        /// per-vertex layouts the renderer consumes. tools/replay/ingest.py
-        /// rebuilds and renders the same shapes, so a reported visual can be
-        /// reproduced numerically.
+        /// per-vertex layouts the renderer consumes. `waybound-lanelab` and
+        /// the WayboundCore golden tests rebuild the same shapes, so a
+        /// reported visual can be reproduced numerically.
         fileprivate func exportLaneDiagnostics() -> URL? {
             ensureCorridorLaneLayouts()
             var root: [String: Any] = [

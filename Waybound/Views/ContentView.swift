@@ -31,9 +31,10 @@ struct ContentView: View {
     @State private var selectedStopJourneyIDs: Set<Int>?
     @State private var expansionPrototype: RouteExpansionPrototype = .sheet
     @State private var isShowingPlanningSettings = false
-    #if DEBUG
+    /// Incremented only by the developer diagnostics action in Settings.
+    /// The map coordinator starts at the same zero value, so launch never
+    /// presents a share sheet accidentally.
     @State private var laneDiagnosticsRequestID = 0
-    #endif
 
     private var selectedJourney: RouteJourney? {
         viewModel.journeys.first { $0.id == selectedJourneyID }
@@ -91,25 +92,6 @@ struct ContentView: View {
                     diagnosticsRequestID: laneDiagnosticsRequestID
                 )
                 .ignoresSafeArea()
-                #if DEBUG
-                .overlay(alignment: .topLeading) {
-                    Button {
-                        laneDiagnosticsRequestID += 1
-                    } label: {
-                        Image(systemName: "waveform.path.ecg")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(WayboundPalette.ink)
-                            .frame(width: 29, height: 29)
-                            .background(.white.opacity(0.72))
-                            .clipShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Export corridor lane diagnostics")
-                    .padding(.leading, 10)
-                    .padding(.top, 62)
-                }
-                #endif
-
                 destinationSheet
                     .frame(
                         maxHeight: bottomSheetHeight,
@@ -140,7 +122,15 @@ struct ContentView: View {
         .sheet(isPresented: $isShowingPlanningSettings) {
             PlanningSettingsSheet(
                 planningDate: viewModel.planningDate,
-                onApply: applyPlanningDate
+                onApply: applyPlanningDate,
+                onExportDiagnostics: {
+                    // Let the settings sheet finish dismissing before the map
+                    // presents UIKit's share sheet over its view controller.
+                    isShowingPlanningSettings = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        laneDiagnosticsRequestID += 1
+                    }
+                }
             )
             .presentationDetents([.height(370)])
             .presentationDragIndicator(.visible)
@@ -339,11 +329,17 @@ private struct PlanningSettingsSheet: View {
 
     let planningDate: Date?
     let onApply: (Date?) -> Void
+    let onExportDiagnostics: () -> Void
     @State private var draftDate: Date
 
-    init(planningDate: Date?, onApply: @escaping (Date?) -> Void) {
+    init(
+        planningDate: Date?,
+        onApply: @escaping (Date?) -> Void,
+        onExportDiagnostics: @escaping () -> Void
+    ) {
         self.planningDate = planningDate
         self.onApply = onApply
+        self.onExportDiagnostics = onExportDiagnostics
         let initialDate = planningDate.map { max($0, Date()) }
             ?? Self.tomorrowMorning()
         _draftDate = State(initialValue: initialDate)
@@ -419,6 +415,24 @@ private struct PlanningSettingsSheet: View {
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
             .buttonStyle(.plain)
+
+            #if DEBUG
+            Divider()
+                .overlay(WayboundPalette.ink.opacity(0.10))
+
+            Button {
+                dismiss()
+                onExportDiagnostics()
+            } label: {
+                Label("Download lane diagnostics JSON", systemImage: "arrow.down.doc.fill")
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundStyle(WayboundPalette.ink)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Shares the current map lane data as a JSON file")
+            #endif
         }
         .padding(.horizontal, 20)
         .padding(.top, 8)
