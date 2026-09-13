@@ -167,6 +167,11 @@ jobs:
       # catch it. Both passes read the cache, so this makes no Transitland
       # requests. generatedAt is a timestamp and is expected to differ.
       - name: Determinism check (second process, same snapshots)
+        # The key is required to get past the verifier's startup guard even when
+        # every snapshot comes from the cache; with a warm cache no request is
+        # made, so this costs no Transitland quota.
+        env:
+          TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
         run: |
           set +e
           : > determinism.txt
