@@ -12,6 +12,10 @@ let package = Package(
             name: "waybound-lanelab",
             targets: ["waybound-lanelab"]
         ),
+        .executable(
+            name: "waybound-transit-verify",
+            targets: ["waybound-transit-verify"]
+        ),
     ],
     targets: [
         .target(
@@ -20,6 +24,11 @@ let package = Package(
         ),
         .executableTarget(
             name: "waybound-lanelab",
+            dependencies: ["WayboundCore"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "waybound-transit-verify",
             dependencies: ["WayboundCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
