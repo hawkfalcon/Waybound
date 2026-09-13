@@ -26,6 +26,17 @@ name: branch-live-transit-verification
 # waybound-transit-verify, and that only happens in this workflow family.
 # This line also re-triggers the run that verifies the fix.
 #
+# Run #3 (cold, freshly fetched) and run #4 (warm, JSON-round-tripped cache)
+# disagreed on scheduledSegmentCount in 6 of 9 area-date combinations and on
+# trunkVertexCount in 3 of 9, while every other metric matched exactly. Run #4
+# and this run share byte-identical cached snapshots, so comparing them separates
+# genuine nondeterminism in CorridorLaneSchedule from a cache round-trip
+# artifact. Swift seeds its hasher randomly per process, so every Dictionary and
+# Set iteration order changes per launch -- CorridorLaneSchedule has
+# order-dependent logic over `presence.keys` (e.g. staysKey's early return).
+# This run makes no Transitland requests: areas.txt is unchanged, so the cache
+# key matches exactly.
+#
 # The three service dates run sequentially inside one job so Swift builds once,
 # the dates share one .transitland-cache (keyed by area slug + date, so they
 # cannot contaminate each other), and only one live Transitland job is in flight.
