@@ -85,6 +85,30 @@ mirrors, regression batteries, and the real downtown traces they run on.
 `python3 tools/replay/battery.py` and `python3 tools/replay/corridor_check.py`
 are the ground truth for any change to the notch or corridor passes.
 
+## Live Transitland verification
+
+The separate `live-transit-verification` workflow is the only CI path that
+contacts Transitland. It is manual or nightly only; push and pull-request CI
+remain offline and fixture-backed. The Swift-only headless command accepts one
+area per line as `NAME=LAT,LON` (or a bare coordinate pair), fetches each area
+sequentially, and stores raw date-keyed snapshots in `.transitland-cache`.
+The workflow artifact contains the snapshots plus `report.json` and
+`report.md`.
+
+To run several areas manually with GitHub CLI:
+
+```sh
+gh workflow run live-transit-verification.yml \
+  --ref main \
+  --field areas=$'Santa Barbara=34.4209,-119.7033\nSan Francisco=37.7749,-122.4194'
+```
+
+Add `--field date=YYYY-MM-DD` to compare a scheduled service day instead of
+using the current live three-hour window. The command requires the
+repository's `TRANSITLAND_API_KEY` Actions secret.
+A complete snapshot for the same area and UTC date is reused automatically;
+use the command's `--refresh` flag for a local live refresh.
+
 ## Deployment target
 
 The project still ships with `IPHONEOS_DEPLOYMENT_TARGET = 26.2` (unchanged).

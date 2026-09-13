@@ -4,3 +4,8 @@ tools/replay/out/
 
 # Swift package build artifacts (WayboundCore)
 WayboundCore/.build/
+
+# Live Transitland verifier output (raw snapshots stay outside Git)
+.transitland-cache/
+verification-output/
+areas.txt
