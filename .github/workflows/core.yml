@@ -2,7 +2,7 @@ name: core
 
 on:
   push:
-    branches: [main, arena/01a05bbd-waybound, arena/01a093c3-waybound]
+    branches: [main, arena/01a05bbd-waybound, arena/01a093c3-waybound, arena/01a09c71-waybound]
 
 permissions:
   contents: read
@@ -24,6 +24,17 @@ jobs:
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: "6.0"
+
+      # `swift test` builds only the library and the test target, so a broken
+      # executable slips straight through: waybound-transit-verify did not
+      # compile on main at 4c94c77 and nothing caught it, which meant
+      # live-transit-verification.yml could never have succeeded. `swift build`
+      # with no --product builds every target in the package, executables
+      # included, so this is the guard for the tools CI actually runs.
+      - name: swift build (all products)
+        run: |
+          set -o pipefail
+          swift build --package-path WayboundCore 2>&1 | tee build.log
 
       - name: swift test
         run: |
@@ -67,10 +78,10 @@ jobs:
             grep -E 'LANE-CHECK|LANE-FUZZ' test.log | head -50 || true
             echo '```'
             echo
-            if grep -q 'error:' test.log; then
+            if grep -q 'error:' build.log test.log 2>/dev/null; then
               echo "### compiler/test errors"
               echo '```'
-              grep 'error:' test.log | sort -u | head -30
+              grep -h 'error:' build.log test.log 2>/dev/null | sort -u | head -30
               echo '```'
             fi
             if grep -q 'Fatal error' test.log; then
