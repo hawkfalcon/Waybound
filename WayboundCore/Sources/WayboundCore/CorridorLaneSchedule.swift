@@ -1811,8 +1811,29 @@ public enum CorridorLaneSchedule {
                     if !departedKeys.isEmpty, !slots.isEmpty {
                         let runLengthValue = strand.arc[s1] - strand.arc[s0]
                         var memberIDByKey: [String: Int] = [:]
-                        for (cid, _) in presence {
-                            memberIDByKey[publicRouteKey(for: cid)] = cid
+                        // Both directions of one route collapse onto a single
+                        // public key, so several journeys claim it. `presence` is
+                        // a Dictionary and Swift reseeds its hasher per process,
+                        // so last-writer-wins here picked a different journey on
+                        // each launch. That moved departedLength below, flipped
+                        // the collapse test, and shifted every slot -- changing
+                        // the schedule and the trunk flags with no change of
+                        // input. Take the highest-ranked member in the module's
+                        // own ladder order, the same comparator the founding
+                        // cohort uses.
+                        for cid in presence.keys.sorted(by: {
+                            guard let first = identities[$0],
+                                  let second = identities[$1]
+                            else { return $0 < $1 }
+                            return CorridorLaneSchedule.laneComesBefore(
+                                first,
+                                second
+                            )
+                        }) {
+                            let key = publicRouteKey(for: cid)
+                            if memberIDByKey[key] == nil {
+                                memberIDByKey[key] = cid
+                            }
                         }
                         func endStretchLength(_ cid: Int) -> Double {
                             // The stretch that just ended -- a member with

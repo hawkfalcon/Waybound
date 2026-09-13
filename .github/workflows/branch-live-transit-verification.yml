@@ -37,6 +37,14 @@ name: branch-live-transit-verification
 # This run makes no Transitland requests: areas.txt is unchanged, so the cache
 # key matches exactly.
 #
+# Run #7's determinism check still reported DIFFERS after the verifier's own
+# candidate selection was canonicalised, which localised the remaining cause to
+# WayboundCore: CorridorLaneSchedule built memberIDByKey by iterating the
+# `presence` Dictionary and letting the last writer win. Both directions of a
+# route collapse onto one public key, so a different journey won on each launch,
+# moving departedLength and flipping the slot-collapse test. This run verifies
+# the fix: both passes read the cache, so it makes no Transitland requests.
+#
 # The three service dates run sequentially inside one job so Swift builds once,
 # the dates share one .transitland-cache (keyed by area slug + date, so they
 # cannot contaminate each other), and only one live Transitland job is in flight.
