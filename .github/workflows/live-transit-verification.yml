@@ -8,6 +8,11 @@ on:
         required: false
         default: "Santa Barbara=34.4209,-119.7033"
         type: string
+      date:
+        description: "Service day YYYY-MM-DD; blank uses today's live window"
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "17 4 * * *"
 
@@ -50,7 +55,14 @@ jobs:
 
       - name: Set snapshot date
         id: date
-        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+        env:
+          DISPATCH_DATE: ${{ inputs.date }}
+        run: |
+          if [ -n "${DISPATCH_DATE}" ]; then
+            echo "date=${DISPATCH_DATE}" >> "$GITHUB_OUTPUT"
+          else
+            echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Restore raw Transitland snapshots
         uses: actions/cache@v4

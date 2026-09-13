@@ -103,7 +103,9 @@ gh workflow run live-transit-verification.yml \
   --field areas=$'Santa Barbara=34.4209,-119.7033\nSan Francisco=37.7749,-122.4194'
 ```
 
-The command requires the repository's `TRANSITLAND_API_KEY` Actions secret.
+Add `--field date=YYYY-MM-DD` to compare a scheduled service day instead of
+using the current live three-hour window. The command requires the
+repository's `TRANSITLAND_API_KEY` Actions secret.
 A complete snapshot for the same area and UTC date is reused automatically;
 use the command's `--refresh` flag for a local live refresh.
 

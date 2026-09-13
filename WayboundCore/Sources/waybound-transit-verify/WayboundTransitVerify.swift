@@ -224,7 +224,7 @@ private func usage() -> String {
       --areas TEXT       newline/semicolon-separated area specifications
       --coordinate TEXT  alias for --area
       --lat LAT --lon LON  add one unnamed coordinate pair
-      --date YYYY-MM-DD  snapshot/cache date (default: current UTC date)
+      --date YYYY-MM-DD  service day and snapshot/cache date (default: current UTC date)
       --cache-dir PATH   raw snapshot cache (default: .transitland-cache)
       --output-dir PATH  report and artifact directory (default: verification-output)
       --refresh          ignore an existing complete snapshot for this date
@@ -850,17 +850,20 @@ private struct AreaAnalysis {
 private final class LiveAreaVerifier {
     private let client: TransitlandHTTPClient
     private let date: String
+    private let isLiveSearch: Bool
     private let cacheDirectory: URL
     private let outputDirectory: URL
 
     init(
         client: TransitlandHTTPClient,
         date: String,
+        isLiveSearch: Bool,
         cacheDirectory: URL,
         outputDirectory: URL
     ) {
         self.client = client
         self.date = date
+        self.isLiveSearch = isLiveSearch
         self.cacheDirectory = cacheDirectory
         self.outputDirectory = outputDirectory
     }
@@ -1027,13 +1030,7 @@ private final class LiveAreaVerifier {
         for stop in selectedStops.sorted(by: { $0.id < $1.id }) {
             let departuresURL = transitlandURL(
                 path: "stops/\(stop.id)/departures",
-                query: [
-                    ("next", "10800"),
-                    ("limit", "200"),
-                    ("include_geometry", "false"),
-                    ("include_alerts", "false"),
-                    ("use_service_window", "false"),
-                ]
+                query: departureQuery()
             )
             let departuresResponse = await capture(
                 name: "departures-\(stop.id)",
@@ -1100,6 +1097,34 @@ private final class LiveAreaVerifier {
             && result.responses.allSatisfy { $0.succeeded }
             && result.issues.isEmpty
         return result
+    }
+
+    private func departureQuery() -> [(String, String)] {
+        let common: [(String, String)] = [
+            ("limit", "200"),
+            ("include_geometry", "false"),
+            ("include_alerts", "false"),
+        ]
+        if isLiveSearch {
+            return [
+                ("next", "10800"),
+            ] + common + [
+                ("use_service_window", "false"),
+            ]
+        }
+
+        // This is the same service-window branch used by
+        // TransitViewModel for a future planning date. The verifier asks for
+        // the whole requested service day so comparisons across dates see the
+        // feed's actual day-level route/direction mix rather than whatever
+        // three-hour wall-clock slice happened to be current on the runner.
+        return [
+            ("date", date),
+            ("start_time", "00:00:00"),
+            ("end_time", "23:59:59"),
+        ] + common + [
+            ("use_service_window", "true"),
+        ]
     }
 
     private func selectStops(
@@ -1683,6 +1708,7 @@ struct WayboundTransitVerifyMain {
             let verifier = LiveAreaVerifier(
                 client: TransitlandHTTPClient(apiKey: apiKey),
                 date: date,
+                isLiveSearch: date == utcDateString(),
                 cacheDirectory: cacheDirectory,
                 outputDirectory: outputDirectory
             )
