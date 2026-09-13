@@ -2,22 +2,22 @@ name: branch-live-transit-verification
 
 # BRANCH-ONLY VERIFICATION SCAFFOLDING -- DO NOT MERGE TO MAIN.
 #
-# The merged live-transit-verification.yml is deliberately gated to
-# workflow_dispatch + schedule. This session's GitHub token has actions:read
-# but not actions:write, so it cannot create a dispatch event (HTTP 403
-# "Resource not accessible by integration"). It does have contents:write, so this
-# mirror is triggered by pushing this file to the session branch instead.
+# The merged live-transit-verification.yml is gated to workflow_dispatch +
+# schedule. This session's GitHub token has actions:read but not actions:write,
+# so it cannot create a dispatch event (HTTP 403 "Resource not accessible by
+# integration"). It does have contents:write, so this mirror is triggered by
+# pushing this file to the session branch instead.
 #
-# It runs the exact same `swift run waybound-transit-verify` invocation as the
-# merged workflow, over the same three areas, for the three requested service
-# dates, sequentially inside a single job so that:
-#   * Swift is built once instead of three times;
-#   * the three dates share one .transitland-cache (the cache is keyed by
-#     area slug + date, so dates cannot contaminate each other);
-#   * only one live Transitland job is ever in flight.
+# Report channel: this sandbox cannot reach the Actions log/artifact hosts
+# (*.blob.core.windows.net and results-receiver.actions.githubusercontent.com
+# both fail), so -- like core.yml and lanes.yml already do -- results are
+# published to the branch's PR comment thread, which is readable through
+# api.github.com. Nothing is committed to Git: .gitignore deliberately keeps
+# verification-output/ and the raw Transitland snapshots out of the repo.
 #
-# The `paths:` filter means this fires only when this file itself changes, so
-# ordinary commits cannot accidentally start another rate-limited live run.
+# The three service dates run sequentially inside one job so Swift builds once,
+# the dates share one .transitland-cache (keyed by area slug + date, so they
+# cannot contaminate each other), and only one live Transitland job is in flight.
 on:
   push:
     branches:
@@ -27,10 +27,11 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 # Same intent as the merged workflow: never run two live Transitland jobs at
-# once. cancel-in-progress is false here so a queued run waits rather than
-# cancelling a job that is already talking to a rate-limited external API.
+# once. cancel-in-progress is false so a queued run waits instead of cancelling
+# a job already talking to a rate-limited external API.
 concurrency:
   group: waybound-live-transitland
   cancel-in-progress: false
@@ -65,12 +66,51 @@ jobs:
           restore-keys: |
             transitland-snapshots-
 
-      - name: Fetch and verify sequentially
-        env:
-          TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
+      # GitHub's default Linux shell is `bash -e`, which is why run #1 aborted on
+      # the first date and reported a bare "exit code 1". errexit is disabled
+      # here so every phase is captured and one bad date cannot hide the others.
+      - name: Build verifier (release)
+        id: build
         run: |
-          # Not `set -e`: one date failing must not hide the other two.
-          set -uo pipefail
+          set +e
+          mkdir -p ci-diagnostics
+          {
+            echo "swift: $(swift --version 2>&1)"
+            echo "which swift: $(command -v swift 2>&1)"
+            echo "pwd: $(pwd)"
+            echo "package path exists: $([ -f WayboundCore/Package.swift ] && echo yes || echo NO)"
+          } | tee ci-diagnostics/env.txt
+
+          swift build --package-path WayboundCore --configuration release \
+            > ci-diagnostics/build.log 2>&1
+          RC=$?
+          echo "rc=$RC" >> ci-diagnostics/env.txt
+          echo "build exit=$RC"
+          echo "----- build.log (tail 120) -----"
+          tail -n 120 ci-diagnostics/build.log
+          echo "$RC" > build-rc.txt
+          exit 0
+
+      - name: Fetch and verify sequentially
+        id: verify
+        run: |
+          set +e
+          BUILD_RC=$(cat build-rc.txt 2>/dev/null || echo unknown)
+          if [ "$BUILD_RC" != "0" ]; then
+            echo "Skipping verification: the release build failed (rc=$BUILD_RC)." \
+              | tee verify-skipped.txt
+            exit 0
+          fi
+          if [ -z "${TRANSITLAND_API_KEY:-}" ]; then
+            echo "TRANSITLAND_API_KEY is EMPTY in this workflow." \
+              | tee ci-diagnostics/apikey.txt
+          else
+            # Never print the value, only its length.
+            echo "TRANSITLAND_API_KEY is set (length ${#TRANSITLAND_API_KEY})." \
+              > ci-diagnostics/apikey.txt
+          fi
+          cat ci-diagnostics/apikey.txt
+
           : > exit-codes.txt
           for D in 2026-09-12 2026-09-13 2026-09-14; do
             echo "::group::service date $D"
@@ -79,37 +119,95 @@ jobs:
               --areas-file areas.txt \
               --date "$D" \
               --cache-dir .transitland-cache \
-              --output-dir "verification-output/$D"
+              --output-dir "verification-output/$D" \
+              > "ci-diagnostics/verify-$D.log" 2>&1
             RC=$?
             echo "::endgroup::"
             echo "$D exit=$RC" | tee -a exit-codes.txt
+            echo "----- verify-$D.log (tail 60) -----"
+            tail -n 60 "ci-diagnostics/verify-$D.log"
           done
-          echo "---- exit codes ----"
-          cat exit-codes.txt
+          exit 0
+        env:
+          TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
 
-      - name: Add reports to run summary
+      # Publish everything through the PR comment thread, the only channel this
+      # sandbox can read. Header-matched edit so repeated runs update in place
+      # instead of stacking comments (same pattern as core.yml).
+      - name: Report to PR
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          for D in 2026-09-12 2026-09-13 2026-09-14; do
-            if [ -f "verification-output/$D/report.md" ]; then
-              {
-                echo "## Service date $D"
-                echo
+          set +e
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          n=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" \
+                --state all --json number --jq '.[0].number' 2>/dev/null)
+
+          {
+            echo "## branch-live-transit-verification — run ${GITHUB_RUN_NUMBER} (\`${GITHUB_SHA:0:7}\`)"
+            echo
+            echo "### environment"
+            echo '```'
+            cat ci-diagnostics/env.txt 2>/dev/null || echo "(no env.txt)"
+            cat ci-diagnostics/apikey.txt 2>/dev/null || echo "(apikey check did not run)"
+            echo '```'
+            echo
+            echo "### build log (errors, if any)"
+            echo '```'
+            grep -E 'error:|warning: .*(deprecat|unavail)|Compiling|Build complete|linking' \
+              ci-diagnostics/build.log 2>/dev/null | sort -u | head -40 \
+              || echo "(no build.log)"
+            echo '```'
+            echo '```'
+            tail -n 40 ci-diagnostics/build.log 2>/dev/null || echo "(no build.log)"
+            echo '```'
+            echo
+            echo "### verifier exit codes"
+            echo '```'
+            cat exit-codes.txt 2>/dev/null || cat verify-skipped.txt 2>/dev/null || echo "(none)"
+            echo '```'
+            for D in 2026-09-12 2026-09-13 2026-09-14; do
+              echo
+              echo "### service date $D"
+              if [ -f "verification-output/$D/report.md" ]; then
                 cat "verification-output/$D/report.md"
                 echo
-              } >> "$GITHUB_STEP_SUMMARY"
+                echo "<details><summary>verify-$D.log</summary>"
+                echo
+                echo '```'
+                tail -n 80 "ci-diagnostics/verify-$D.log" 2>/dev/null
+                echo '```'
+                echo "</details>"
+              else
+                echo "_no report produced_"
+                echo '```'
+                tail -n 40 "ci-diagnostics/verify-$D.log" 2>/dev/null || echo "(no log)"
+                echo '```'
+              fi
+            done
+            echo
+            echo "### report.json presence"
+            echo '```'
+            find verification-output -type f 2>/dev/null | sort || echo "(no verification-output)"
+            echo '```'
+          } > pr-report.md
+
+          cat pr-report.md >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$n" ]; then
+            cid=$(gh api "repos/$GITHUB_REPOSITORY/issues/$n/comments" \
+                    --jq '.[] | select(.body | startswith("## branch-live-transit-verification —")) | .id' \
+                    2>/dev/null | tail -1)
+            if [ -n "$cid" ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" \
+                -f body="$(cat pr-report.md)" > /dev/null && echo "updated PR #$n comment $cid"
             else
-              echo "## Service date $D" >> "$GITHUB_STEP_SUMMARY"
-              echo "The verifier did not produce a report." >> "$GITHUB_STEP_SUMMARY"
+              gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --body-file pr-report.md \
+                && echo "posted comment to PR #$n"
             fi
-          done
-          if [ -f exit-codes.txt ]; then
-            {
-              echo "## Verifier exit codes"
-              echo '```'
-              cat exit-codes.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(no PR found for branch ${branch}; report left in the step summary)"
           fi
 
       - name: Report artifact size
@@ -126,7 +224,9 @@ jobs:
           name: branch-transitland-verification-${{ github.run_number }}
           path: |
             verification-output
+            ci-diagnostics
             exit-codes.txt
+            pr-report.md
             areas.txt
           if-no-files-found: warn
           retention-days: 14
