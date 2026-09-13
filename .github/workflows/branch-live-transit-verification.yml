@@ -122,6 +122,14 @@ jobs:
           fi
           cat ci-diagnostics/apikey.txt
 
+          # Prove whether the snapshot cache restored, so a cache-only run is
+          # distinguishable from one that went back to Transitland.
+          {
+            echo "cache dir listing:"
+            find .transitland-cache -type f -printf '%s\t%p\n' 2>/dev/null | sort -k2 \
+              || echo "  (cache empty or absent)"
+          } | tee ci-diagnostics/cache-state.txt
+
           : > exit-codes.txt
           for D in 2026-09-12 2026-09-13 2026-09-14; do
             echo "::group::service date $D"
@@ -164,6 +172,11 @@ jobs:
             cat ci-diagnostics/apikey.txt 2>/dev/null || echo "(apikey check did not run)"
             echo '```'
             echo
+            echo "### snapshot cache state before verification"
+            echo '```'
+            cat ci-diagnostics/cache-state.txt 2>/dev/null || echo "(no cache-state.txt)"
+            echo '```'
+            echo
             echo "### build log (errors, if any)"
             echo '```'
             grep -E 'error:|warning: .*(deprecat|unavail)|Compiling|Build complete|linking' \
@@ -183,6 +196,16 @@ jobs:
               echo "### service date $D"
               if [ -f "verification-output/$D/report.md" ]; then
                 cat "verification-output/$D/report.md"
+                echo
+                # report.json is aggregate-only (no per-journey ordering), but it
+                # is the sole place fetch.issues[], laneCheck.issues[] and the
+                # per-area cacheHit flag are exposed -- report.md omits them.
+                echo "<details><summary>report.json</summary>"
+                echo
+                echo '```json'
+                cat "verification-output/$D/report.json" 2>/dev/null
+                echo '```'
+                echo "</details>"
                 echo
                 echo "<details><summary>verify-$D.log</summary>"
                 echo
