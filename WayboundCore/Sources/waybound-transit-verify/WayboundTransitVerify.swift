@@ -795,6 +795,10 @@ private struct AreaReport: Codable {
     let fetch: FetchReport
     let journeys: JourneyCountReport
     let laneCheck: LaneVerificationResult
+    /// Lateral lane order, innermost first: `ROUTE#journeyID@meanOffset`. The
+    /// aggregate counts above cannot see a lane swap, and this is what the map
+    /// actually draws, so it belongs in the audited record.
+    let laneOrder: [String]
 }
 
 private struct VerificationSummary: Codable {
@@ -843,6 +847,9 @@ private struct DepartureCandidate {
 private struct AreaAnalysis {
     let journeyCounts: JourneyCountReport
     let laneCheck: LaneVerificationResult
+    /// Lateral lane order, for diffing which side of the corridor each route's
+    /// ribbon draws on. Not part of the report schema.
+    let laneOrder: [String]
 }
 
 // MARK: - Area fetch and analysis
@@ -929,7 +936,8 @@ private final class LiveAreaVerifier {
                 issues: snapshot.issues
             ),
             journeys: analysis.journeyCounts,
-            laneCheck: analysis.laneCheck
+            laneCheck: analysis.laneCheck,
+            laneOrder: analysis.laneOrder
         )
     }
 
@@ -1181,16 +1189,21 @@ private final class LiveAreaVerifier {
         var tripIDsByPattern: [String: Set<Int>] = [:]
         let stopByID = Dictionary(uniqueKeysWithValues: selectedStops.map { ($0.id, $0) })
 
+        // A `for ... where` clause takes a single boolean expression, so the
+        // per-response bindings have to live in a guard inside the body.
         for response in snapshot.responses
-        where response.name.hasPrefix("departures-"),
-              response.succeeded,
-              let stopID = Int(String(response.name.dropFirst("departures-".count))),
-              let stop = stopByID[stopID],
-              let data = response.bodyData,
-              let document = try? JSONDecoder().decode(
-                  TransitlandDeparturesResponse.self,
-                  from: data
-              ) {
+        where response.name.hasPrefix("departures-") {
+            guard response.succeeded,
+                  let stopID = Int(
+                      String(response.name.dropFirst("departures-".count))
+                  ),
+                  let stop = stopByID[stopID],
+                  let data = response.bodyData,
+                  let document = try? JSONDecoder().decode(
+                      TransitlandDeparturesResponse.self,
+                      from: data
+                  )
+            else { continue }
             let departures = document.stops.first { $0.id == stopID }?.departures ?? []
             for departure in departures {
                 guard let trip = departure.trip else { continue }
@@ -1225,8 +1238,21 @@ private final class LiveAreaVerifier {
         }
 
         var patternRepresentatives: [DepartureCandidate] = []
-        for (key, candidates) in candidatesByPattern {
-            guard let first = candidates.min(by: candidatePrecedes) else { continue }
+        // Dictionary iteration order changes on every launch because Swift seeds
+        // its hasher randomly per process. candidatePrecedes is deliberately
+        // tolerant -- its one-metre distance deadband lets A tie with B and B tie
+        // with C while A beats C on distance -- so it is not transitive, and
+        // Swift's sort is not stable. Feeding that sort an unordered array made
+        // the winning representative for a direction, and therefore the trip
+        // shapes handed to the lane pipeline, vary between runs over identical
+        // snapshots: scheduledSegmentCount and trunkVertexCount moved while every
+        // count stayed the same. Iterating patterns in a fixed order and
+        // canonically ordering the representatives makes the selection
+        // reproducible without changing what the comparator prefers.
+        for key in candidatesByPattern.keys.sorted() {
+            guard let first = candidatesByPattern[key]?
+                .min(by: candidatePrecedes)
+            else { continue }
             patternRepresentatives.append(DepartureCandidate(
                 routeID: first.routeID,
                 tripID: first.tripID,
@@ -1239,6 +1265,7 @@ private final class LiveAreaVerifier {
                 observedDepartureCount: tripIDsByPattern[key]?.count ?? 0
             ))
         }
+        patternRepresentatives.sort(by: candidateIdentityPrecedes)
 
         var selected: [DepartureCandidate] = []
         for routeID in routeIDs.sorted() {
@@ -1265,13 +1292,23 @@ private final class LiveAreaVerifier {
                 }
             }
         }
-        return selected.sorted {
-            if $0.routeID != $1.routeID { return $0.routeID < $1.routeID }
-            if $0.directionKey != $1.directionKey {
-                return $0.directionKey < $1.directionKey
-            }
-            return $0.tripID < $1.tripID
+        return selected.sorted(by: candidateIdentityPrecedes)
+    }
+
+    /// Canonical, transitive order over candidates: route, then direction, then
+    /// trip. `candidatePrecedes` expresses the audit's preference (proximity,
+    /// then departure time) but its distance deadband makes it intransitive, so
+    /// it cannot define a reproducible sequence on its own. Anything whose order
+    /// is observable has to go through this instead.
+    private func candidateIdentityPrecedes(
+        _ first: DepartureCandidate,
+        _ second: DepartureCandidate
+    ) -> Bool {
+        if first.routeID != second.routeID { return first.routeID < second.routeID }
+        if first.directionKey != second.directionKey {
+            return first.directionKey < second.directionKey
         }
+        return first.tripID < second.tripID
     }
 
     private func candidatePrecedes(
@@ -1315,7 +1352,8 @@ private final class LiveAreaVerifier {
             )
             return AreaAnalysis(
                 journeyCounts: emptyCounts,
-                laneCheck: LiveLaneVerification.verify(journeys: [])
+                laneCheck: LiveLaneVerification.verify(journeys: []),
+                laneOrder: []
             )
         }
 
@@ -1371,6 +1409,7 @@ private final class LiveAreaVerifier {
         }
 
         let laneCheck = LiveLaneVerification.verify(journeys: journeys)
+        let laneOrder = LiveLaneVerification.lateralOrder(journeys: journeys)
         let counts = JourneyCountReport(
             sourceStopCount: selectedStops.count,
             routeCount: routeIDsWithJourneys.count,
@@ -1384,7 +1423,11 @@ private final class LiveAreaVerifier {
                 $0 + $1.observedDepartureCount
             }
         )
-        return AreaAnalysis(journeyCounts: counts, laneCheck: laneCheck)
+        return AreaAnalysis(
+            journeyCounts: counts,
+            laneCheck: laneCheck,
+            laneOrder: laneOrder
+        )
     }
 
     private func routeMetadata(
@@ -1723,6 +1766,11 @@ struct WayboundTransitVerifyMain {
                 print(
                     "  \(report.fetch.status): \(report.journeys.journeyCount) journeys; "
                         + "lane \(report.laneCheck.status)"
+                )
+                print(
+                    "  LANE-ORDER \(area.slug): "
+                        + (report.laneOrder.isEmpty
+                            ? "-" : report.laneOrder.joined(separator: " "))
                 )
             }
 

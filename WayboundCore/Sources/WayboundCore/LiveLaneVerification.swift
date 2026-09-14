@@ -151,4 +151,58 @@ public enum LiveLaneVerification {
             issues: issues
         )
     }
+
+    /// Route numbers in lateral lane order, innermost offset first, one entry
+    /// per scheduled journey (so a route served in both directions appears
+    /// twice). Lateral order is defined by public route identity rather than
+    /// utility ranking, so this is the order the ribbons actually draw in on the
+    /// map -- the first thing a scheduling change disturbs, and the one the
+    /// aggregate counts above cannot see. Each journey's offset varies along the
+    /// corridor, so entries are ordered by the mean offset across the segments
+    /// the schedule placed.
+    ///
+    /// Ties break on route number then journey id, so the emitted order is
+    /// itself deterministic and safe to diff between runs.
+    public static func lateralOrder(
+        journeys: [LaneDiagnosticsDocument.Journey],
+        laneSpacingPoints: Double = LaneScheduleConstants.laneSpacing
+    ) -> [String] {
+        let usableJourneys = journeys.filter { journey in
+            journey.polylines.contains { $0.count >= 2 }
+        }
+        guard !usableJourneys.isEmpty else { return [] }
+        let schedule = CorridorLaneSchedule.schedule(
+            journeys: usableJourneys,
+            laneSpacingPoints: laneSpacingPoints
+        )
+
+        var offsetSum: [Int: Double] = [:]
+        var offsetCount: [Int: Int] = [:]
+        for (key, entries) in schedule {
+            for (_, sample) in entries {
+                offsetSum[key.journeyID, default: 0] += sample.offset
+                offsetCount[key.journeyID, default: 0] += 1
+            }
+        }
+        let routeByID = Dictionary(
+            uniqueKeysWithValues: usableJourneys.map { ($0.id, $0.routeNumber) }
+        )
+
+        let ranked = offsetSum.map { journeyID, sum -> (Double, String, Int) in
+            let count = max(offsetCount[journeyID] ?? 1, 1)
+            return (
+                sum / Double(count),
+                routeByID[journeyID] ?? "?",
+                journeyID
+            )
+        }
+        .sorted { lhs, rhs in
+            if lhs.0 != rhs.0 { return lhs.0 < rhs.0 }
+            if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+            return lhs.2 < rhs.2
+        }
+        return ranked.map { entry in
+            "\(entry.1)#\(entry.2)@\(String(format: "%.2f", entry.0))"
+        }
+    }
 }

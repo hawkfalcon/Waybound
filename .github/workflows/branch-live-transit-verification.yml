@@ -1,0 +1,397 @@
+name: branch-live-transit-verification
+
+# BRANCH-ONLY VERIFICATION SCAFFOLDING -- DO NOT MERGE TO MAIN.
+#
+# The merged live-transit-verification.yml is gated to workflow_dispatch +
+# schedule. This session's GitHub token has actions:read but not actions:write,
+# so it cannot create a dispatch event (HTTP 403 "Resource not accessible by
+# integration"). It does have contents:write, so this mirror is triggered by
+# pushing this file to the session branch instead.
+#
+# Report channel: this sandbox cannot reach the Actions log/artifact hosts
+# (*.blob.core.windows.net and results-receiver.actions.githubusercontent.com
+# both fail), so -- like core.yml and lanes.yml already do -- results are
+# published to the branch's PR comment thread, which is readable through
+# api.github.com. Nothing is committed to Git: .gitignore deliberately keeps
+# verification-output/ and the raw Transitland snapshots out of the repo.
+#
+# Run #2 exposed a real regression on main at 4c94c77: the verifier did not
+# compile at all, so live-transit-verification.yml could never have succeeded.
+# WayboundTransitVerify.swift:1185 tried to put a comma-separated list of
+# `let` bindings in a `for ... where` clause, which only accepts a single
+# boolean expression (9 compiler errors). No CI workflow caught it because
+# core.yml and lanes.yml run `swift test` (which builds only WayboundCore and
+# WayboundCoreTests, never the executable targets) and swift-build.yml runs
+# xcodebuild against the app project. Nothing but `swift run` builds
+# waybound-transit-verify, and that only happens in this workflow family.
+# This line also re-triggers the run that verifies the fix.
+#
+# Run #3 (cold, freshly fetched) and run #4 (warm, JSON-round-tripped cache)
+# disagreed on scheduledSegmentCount in 6 of 9 area-date combinations and on
+# trunkVertexCount in 3 of 9, while every other metric matched exactly. Run #4
+# and this run share byte-identical cached snapshots, so comparing them separates
+# genuine nondeterminism in CorridorLaneSchedule from a cache round-trip
+# artifact. Swift seeds its hasher randomly per process, so every Dictionary and
+# Set iteration order changes per launch -- CorridorLaneSchedule has
+# order-dependent logic over `presence.keys` (e.g. staysKey's early return).
+# This run makes no Transitland requests: areas.txt is unchanged, so the cache
+# key matches exactly.
+#
+# Run #7's determinism check still reported DIFFERS after the verifier's own
+# candidate selection was canonicalised, which localised the remaining cause to
+# WayboundCore: CorridorLaneSchedule built memberIDByKey by iterating the
+# `presence` Dictionary and letting the last writer win. Both directions of a
+# route collapse onto one public key, so a different journey won on each launch,
+# moving departedLength and flipping the slot-collapse test. This run verifies
+# the fix: both passes read the cache, so it makes no Transitland requests.
+#
+# Run #10 verifies the revert in ddf1b1d, which restored main's last-writer-wins
+# memberIDByKey after run #9's A/B proved afd55a1 caused the reported lane swaps
+# (route 11 from -28.83 to -39.90, route 6 from -24.96 to -35.70, route 5 from
+# 10.71 to 2.02, and 14 of 18 core-line journeys changing lateral rank -- five
+# of them with an offset delta of exactly 0.00, i.e. pure reordering).
+#
+# CorridorLaneSchedule.swift is now byte-identical to main's apart from comments,
+# so the A/B step below changes meaning: both passes build the same source. It
+# stops being a code comparison and becomes a pure nondeterminism probe -- two
+# Swift processes over one identical cached snapshot, differing only in the
+# per-process hash seed. That is the decisive check on the revert's premise. If
+# LANE-ORDER comes back identical, run #9's branch-vs-main delta was a genuine
+# systematic effect of afd55a1 and the lateral order is reproducible without it.
+# If it comes back different, main's lane order is itself unstable per launch,
+# which would mean the validated arrangement was one draw among several and the
+# revert alone does not make it stable.
+#
+# The determinism check is expected to report DIFFERS again on
+# scheduledSegmentCount and trunkVertexCount: that variance is the known cost of
+# the revert and is documented at the collapse site. Both passes read the cache,
+# so this run makes no Transitland requests.
+#
+# The three service dates run sequentially inside one job so Swift builds once,
+# the dates share one .transitland-cache (keyed by area slug + date, so they
+# cannot contaminate each other), and only one live Transitland job is in flight.
+on:
+  push:
+    branches:
+      - arena/01a09c71-waybound
+    paths:
+      - .github/workflows/branch-live-transit-verification.yml
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Same intent as the merged workflow: never run two live Transitland jobs at
+# once. cancel-in-progress is false so a queued run waits instead of cancelling
+# a job already talking to a rate-limited external API.
+concurrency:
+  group: waybound-live-transitland
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The A/B step below checks out main's CorridorLaneSchedule.swift, so
+          # the default fetch-depth of 1 is not enough.
+          fetch-depth: 0
+
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: Select areas
+        run: |
+          set -eu
+          cat > areas.txt <<'EOF'
+          Downtown Santa Barbara=34.4209,-119.7033
+          UCSB=34.4139,-119.8489
+          Carpinteria=34.3989,-119.5185
+          EOF
+          printf 'areas:\n'
+          cat areas.txt
+
+      - name: Restore raw Transitland snapshots
+        uses: actions/cache@v4
+        with:
+          path: .transitland-cache
+          key: transitland-snapshots-branch-3dates-${{ hashFiles('areas.txt') }}
+          restore-keys: |
+            transitland-snapshots-
+
+      # GitHub's default Linux shell is `bash -e`, which is why run #1 aborted on
+      # the first date and reported a bare "exit code 1". errexit is disabled
+      # here so every phase is captured and one bad date cannot hide the others.
+      - name: Build verifier (release)
+        id: build
+        run: |
+          set +e
+          mkdir -p ci-diagnostics
+          {
+            echo "swift: $(swift --version 2>&1)"
+            echo "which swift: $(command -v swift 2>&1)"
+            echo "pwd: $(pwd)"
+            echo "package path exists: $([ -f WayboundCore/Package.swift ] && echo yes || echo NO)"
+          } | tee ci-diagnostics/env.txt
+
+          swift build --package-path WayboundCore --configuration release \
+            > ci-diagnostics/build.log 2>&1
+          RC=$?
+          echo "rc=$RC" >> ci-diagnostics/env.txt
+          echo "build exit=$RC"
+          echo "----- build.log (tail 120) -----"
+          tail -n 120 ci-diagnostics/build.log
+          echo "$RC" > build-rc.txt
+          exit 0
+
+      - name: Fetch and verify sequentially
+        id: verify
+        run: |
+          set +e
+          BUILD_RC=$(cat build-rc.txt 2>/dev/null || echo unknown)
+          if [ "$BUILD_RC" != "0" ]; then
+            echo "Skipping verification: the release build failed (rc=$BUILD_RC)." \
+              | tee verify-skipped.txt
+            exit 0
+          fi
+          if [ -z "${TRANSITLAND_API_KEY:-}" ]; then
+            echo "TRANSITLAND_API_KEY is EMPTY in this workflow." \
+              | tee ci-diagnostics/apikey.txt
+          else
+            # Never print the value, only its length.
+            echo "TRANSITLAND_API_KEY is set (length ${#TRANSITLAND_API_KEY})." \
+              > ci-diagnostics/apikey.txt
+          fi
+          cat ci-diagnostics/apikey.txt
+
+          # Prove whether the snapshot cache restored, so a cache-only run is
+          # distinguishable from one that went back to Transitland.
+          {
+            echo "cache dir listing:"
+            find .transitland-cache -type f -printf '%s\t%p\n' 2>/dev/null | sort -k2 \
+              || echo "  (cache empty or absent)"
+          } | tee ci-diagnostics/cache-state.txt
+
+          : > exit-codes.txt
+          for D in 2026-09-12 2026-09-13 2026-09-14; do
+            echo "::group::service date $D"
+            swift run --package-path WayboundCore --configuration release \
+              waybound-transit-verify \
+              --areas-file areas.txt \
+              --date "$D" \
+              --cache-dir .transitland-cache \
+              --output-dir "verification-output/$D" \
+              > "ci-diagnostics/verify-$D.log" 2>&1
+            RC=$?
+            echo "::endgroup::"
+            echo "$D exit=$RC" | tee -a exit-codes.txt
+            echo "----- verify-$D.log (tail 60) -----"
+            tail -n 60 "ci-diagnostics/verify-$D.log"
+          done
+          exit 0
+        env:
+          TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
+
+      # Swift reseeds its hasher per process, so a second process over the same
+      # cached snapshots is the only way to observe ordering nondeterminism --
+      # two runs inside one process always agree, which is why no unit test can
+      # catch it. Both passes read the cache, so this makes no Transitland
+      # requests. generatedAt is a timestamp and is expected to differ.
+      - name: Determinism check (second process, same snapshots)
+        # The key is required to get past the verifier's startup guard even when
+        # every snapshot comes from the cache; with a warm cache no request is
+        # made, so this costs no Transitland quota.
+        env:
+          TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
+        run: |
+          set +e
+          : > determinism.txt
+          for D in 2026-09-12 2026-09-13 2026-09-14; do
+            swift run --package-path WayboundCore --configuration release \
+              waybound-transit-verify \
+              --areas-file areas.txt \
+              --date "$D" \
+              --cache-dir .transitland-cache \
+              --output-dir "verification-output-repeat/$D" \
+              > "ci-diagnostics/repeat-$D.log" 2>&1
+            RC=$?
+            A="verification-output/$D/report.json"
+            B="verification-output-repeat/$D/report.json"
+            if [ $RC -ne 0 ] || [ ! -f "$A" ] || [ ! -f "$B" ]; then
+              echo "$D INCONCLUSIVE (repeat exit=$RC)" | tee -a determinism.txt
+              continue
+            fi
+            if diff <(grep -v '"generatedAt"' "$A") \
+                    <(grep -v '"generatedAt"' "$B") > /dev/null 2>&1; then
+              echo "$D IDENTICAL" | tee -a determinism.txt
+            else
+              echo "$D DIFFERS" | tee -a determinism.txt
+              diff <(grep -v '"generatedAt"' "$A") \
+                   <(grep -v '"generatedAt"' "$B") | head -60 >> determinism.txt
+            fi
+          done
+          echo "---- determinism ----"
+          cat determinism.txt
+          exit 0
+
+      # Which commit moves the lateral lane order? The app renders lanes through
+      # WayboundCore, so afd55a1's memberIDByKey change is reachable from the app
+      # even though dbc47b9 is app-only. Rebuild with main's CorridorLaneSchedule
+      # and diff the emitted lane order on the SAME cached snapshot: zero
+      # Transitland requests, and the only variable is that one file.
+      - name: A/B lateral lane order (branch vs main)
+        env:
+          TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
+        run: |
+          set +e
+          CORE=WayboundCore/Sources/WayboundCore/CorridorLaneSchedule.swift
+          run_order () {
+            swift run --package-path WayboundCore --configuration release \
+              waybound-transit-verify \
+              --areas-file areas.txt \
+              --date 2026-09-14 \
+              --cache-dir .transitland-cache \
+              --output-dir "verification-output-ab/$1" 2>&1 \
+              | grep 'LANE-ORDER'
+          }
+          echo "### branch (afd55a1 applied)" > ab-lane-order.txt
+          run_order branch | tee -a ab-lane-order.txt
+          git checkout 4c94c77ddc3ed41d91c2dc6cbc1d081e5e863822 -- "$CORE"
+          echo "exit=$? checking out main's CorridorLaneSchedule" >> ab-lane-order.txt
+          echo "### main (4c94c77, before the fix)" >> ab-lane-order.txt
+          run_order main | tee -a ab-lane-order.txt
+          git checkout HEAD -- "$CORE"
+          echo "restored: $(git diff --stat -- "$CORE" | wc -l) diff lines (0 expected)" \
+            >> ab-lane-order.txt
+          cat ab-lane-order.txt
+          exit 0
+
+      # Publish everything through the PR comment thread, the only channel this
+      # sandbox can read. Header-matched edit so repeated runs update in place
+      # instead of stacking comments (same pattern as core.yml).
+      - name: Report to PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          n=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" \
+                --state all --json number --jq '.[0].number' 2>/dev/null)
+
+          {
+            echo "## branch-live-transit-verification — run ${GITHUB_RUN_NUMBER} (\`${GITHUB_SHA:0:7}\`)"
+            echo
+            echo "### environment"
+            echo '```'
+            cat ci-diagnostics/env.txt 2>/dev/null || echo "(no env.txt)"
+            cat ci-diagnostics/apikey.txt 2>/dev/null || echo "(apikey check did not run)"
+            echo '```'
+            echo
+            echo "### snapshot cache state before verification"
+            echo '```'
+            cat ci-diagnostics/cache-state.txt 2>/dev/null || echo "(no cache-state.txt)"
+            echo '```'
+            echo
+            echo "### build log (errors, if any)"
+            echo '```'
+            grep -E 'error:|warning: .*(deprecat|unavail)|Compiling|Build complete|linking' \
+              ci-diagnostics/build.log 2>/dev/null | sort -u | head -40 \
+              || echo "(no build.log)"
+            echo '```'
+            echo '```'
+            tail -n 40 ci-diagnostics/build.log 2>/dev/null || echo "(no build.log)"
+            echo '```'
+            echo
+            echo "### verifier exit codes"
+            echo '```'
+            cat exit-codes.txt 2>/dev/null || cat verify-skipped.txt 2>/dev/null || echo "(none)"
+            echo '```'
+            echo
+            echo "### A/B lateral lane order for 2026-09-14 (branch vs main)"
+            echo '```'
+            cat ab-lane-order.txt 2>/dev/null || echo "(did not run)"
+            echo '```'
+            echo
+            echo "### determinism (second process, identical cached snapshots)"
+            echo '```'
+            cat determinism.txt 2>/dev/null || echo "(did not run)"
+            echo '```'
+            for D in 2026-09-12 2026-09-13 2026-09-14; do
+              echo
+              echo "### service date $D"
+              if [ -f "verification-output/$D/report.md" ]; then
+                cat "verification-output/$D/report.md"
+                echo
+                # report.json is aggregate-only (no per-journey ordering), but it
+                # is the sole place fetch.issues[], laneCheck.issues[] and the
+                # per-area cacheHit flag are exposed -- report.md omits them.
+                echo "<details><summary>report.json</summary>"
+                echo
+                echo '```json'
+                cat "verification-output/$D/report.json" 2>/dev/null
+                echo '```'
+                echo "</details>"
+                echo
+                echo "<details><summary>verify-$D.log</summary>"
+                echo
+                echo '```'
+                tail -n 80 "ci-diagnostics/verify-$D.log" 2>/dev/null
+                echo '```'
+                echo "</details>"
+              else
+                echo "_no report produced_"
+                echo '```'
+                tail -n 40 "ci-diagnostics/verify-$D.log" 2>/dev/null || echo "(no log)"
+                echo '```'
+              fi
+            done
+            echo
+            echo "### report.json presence"
+            echo '```'
+            find verification-output -type f 2>/dev/null | sort || echo "(no verification-output)"
+            echo '```'
+          } > pr-report.md
+
+          cat pr-report.md >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$n" ]; then
+            cid=$(gh api "repos/$GITHUB_REPOSITORY/issues/$n/comments" \
+                    --jq '.[] | select(.body | startswith("## branch-live-transit-verification —")) | .id' \
+                    2>/dev/null | tail -1)
+            if [ -n "$cid" ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" \
+                -f body="$(cat pr-report.md)" > /dev/null && echo "updated PR #$n comment $cid"
+            else
+              gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --body-file pr-report.md \
+                && echo "posted comment to PR #$n"
+            fi
+          else
+            echo "(no PR found for branch ${branch}; report left in the step summary)"
+          fi
+
+      - name: Report artifact size
+        if: always()
+        run: |
+          du -sh verification-output 2>/dev/null || true
+          find verification-output -type f -printf '%s\t%p\n' 2>/dev/null \
+            | sort -rn | head -20 || true
+
+      - name: Upload snapshots and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: branch-transitland-verification-${{ github.run_number }}
+          path: |
+            verification-output
+            ci-diagnostics
+            determinism.txt
+            ab-lane-order.txt
+            exit-codes.txt
+            pr-report.md
+            areas.txt
+          if-no-files-found: warn
+          retention-days: 14
