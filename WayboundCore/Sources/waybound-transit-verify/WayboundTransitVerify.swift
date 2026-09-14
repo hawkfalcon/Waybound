@@ -795,6 +795,10 @@ private struct AreaReport: Codable {
     let fetch: FetchReport
     let journeys: JourneyCountReport
     let laneCheck: LaneVerificationResult
+    /// Lateral lane order, innermost first: `ROUTE#journeyID@meanOffset`. The
+    /// aggregate counts above cannot see a lane swap, and this is what the map
+    /// actually draws, so it belongs in the audited record.
+    let laneOrder: [String]
 }
 
 private struct VerificationSummary: Codable {
@@ -843,6 +847,9 @@ private struct DepartureCandidate {
 private struct AreaAnalysis {
     let journeyCounts: JourneyCountReport
     let laneCheck: LaneVerificationResult
+    /// Lateral lane order, for diffing which side of the corridor each route's
+    /// ribbon draws on. Not part of the report schema.
+    let laneOrder: [String]
 }
 
 // MARK: - Area fetch and analysis
@@ -929,7 +936,8 @@ private final class LiveAreaVerifier {
                 issues: snapshot.issues
             ),
             journeys: analysis.journeyCounts,
-            laneCheck: analysis.laneCheck
+            laneCheck: analysis.laneCheck,
+            laneOrder: analysis.laneOrder
         )
     }
 
@@ -1344,7 +1352,8 @@ private final class LiveAreaVerifier {
             )
             return AreaAnalysis(
                 journeyCounts: emptyCounts,
-                laneCheck: LiveLaneVerification.verify(journeys: [])
+                laneCheck: LiveLaneVerification.verify(journeys: []),
+                laneOrder: []
             )
         }
 
@@ -1400,6 +1409,7 @@ private final class LiveAreaVerifier {
         }
 
         let laneCheck = LiveLaneVerification.verify(journeys: journeys)
+        let laneOrder = LiveLaneVerification.lateralOrder(journeys: journeys)
         let counts = JourneyCountReport(
             sourceStopCount: selectedStops.count,
             routeCount: routeIDsWithJourneys.count,
@@ -1413,7 +1423,11 @@ private final class LiveAreaVerifier {
                 $0 + $1.observedDepartureCount
             }
         )
-        return AreaAnalysis(journeyCounts: counts, laneCheck: laneCheck)
+        return AreaAnalysis(
+            journeyCounts: counts,
+            laneCheck: laneCheck,
+            laneOrder: laneOrder
+        )
     }
 
     private func routeMetadata(
@@ -1752,6 +1766,11 @@ struct WayboundTransitVerifyMain {
                 print(
                     "  \(report.fetch.status): \(report.journeys.journeyCount) journeys; "
                         + "lane \(report.laneCheck.status)"
+                )
+                print(
+                    "  LANE-ORDER \(area.slug): "
+                        + (report.laneOrder.isEmpty
+                            ? "-" : report.laneOrder.joined(separator: " "))
                 )
             }
 

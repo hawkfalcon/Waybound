@@ -72,6 +72,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The A/B step below checks out main's CorridorLaneSchedule.swift, so
+          # the default fetch-depth of 1 is not enough.
+          fetch-depth: 0
 
       - uses: swift-actions/setup-swift@v2
         with:
@@ -211,6 +215,38 @@ jobs:
           cat determinism.txt
           exit 0
 
+      # Which commit moves the lateral lane order? The app renders lanes through
+      # WayboundCore, so afd55a1's memberIDByKey change is reachable from the app
+      # even though dbc47b9 is app-only. Rebuild with main's CorridorLaneSchedule
+      # and diff the emitted lane order on the SAME cached snapshot: zero
+      # Transitland requests, and the only variable is that one file.
+      - name: A/B lateral lane order (branch vs main)
+        env:
+          TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
+        run: |
+          set +e
+          CORE=WayboundCore/Sources/WayboundCore/CorridorLaneSchedule.swift
+          run_order () {
+            swift run --package-path WayboundCore --configuration release \
+              waybound-transit-verify \
+              --areas-file areas.txt \
+              --date 2026-09-14 \
+              --cache-dir .transitland-cache \
+              --output-dir "verification-output-ab/$1" 2>&1 \
+              | grep 'LANE-ORDER'
+          }
+          echo "### branch (afd55a1 applied)" > ab-lane-order.txt
+          run_order branch | tee -a ab-lane-order.txt
+          git checkout 4c94c77ddc3ed41d91c2dc6cbc1d081e5e863822 -- "$CORE"
+          echo "exit=$? checking out main's CorridorLaneSchedule" >> ab-lane-order.txt
+          echo "### main (4c94c77, before the fix)" >> ab-lane-order.txt
+          run_order main | tee -a ab-lane-order.txt
+          git checkout HEAD -- "$CORE"
+          echo "restored: $(git diff --stat -- "$CORE" | wc -l) diff lines (0 expected)" \
+            >> ab-lane-order.txt
+          cat ab-lane-order.txt
+          exit 0
+
       # Publish everything through the PR comment thread, the only channel this
       # sandbox can read. Header-matched edit so repeated runs update in place
       # instead of stacking comments (same pattern as core.yml).
@@ -251,6 +287,11 @@ jobs:
             echo "### verifier exit codes"
             echo '```'
             cat exit-codes.txt 2>/dev/null || cat verify-skipped.txt 2>/dev/null || echo "(none)"
+            echo '```'
+            echo
+            echo "### A/B lateral lane order for 2026-09-14 (branch vs main)"
+            echo '```'
+            cat ab-lane-order.txt 2>/dev/null || echo "(did not run)"
             echo '```'
             echo
             echo "### determinism (second process, identical cached snapshots)"
@@ -326,6 +367,7 @@ jobs:
             verification-output
             ci-diagnostics
             determinism.txt
+            ab-lane-order.txt
             exit-codes.txt
             pr-report.md
             areas.txt
