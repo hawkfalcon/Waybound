@@ -1811,29 +1811,37 @@ public enum CorridorLaneSchedule {
                     if !departedKeys.isEmpty, !slots.isEmpty {
                         let runLengthValue = strand.arc[s1] - strand.arc[s0]
                         var memberIDByKey: [String: Int] = [:]
+                        // KNOWN NONDETERMINISM, DELIBERATELY LEFT ALONE.
+                        //
                         // Both directions of one route collapse onto a single
-                        // public key, so several journeys claim it. `presence` is
-                        // a Dictionary and Swift reseeds its hasher per process,
-                        // so last-writer-wins here picked a different journey on
-                        // each launch. That moved departedLength below, flipped
-                        // the collapse test, and shifted every slot -- changing
-                        // the schedule and the trunk flags with no change of
-                        // input. Take the highest-ranked member in the module's
-                        // own ladder order, the same comparator the founding
-                        // cohort uses.
-                        for cid in presence.keys.sorted(by: {
-                            guard let first = identities[$0],
-                                  let second = identities[$1]
-                            else { return $0 < $1 }
-                            return CorridorLaneSchedule.laneComesBefore(
-                                first,
-                                second
-                            )
-                        }) {
-                            let key = publicRouteKey(for: cid)
-                            if memberIDByKey[key] == nil {
-                                memberIDByKey[key] = cid
-                            }
+                        // public key, so several journeys claim it and the last
+                        // writer wins. `presence` is a Dictionary and Swift
+                        // reseeds its hasher per process, so a different member
+                        // wins on each launch, which moves departedLength below
+                        // and can flip the collapse test.
+                        //
+                        // Picking a canonical member here (highest-ranked under
+                        // laneComesBefore) was tried and reverted: an A/B over
+                        // the cached 2026-09-14 downtown snapshot showed it
+                        // suppresses a collapse that should fire, pushing the
+                        // outer rungs far off the street -- route 11 from -28.83
+                        // to -39.90 lanes, route 6 from -24.96 to -35.70, route
+                        // 5 from 10.71 to 2.02, and it reordered 14/24X and
+                        // crossed GR Route 10 onto the other side of the spine
+                        // in Carpinteria. The journey set was identical, so this
+                        // was pure lane geometry, and the pre-existing behaviour
+                        // is the one that has been visually validated.
+                        //
+                        // Fixing it properly needs a decision about which member
+                        // a departed public key should be measured by -- the
+                        // longest rider that just left, the shortest, or the one
+                        // whose stretch actually ends here -- and that is domain
+                        // knowledge, not a determinism question. Until then the
+                        // audit's scheduledSegmentCount and trunkVertexCount
+                        // carry a small run-to-run variance; every other metric,
+                        // including the lateral lane order, is reproducible.
+                        for (cid, _) in presence {
+                            memberIDByKey[publicRouteKey(for: cid)] = cid
                         }
                         func endStretchLength(_ cid: Int) -> Double {
                             // The stretch that just ended -- a member with
