@@ -45,6 +45,28 @@ name: branch-live-transit-verification
 # moving departedLength and flipping the slot-collapse test. This run verifies
 # the fix: both passes read the cache, so it makes no Transitland requests.
 #
+# Run #10 verifies the revert in ddf1b1d, which restored main's last-writer-wins
+# memberIDByKey after run #9's A/B proved afd55a1 caused the reported lane swaps
+# (route 11 from -28.83 to -39.90, route 6 from -24.96 to -35.70, route 5 from
+# 10.71 to 2.02, and 14 of 18 core-line journeys changing lateral rank -- five
+# of them with an offset delta of exactly 0.00, i.e. pure reordering).
+#
+# CorridorLaneSchedule.swift is now byte-identical to main's apart from comments,
+# so the A/B step below changes meaning: both passes build the same source. It
+# stops being a code comparison and becomes a pure nondeterminism probe -- two
+# Swift processes over one identical cached snapshot, differing only in the
+# per-process hash seed. That is the decisive check on the revert's premise. If
+# LANE-ORDER comes back identical, run #9's branch-vs-main delta was a genuine
+# systematic effect of afd55a1 and the lateral order is reproducible without it.
+# If it comes back different, main's lane order is itself unstable per launch,
+# which would mean the validated arrangement was one draw among several and the
+# revert alone does not make it stable.
+#
+# The determinism check is expected to report DIFFERS again on
+# scheduledSegmentCount and trunkVertexCount: that variance is the known cost of
+# the revert and is documented at the collapse site. Both passes read the cache,
+# so this run makes no Transitland requests.
+#
 # The three service dates run sequentially inside one job so Swift builds once,
 # the dates share one .transitland-cache (keyed by area slug + date, so they
 # cannot contaminate each other), and only one live Transitland job is in flight.
