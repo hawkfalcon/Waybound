@@ -112,21 +112,21 @@ public enum LaneCollapseRider: Equatable, Sendable, CustomStringConvertible {
     /// so the gate reduces to its second half -- "is the surviving lattice
     /// parked more than a lane off the street" -- and fires whenever one is.
     ///
-    /// The shipped rule. The ride-length gate is meant to keep real bundle
-    /// members from triggering a re-centre, but the sweep prices that gate at
-    /// a cost: on 2026-09-12/13/14, over downtown Santa Barbara, UCSB and
-    /// Carpinteria, gating on it draws 3092 crossings against 2914 without it
-    /// (and 2650 in-bundle against 2449). The mechanism is the collapse's own
-    /// purpose: a lattice that keeps re-centring sits on its street, and a
-    /// lattice on its street crosses its neighbours less. Seven of the nine
-    /// area-dates are monotone in how often the gate opens; the exception is
-    /// the 47-journey weekday downtown, where never firing is 2.6% better and
-    /// this rule is still 3.7% better than the leaver rules.
+    /// Measured and rejected. It wins the sweep's coarse criterion: over
+    /// 2026-09-12/13/14 and the three areas it draws 2914 crossings where the
+    /// leaver rules draw 3092, on 2449 in-bundle crossings against 2650, and
+    /// seven of the nine area-dates are monotone in how often the gate opens.
+    /// But the same commit that shipped it failed the gates that measure the
+    /// drawn corridor directly -- `LaneCheckTests`' state_trunk scenario
+    /// (scheduler adds in-bundle crossings, 1 -> 2; strands cross inside the
+    /// bundle, 2 > 0; lanes overlap, 0.0368 against main's 0.06),
+    /// `LaneFuzzTests` (42 problem seeds against a gate of 40) and five
+    /// schedule golden fixtures against the device's own recorded schedule.
     ///
-    /// The deterministic limit of the retired rule, too: it drew a member out
-    /// of every member the key had in the corridor -- including ones that had
-    /// left at an earlier boundary, which read as a 0 m ride -- so it read 0
-    /// far more often than any leaver rule, and its fires cluster here.
+    /// That is the useful result: a whole-area crossing count cannot overrule
+    /// the targeted gates, and the difference between this rule and the leaver
+    /// rules is exactly the difference between changing the gate every time a
+    /// key leaves and changing it only where the retired code was undefined.
     case assumeStubCrowd
     /// The lower end of the same axis: no departing crowd is ever a stub, so
     /// the gate never opens and the lattice never translates.
@@ -153,10 +153,19 @@ public enum LaneCollapseRider: Equatable, Sendable, CustomStringConvertible {
         }
     }
 
-    /// The rule the app and the verifier run: set from the sweep in
-    /// `LanePolicyAudit`, because "fewest drawn crossings" is the criterion
-    /// and only the sweep can answer it.
-    public static let production: LaneCollapseRider = .assumeStubCrowd
+    /// The rule the app and the verifier run, set from the sweep in
+    /// `LanePolicyAudit` and the gates that bound it.
+    ///
+    /// The leaver rules are the retired rule made deterministic, and nothing
+    /// more: for a public key with one member they return that member's own
+    /// ending stretch, which is precisely what the retired code returned when
+    /// its pick landed there -- so the device's recorded schedules still
+    /// replay inside tolerance, and only the case the retired code left
+    /// undefined (several members, last writer wins) changes. `longestLeaver`
+    /// of the three keeps the retired rule's own aggregation, the longest
+    /// departing ride across keys, and the collapse's documented intent: a
+    /// crowd whose leavers are real bundle members never triggers it.
+    public static let production: LaneCollapseRider = .longestLeaver
 
     /// Rules the verification sweep compares, ordered along the
     /// fire-propensity axis: the never-collapse control, draws of the retired

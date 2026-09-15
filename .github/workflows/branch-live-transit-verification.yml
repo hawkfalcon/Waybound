@@ -98,6 +98,19 @@ name: branch-live-transit-verification
 # that ships only, and an overlong report is truncated rather than posted
 # silently failing.
 #
+# Run #13's table picked `assume-stub-crowd` (2914 crossings and 2449 in-bundle
+# against the leaver rules' 3092/2650), and run #14 shipped it -- where the
+# gates that measure the drawn corridor directly threw it out: `LaneCheckTests`'
+# state_trunk scenario gained in-bundle crossings (1 -> 2) and overlapping
+# lanes, `LaneFuzzTests` went to 42 problem seeds against a gate of 40, and five
+# schedule golden fixtures fell outside the device's own recorded schedule. The
+# useful lesson is now part of the report: a whole-area crossing count is a
+# coarse instrument and does not overrule the targeted gates. Run #14 ships the
+# leaver rule instead -- the retired rule made deterministic and nothing else,
+# identical to it on a single-member public key and order-free on a multi-member
+# one -- and the determinism check reads IDENTICAL on all three dates, with the
+# lane content as the only thing it compares.
+#
 # The three service dates run sequentially inside one job so Swift builds once,
 # the dates share one .transitland-cache (keyed by area slug + date, so they
 # cannot contaminate each other), and only one live Transitland job is in flight.
