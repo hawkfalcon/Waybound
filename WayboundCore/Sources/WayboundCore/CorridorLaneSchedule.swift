@@ -108,17 +108,25 @@ public enum LaneCollapseRider: Equatable, Sendable, CustomStringConvertible {
     /// off their street. The sweep prices this case next to the others rather
     /// than trusting either report.
     case rankedLeaver
-    /// Every departure is treated as a stub crowd, so the gate reduces to
-    /// "is the surviving lattice parked more than a lane off the street".
+    /// No member measures anything: every departing crowd reads as a stub,
+    /// so the gate reduces to its second half -- "is the surviving lattice
+    /// parked more than a lane off the street" -- and fires whenever one is.
     ///
-    /// The upper end of the fire-propensity axis, and the deterministic
-    /// limit of what the retired rule did: it drew a member out of every
-    /// member the key had in the corridor, including ones that had left at an
-    /// earlier boundary, and those read as a 0 m ride. `departedLength` was
-    /// therefore 0 far more often than any leaver rule makes it, and both
-    /// gate conditions passed trivially. Naming the limit is what lets the
-    /// sweep read a crossing count as "this is what firing that often
-    /// costs".
+    /// The shipped rule. The ride-length gate is meant to keep real bundle
+    /// members from triggering a re-centre, but the sweep prices that gate at
+    /// a cost: on 2026-09-12/13/14, over downtown Santa Barbara, UCSB and
+    /// Carpinteria, gating on it draws 3092 crossings against 2914 without it
+    /// (and 2650 in-bundle against 2449). The mechanism is the collapse's own
+    /// purpose: a lattice that keeps re-centring sits on its street, and a
+    /// lattice on its street crosses its neighbours less. Seven of the nine
+    /// area-dates are monotone in how often the gate opens; the exception is
+    /// the 47-journey weekday downtown, where never firing is 2.6% better and
+    /// this rule is still 3.7% better than the leaver rules.
+    ///
+    /// The deterministic limit of the retired rule, too: it drew a member out
+    /// of every member the key had in the corridor -- including ones that had
+    /// left at an earlier boundary, which read as a 0 m ride -- so it read 0
+    /// far more often than any leaver rule, and its fires cluster here.
     case assumeStubCrowd
     /// The lower end of the same axis: no departing crowd is ever a stub, so
     /// the gate never opens and the lattice never translates.
@@ -145,24 +153,23 @@ public enum LaneCollapseRider: Equatable, Sendable, CustomStringConvertible {
         }
     }
 
-    /// The rule the app and the verifier run.
-    ///
-    /// Every case here is a candidate; this one is the default until the
-    /// sweep in `LanePolicyAudit` prices them all on the cached snapshots,
-    /// because "fewest drawn crossings" is the criterion and only the sweep
-    /// can answer it. It is a leaver rule because a departure should be
-    /// measured by a ride that actually ended there.
-    public static let production: LaneCollapseRider = .longestLeaver
+    /// The rule the app and the verifier run: set from the sweep in
+    /// `LanePolicyAudit`, because "fewest drawn crossings" is the criterion
+    /// and only the sweep can answer it.
+    public static let production: LaneCollapseRider = .assumeStubCrowd
 
-    /// Rules the verification sweep compares on one snapshot, ordered along
-    /// the fire-propensity axis: the never-collapse control, draws of the
-    /// retired behaviour, the leaver semantics, then the always-fire limit.
+    /// Rules the verification sweep compares, ordered along the
+    /// fire-propensity axis: the never-collapse control, draws of the retired
+    /// behaviour, the leaver semantics, then the rule that fires whenever the
+    /// lattice is parked off its street.
     ///
     /// The draws are the baseline the corridor sits on today -- four samples
-    /// of the per-process pick the bug introduced -- so a semantic candidate
-    /// is read against the distribution users actually see rather than
-    /// against one launch. The two controls bracket the axis, which is what
-    /// says whether fewer fires is what fewer crossings means.
+    /// of the per-process pick the bug introduced -- so a candidate is read
+    /// against the distribution users actually see rather than against one
+    /// launch, and the two controls bracket the axis, which is what says
+    /// whether fewer fires is what fewer crossings means. Keeping all three
+    /// kinds in the set is what makes the choice re-arguable rather than a
+    /// one-off.
     public static func auditSet(drawSeeds: Int = 4) -> [LaneCollapseRider] {
         var out: [LaneCollapseRider] = [.neverCollapse]
         for seed in 1...max(1, drawSeeds) {
