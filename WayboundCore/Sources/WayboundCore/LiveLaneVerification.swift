@@ -165,7 +165,8 @@ public enum LiveLaneVerification {
     /// itself deterministic and safe to diff between runs.
     public static func lateralOrder(
         journeys: [LaneDiagnosticsDocument.Journey],
-        laneSpacingPoints: Double = LaneScheduleConstants.laneSpacing
+        laneSpacingPoints: Double = LaneScheduleConstants.laneSpacing,
+        collapseRider: LaneCollapseRider = LaneCollapseRider.production
     ) -> [String] {
         let usableJourneys = journeys.filter { journey in
             journey.polylines.contains { $0.count >= 2 }
@@ -173,7 +174,8 @@ public enum LiveLaneVerification {
         guard !usableJourneys.isEmpty else { return [] }
         let schedule = CorridorLaneSchedule.schedule(
             journeys: usableJourneys,
-            laneSpacingPoints: laneSpacingPoints
+            laneSpacingPoints: laneSpacingPoints,
+            collapseRider: collapseRider
         )
 
         var offsetSum: [Int: Double] = [:]

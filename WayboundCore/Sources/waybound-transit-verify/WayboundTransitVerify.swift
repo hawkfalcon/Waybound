@@ -43,6 +43,9 @@ private struct VerificationOptions {
     var cacheDirectory = ".transitland-cache"
     var snapshotDate: String?
     var refresh = false
+    /// Sweep every collapse-rider policy over the same journeys and report
+    /// the drawn-corridor metrics. Cache-only: it adds no requests.
+    var auditCollapse = false
     var showHelp = false
 
     static func parse(_ arguments: [String]) throws -> VerificationOptions {
@@ -84,6 +87,8 @@ private struct VerificationOptions {
                 explicitLongitude = longitude
             case "--refresh":
                 options.refresh = true
+            case "--audit-collapse":
+                options.auditCollapse = true
             case "--help", "-h":
                 options.showHelp = true
             default:
@@ -228,6 +233,10 @@ private func usage() -> String {
       --cache-dir PATH   raw snapshot cache (default: .transitland-cache)
       --output-dir PATH  report and artifact directory (default: verification-output)
       --refresh          ignore an existing complete snapshot for this date
+      --audit-collapse   measure every collapse-rider policy (draw samples of
+                         the retired rule plus the candidate semantics) on the
+                         same journeys and print COLLAPSE-RIDER lines; reads
+                         the cache only, so it spends no API quota
       --help
 
     The Transitland API key is read only from TRANSITLAND_API_KEY.
@@ -799,6 +808,9 @@ private struct AreaReport: Codable {
     /// aggregate counts above cannot see a lane swap, and this is what the map
     /// actually draws, so it belongs in the audited record.
     let laneOrder: [String]
+    /// Encoded only under `--audit-collapse`; nil leaves report.json
+    /// byte-for-byte what it was on runs that do not ask for the sweep.
+    let collapseRiders: [LaneDrawMetrics]?
 }
 
 private struct VerificationSummary: Codable {
@@ -850,6 +862,8 @@ private struct AreaAnalysis {
     /// Lateral lane order, for diffing which side of the corridor each route's
     /// ribbon draws on. Not part of the report schema.
     let laneOrder: [String]
+    /// One measured pass per collapse-rider policy, when the run asks for it.
+    let collapseRiders: [LaneDrawMetrics]?
 }
 
 // MARK: - Area fetch and analysis
@@ -860,19 +874,22 @@ private final class LiveAreaVerifier {
     private let isLiveSearch: Bool
     private let cacheDirectory: URL
     private let outputDirectory: URL
+    private let auditCollapse: Bool
 
     init(
         client: TransitlandHTTPClient,
         date: String,
         isLiveSearch: Bool,
         cacheDirectory: URL,
-        outputDirectory: URL
+        outputDirectory: URL,
+        auditCollapse: Bool
     ) {
         self.client = client
         self.date = date
         self.isLiveSearch = isLiveSearch
         self.cacheDirectory = cacheDirectory
         self.outputDirectory = outputDirectory
+        self.auditCollapse = auditCollapse
     }
 
     func verify(
@@ -937,7 +954,8 @@ private final class LiveAreaVerifier {
             ),
             journeys: analysis.journeyCounts,
             laneCheck: analysis.laneCheck,
-            laneOrder: analysis.laneOrder
+            laneOrder: analysis.laneOrder,
+            collapseRiders: analysis.collapseRiders
         )
     }
 
@@ -1350,10 +1368,12 @@ private final class LiveAreaVerifier {
                 directionCount: 0,
                 observedDepartureCount: 0
             )
+            let emptyMetrics: [LaneDrawMetrics]? = auditCollapse ? [] : nil
             return AreaAnalysis(
                 journeyCounts: emptyCounts,
                 laneCheck: LiveLaneVerification.verify(journeys: []),
-                laneOrder: []
+                laneOrder: [],
+                collapseRiders: emptyMetrics
             )
         }
 
@@ -1410,6 +1430,12 @@ private final class LiveAreaVerifier {
 
         let laneCheck = LiveLaneVerification.verify(journeys: journeys)
         let laneOrder = LiveLaneVerification.lateralOrder(journeys: journeys)
+        // Six to eight full pipeline passes over the same journeys, each one
+        // a different answer to "which member measures a departed key". Only
+        // runs that ask for it pay for it.
+        let collapseRiders: [LaneDrawMetrics]? = auditCollapse
+            ? LanePolicyAudit.sweep(journeys: journeys)
+            : nil
         let counts = JourneyCountReport(
             sourceStopCount: selectedStops.count,
             routeCount: routeIDsWithJourneys.count,
@@ -1426,7 +1452,8 @@ private final class LiveAreaVerifier {
         return AreaAnalysis(
             journeyCounts: counts,
             laneCheck: laneCheck,
-            laneOrder: laneOrder
+            laneOrder: laneOrder,
+            collapseRiders: collapseRiders
         )
     }
 
@@ -1753,7 +1780,8 @@ struct WayboundTransitVerifyMain {
                 date: date,
                 isLiveSearch: date == utcDateString(),
                 cacheDirectory: cacheDirectory,
-                outputDirectory: outputDirectory
+                outputDirectory: outputDirectory,
+                auditCollapse: options.auditCollapse
             )
             var areaReports: [AreaReport] = []
             for area in areas {
@@ -1772,6 +1800,13 @@ struct WayboundTransitVerifyMain {
                         + (report.laneOrder.isEmpty
                             ? "-" : report.laneOrder.joined(separator: " "))
                 )
+                for metrics in report.collapseRiders ?? [] {
+                    // Ordering criterion first: crossings of the drawn
+                    // ribbons, then the in-bundle crossings that are the
+                    // avoidable ones, then how far off the street the
+                    // arrangement parks its outer lanes.
+                    print(metrics.reportLine(slug: area.slug))
+                }
             }
 
             let fetched = areaReports.filter { $0.fetch.status == "fetched" }.count

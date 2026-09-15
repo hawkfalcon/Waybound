@@ -67,15 +67,31 @@ name: branch-live-transit-verification
 # the revert and is documented at the collapse site. Both passes read the cache,
 # so this run makes no Transitland requests.
 #
+# Run #11 answers the question run #10 left open. The revert restored a code
+# path whose lane order varies by up to 7.62 lanes between launches, so a
+# deterministic rule is needed that also keeps the corridor where it belongs.
+# `--audit-collapse` sweeps every candidate rule over the same cached snapshot
+# and reports, per rule, how many of the DRAWN ribbons cross: the criterion is
+# fewest lines crossing, so the sweep's draw samples (which reproduce the
+# retired last-writer-wins behaviour) act as the baseline and the semantic
+# candidates compete against it. A/B against main's source is gone with this
+# run: main's file no longer compiles against the branch's new policy type,
+# and its behaviour is already represented by the draw samples.
+#
 # The three service dates run sequentially inside one job so Swift builds once,
 # the dates share one .transitland-cache (keyed by area slug + date, so they
 # cannot contaminate each other), and only one live Transitland job is in flight.
 on:
   push:
     branches:
-      - arena/01a09c71-waybound
+      - arena/01a0a355-waybound
     paths:
       - .github/workflows/branch-live-transit-verification.yml
+      # Source pushes re-run the whole verification: the cache key below
+      # depends on areas.txt only, so a source-only push is still cache-only
+      # and spends no Transitland quota.
+      - WayboundCore/Sources/**
+      - WayboundCore/Tests/**
 
 permissions:
   contents: read
@@ -237,36 +253,53 @@ jobs:
           cat determinism.txt
           exit 0
 
-      # Which commit moves the lateral lane order? The app renders lanes through
-      # WayboundCore, so afd55a1's memberIDByKey change is reachable from the app
-      # even though dbc47b9 is app-only. Rebuild with main's CorridorLaneSchedule
-      # and diff the emitted lane order on the SAME cached snapshot: zero
-      # Transitland requests, and the only variable is that one file.
-      - name: A/B lateral lane order (branch vs main)
+      # Which member measures a departing public key? One run, every candidate
+      # rule, on the SAME cached snapshot: the sweep's draw samples reproduce
+      # what the retired last-writer-wins rule was doing, and the semantic
+      # candidates answer the question the revert left open. The criterion is
+      # crossings of the drawn ribbons -- fewest lines crossing wins -- with
+      # the in-bundle crossings, wobble, separation, kink and off-street
+      # displacement reported alongside so a cheap crossing count cannot hide
+      # a corridor parked off its own street. Zero Transitland requests.
+      - name: Collapse-rider policy sweep (drawn crossings per rule)
         env:
           TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
         run: |
           set +e
-          CORE=WayboundCore/Sources/WayboundCore/CorridorLaneSchedule.swift
-          run_order () {
-            swift run --package-path WayboundCore --configuration release \
-              waybound-transit-verify \
-              --areas-file areas.txt \
-              --date 2026-09-14 \
-              --cache-dir .transitland-cache \
-              --output-dir "verification-output-ab/$1" 2>&1 \
-              | grep 'LANE-ORDER'
-          }
-          echo "### branch (afd55a1 applied)" > ab-lane-order.txt
-          run_order branch | tee -a ab-lane-order.txt
-          git checkout 4c94c77ddc3ed41d91c2dc6cbc1d081e5e863822 -- "$CORE"
-          echo "exit=$? checking out main's CorridorLaneSchedule" >> ab-lane-order.txt
-          echo "### main (4c94c77, before the fix)" >> ab-lane-order.txt
-          run_order main | tee -a ab-lane-order.txt
-          git checkout HEAD -- "$CORE"
-          echo "restored: $(git diff --stat -- "$CORE" | wc -l) diff lines (0 expected)" \
-            >> ab-lane-order.txt
-          cat ab-lane-order.txt
+          : > collapse-rider.txt
+          for D in 2026-09-14; do
+            echo "### service date $D" >> collapse-rider.txt
+            # Two processes over one cached snapshot, like the determinism
+            # check above: the metrics below are only usable as a comparison
+            # if the rule that produced them is reproducible, and the retired
+            # one was not.
+            for PASS in a b; do
+              swift run --package-path WayboundCore --configuration release \
+                waybound-transit-verify \
+                --areas-file areas.txt \
+                --date "$D" \
+                --cache-dir .transitland-cache \
+                --audit-collapse \
+                --output-dir "verification-output-policy-$PASS" \
+                > "ci-diagnostics/policy-$D-$PASS.log" 2>&1
+              echo "pass $PASS exit=$?" >> collapse-rider.txt
+              grep '^COLLAPSE-RIDER' "ci-diagnostics/policy-$D-$PASS.log" \
+                >> "ci-diagnostics/policy-$D-$PASS.lines"
+            done
+            cat "ci-diagnostics/policy-$D-a.lines" >> collapse-rider.txt
+            if diff "ci-diagnostics/policy-$D-a.lines" \
+                    "ci-diagnostics/policy-$D-b.lines" > /dev/null 2>&1; then
+              echo "policy determinism: IDENTICAL across processes" \
+                >> collapse-rider.txt
+            else
+              echo "policy determinism: DIFFERS across processes" \
+                >> collapse-rider.txt
+              diff "ci-diagnostics/policy-$D-a.lines" \
+                   "ci-diagnostics/policy-$D-b.lines" | head -40 \
+                >> collapse-rider.txt
+            fi
+          done
+          cat collapse-rider.txt
           exit 0
 
       # Publish everything through the PR comment thread, the only channel this
@@ -311,9 +344,9 @@ jobs:
             cat exit-codes.txt 2>/dev/null || cat verify-skipped.txt 2>/dev/null || echo "(none)"
             echo '```'
             echo
-            echo "### A/B lateral lane order for 2026-09-14 (branch vs main)"
+            echo "### collapse-rider sweep (fewest drawn crossings wins)"
             echo '```'
-            cat ab-lane-order.txt 2>/dev/null || echo "(did not run)"
+            cat collapse-rider.txt 2>/dev/null || echo "(did not run)"
             echo '```'
             echo
             echo "### determinism (second process, identical cached snapshots)"
@@ -389,7 +422,7 @@ jobs:
             verification-output
             ci-diagnostics
             determinism.txt
-            ab-lane-order.txt
+            collapse-rider.txt
             exit-codes.txt
             pr-report.md
             areas.txt
