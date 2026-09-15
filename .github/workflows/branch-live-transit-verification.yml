@@ -335,16 +335,17 @@ jobs:
               grep '^LANE-POLICY' "ci-diagnostics/policy-$D-$PASS.log" \
                 > "ci-diagnostics/policy-$D-$PASS.orders"
             done
-            cat "ci-diagnostics/policy-$D-a.lines" >> collapse-rider.txt
             # The per-rule line positions are the numbers behind the table,
             # and the weekday snapshot is where the rules actually disagree.
             # The other two dates carry the totals only, so one comment can
             # hold the whole comparison.
             if [ "$D" = "$PRIMARY" ]; then
+              cat "ci-diagnostics/policy-$D-a.lines" >> collapse-rider.txt
               cat "ci-diagnostics/policy-$D-a.orders" >> collapse-rider.txt
             else
               # Offending-pair lists are kilobytes each and the shipped
-              # rule's pairs are the same story on every date.
+              # rule's pairs are the same story on every date. Appended once,
+              # stripped -- not once raw and once stripped.
               sed 's/ pairs=\[[^]]*\]//' "ci-diagnostics/policy-$D-a.lines" \
                 >> collapse-rider.txt
             fi
