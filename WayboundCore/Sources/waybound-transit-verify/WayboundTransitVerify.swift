@@ -1815,6 +1815,18 @@ struct WayboundTransitVerifyMain {
                             == LaneCollapseRider.production.description
                     ))
                 }
+                // The numbers behind a crossing count, per rule: where each
+                // journey's line actually sits. A total says one rule beats
+                // another; this says which lines moved, and is the only way to
+                // read a table of totals as a drawing.
+                for metrics in report.collapseRiders ?? [] {
+                    print(
+                        "LANE-POLICY \(area.slug) \(metrics.policy) "
+                            + (metrics.laneOrder.isEmpty
+                                ? "-"
+                                : metrics.laneOrder.joined(separator: " "))
+                    )
+                }
             }
 
             let fetched = areaReports.filter { $0.fetch.status == "fetched" }.count
