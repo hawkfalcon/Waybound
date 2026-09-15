@@ -35,22 +35,42 @@ public struct LaneDrawMetrics: Codable, Equatable, Sendable {
     /// `ROUTE#journeyID@meanOffset`, innermost first. Harness journey ids
     /// (array positions), not live Transitland ids.
     public let laneOrder: [String]
+    /// Journeys this policy moved more than a lane away from where the
+    /// corridor sits today, out of `laneOrder.count`.
+    ///
+    /// The baseline is the median offset of each journey across the sweep's
+    /// draw samples: the per-process pick the retired rule made, sampled.
+    /// Crossings is the criterion, but this is what a crossing count must not
+    /// be bought with -- a rule that parks a route a dozen lanes off its own
+    /// street is the regression the A/B caught once already.
+    public internal(set) var movedJourneys = 0
+    /// Farthest any journey moved from that baseline, in lanes.
+    public internal(set) var maxMoveLanes: Double = 0
 
     /// One grep-able line for a CI log or PR report. Crossings first, since
     /// that is the criterion; the rest is what it cost to get them.
-    public func reportLine(slug: String) -> String {
+    ///
+    /// The offending-pair list is the longest part of the line by far, so it
+    /// is opt-in: a report prices every policy, and then prints the pairs
+    /// only for the rule that ships.
+    public func reportLine(slug: String, includePairs: Bool = false) -> String {
         func number(_ value: Double?) -> String {
             guard let value else { return "-" }
             return String(format: "%.2f", value)
         }
-        return "COLLAPSE-RIDER \(slug) \(policy) crossings=\(crossings) "
+        var line = "COLLAPSE-RIDER \(slug) \(policy) crossings=\(crossings) "
             + "bundle=\(bundleCrossings) "
-            + "pairs=[\(bundlePairs.joined(separator: ","))] "
+        if includePairs {
+            line += "pairs=[\(bundlePairs.joined(separator: ","))] "
+        }
+        return line
             + "wobble=\(number(wobble)) sep=\(number(minSeparation)) "
             + "kink=\(number(alignmentKink)) "
             + "maxoff=\(String(format: "%.2f", maxAbsOffsetLanes)) "
             + "fires=\(collapseFires)/\(collapseEvaluations) "
-            + "shift=\(String(format: "%.2f", maxShiftLanes))"
+            + "shift=\(String(format: "%.2f", maxShiftLanes)) "
+            + "move=\(movedJourneys)/\(laneOrder.count) "
+            + "maxmove=\(String(format: "%.2f", maxMoveLanes))"
     }
 }
 
@@ -175,25 +195,67 @@ public enum LanePolicyAudit {
     }
 
     /// Measure every candidate on one journey set, in `auditSet` order.
-    /// Motion metrics (wobble, separation) cost a pairwise spine walk each,
-    /// so they run only for the semantic candidates, not the draw samples.
+    ///
+    /// Motion metrics (wobble, separation) cost a pairwise spine walk each and
+    /// run for every policy: a rule that wins on crossings by tearing the
+    /// bundle apart has to show it here.
     public static func sweep(
         journeys: [LaneDiagnosticsDocument.Journey],
         riders: [LaneCollapseRider] = LaneCollapseRider.auditSet(),
         laneSpacingPoints: Double = LaneScheduleConstants.laneSpacing
     ) -> [LaneDrawMetrics] {
-        riders.compactMap { rider in
-            var motion = false
-            switch rider {
-            case .longestLeaver, .shortestLeaver, .rankedLeaver: motion = true
-            case .drawOrder: motion = false
-            }
-            return metrics(
+        var out: [LaneDrawMetrics] = riders.compactMap { rider in
+            metrics(
                 journeys: journeys,
                 rider: rider,
-                laneSpacingPoints: laneSpacingPoints,
-                includeMotion: motion
+                laneSpacingPoints: laneSpacingPoints
             )
         }
+        // Where each journey sits today: the median offset across the sampled
+        // draws, i.e. the arrangement the retired rule's own distribution puts
+        // it in. A policy's distance from that is not the criterion, but a
+        // crossing count bought by moving routes off their street is not a
+        // win either, and this is the number that shows it.
+        var samples: [String: [Double]] = [:]
+        for row in out where row.policy.hasPrefix("draw-") {
+            for entry in row.laneOrder {
+                guard let (key, value) = lateralEntry(entry) else { continue }
+                samples[key, default: []].append(value)
+            }
+        }
+        guard !samples.isEmpty else { return out }
+        var baseline: [String: Double] = [:]
+        for (key, values) in samples {
+            let sorted = values.sorted()
+            guard !sorted.isEmpty else { continue }
+            let count = sorted.count
+            baseline[key] = count % 2 == 1
+                ? sorted[count / 2]
+                : (sorted[count / 2 - 1] + sorted[count / 2]) / 2
+        }
+        for index in out.indices {
+            var moved = 0
+            var farthest = 0.0
+            for entry in out[index].laneOrder {
+                guard let (key, value) = lateralEntry(entry),
+                      let base = baseline[key] else { continue }
+                let delta = abs(value - base) / max(laneSpacingPoints, 1e-9)
+                farthest = max(farthest, delta)
+                if delta > 1 { moved += 1 }
+            }
+            out[index].movedJourneys = moved
+            out[index].maxMoveLanes = farthest
+        }
+        return out
+    }
+
+    /// `"ROUTE#journeyID@offset"`, as the harness's lateral order writes it.
+    private static func lateralEntry(_ entry: String) -> (String, Double)? {
+        guard let at = entry.lastIndex(of: "@") else { return nil }
+        let key = String(entry[entry.startIndex..<at])
+        guard let value = Double(entry[entry.index(after: at)...]) else {
+            return nil
+        }
+        return (key, value)
     }
 }

@@ -27,8 +27,8 @@ final class LaneCollapseTests: XCTestCase {
     ]
 
     func testLongestLeaverReadsTheLongestRideEndingHere() {
-        // Any arriving order, one answer: this is the production rule, and it
-        // is what makes the collapse decision reproducible.
+        // Any arriving order, one answer: the decision is a function of the
+        // member set, which is what makes it reproducible.
         let orders: [[(id: Int, length: Double)]] = [
             leavers,
             Array(leavers.reversed()),
@@ -77,6 +77,40 @@ final class LaneCollapseTests: XCTestCase {
         )
     }
 
+    func testAssumeStubCrowdReadsZeroHoweverTheLeaversRode() {
+        // The retired rule's average case, made explicit: a member that had
+        // already left at an earlier boundary read back as a 0 m ride, so the
+        // gate's two conditions both passed and the lattice re-centred. With
+        // the rule named, the sweep can price that arrangement directly
+        // instead of hoping four seeded draws land on it.
+        for leavers in [leavers, Array(leavers.reversed()), []] {
+            XCTAssertEqual(
+                CorridorLaneSchedule.departingRideLength(
+                    .assumeStubCrowd,
+                    rankedLeavers: leavers,
+                    drawnLeaver: (id: 11, length: 36)
+                ),
+                0
+            )
+        }
+    }
+
+    func testNeverCollapseReadsARideNoCrowdCouldHaveRidden() {
+        // The control at the other end of the axis. The gate's first test is
+        // `<`, so an infinite ride length can only fail it: the collapse can
+        // never fire, which is what prices what the collapse buys.
+        for leavers in [leavers, [], [leavers[2]]] {
+            XCTAssertEqual(
+                CorridorLaneSchedule.departingRideLength(
+                    .neverCollapse,
+                    rankedLeavers: leavers,
+                    drawnLeaver: (id: 11, length: 36)
+                ),
+                .infinity
+            )
+        }
+    }
+
     func testDrawOrderReadsTheDrawnMember() {
         XCTAssertEqual(
             CorridorLaneSchedule.departingRideLength(
@@ -100,7 +134,7 @@ final class LaneCollapseTests: XCTestCase {
     }
 
     func testEmptyLeaverSetReadsAsZero() {
-        for rider in LaneCollapseRider.auditSet() {
+        for rider in LaneCollapseRider.auditSet() where rider != .neverCollapse {
             XCTAssertEqual(
                 CorridorLaneSchedule.departingRideLength(
                     rider,
@@ -196,6 +230,8 @@ final class LaneCollapseTests: XCTestCase {
             LaneCollapseRider.longestLeaver,
             .shortestLeaver,
             .rankedLeaver,
+            .assumeStubCrowd,
+            .neverCollapse,
         ] {
             XCTAssertEqual(
                 CorridorLaneSchedule.schedule(
@@ -251,5 +287,40 @@ final class LaneCollapseTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(first.bundleCrossings, 0)
         XCTAssertLessThanOrEqual(first.bundleCrossings, first.crossings)
         XCTAssertGreaterThanOrEqual(first.maxAbsOffsetLanes, 0)
+    }
+
+    func testSweepPricesEveryRuleAgainstTheDrawBaseline() throws {
+        // The sweep's job is to make the choice argable: one row per rule,
+        // every row measured on the same journeys, and the displacement
+        // measured against the draws' median arrangement rather than against
+        // whichever rule happens to be listed first.
+        let strands = LaneScenarios.stateTrunk()
+        let rows = LanePolicyAudit.sweep(journeys: journeys(from: strands))
+        XCTAssertEqual(
+            rows.map(\.policy),
+            LaneCollapseRider.auditSet().map(\.description)
+        )
+        let count = try XCTUnwrap(rows.first?.laneOrder.count)
+        XCTAssertGreaterThan(count, 0)
+        for row in rows {
+            XCTAssertEqual(row.laneOrder.count, count)
+            XCTAssertGreaterThanOrEqual(row.movedJourneys, 0)
+            XCTAssertLessThanOrEqual(row.movedJourneys, count)
+            XCTAssertGreaterThanOrEqual(row.maxMoveLanes, 0)
+            // Motion is measured the same way for every rule, draws
+            // included, or a rule could win on crossings with no wobble or
+            // separation number to answer for.
+            XCTAssertEqual(row.wobble != nil, rows[0].wobble != nil, row.policy)
+            XCTAssertEqual(
+                row.minSeparation != nil,
+                rows[0].minSeparation != nil,
+                row.policy
+            )
+        }
+        // The control cannot fire, whatever the scenario does.
+        let control = try XCTUnwrap(
+            rows.first { $0.policy == LaneCollapseRider.neverCollapse.description }
+        )
+        XCTAssertEqual(control.collapseFires, 0)
     }
 }

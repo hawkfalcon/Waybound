@@ -62,10 +62,12 @@ name: branch-live-transit-verification
 # which would mean the validated arrangement was one draw among several and the
 # revert alone does not make it stable.
 #
-# The determinism check is expected to report DIFFERS again on
-# scheduledSegmentCount and trunkVertexCount: that variance is the known cost of
-# the revert and is documented at the collapse site. Both passes read the cache,
-# so this run makes no Transitland requests.
+# The determinism check now filters the three fields that legitimately differ
+# between two passes over one cache -- `generatedAt`, and the cacheHit/status
+# bookkeeping that records which pass had to fetch -- so IDENTICAL is a claim
+# about the lanes and a regression cannot hide behind lines that always differ.
+# Run #12 is the first run where that claim is worth anything: it reported
+# IDENTICAL on all three dates, with no lane, count or order left differing.
 #
 # Run #11 answers the question run #10 left open. The revert restored a code
 # path whose lane order varies by up to 7.62 lanes between launches, so a
@@ -77,6 +79,24 @@ name: branch-live-transit-verification
 # candidates compete against it. A/B against main's source is gone with this
 # run: main's file no longer compiles against the branch's new policy type,
 # and its behaviour is already represented by the draw samples.
+#
+# Run #12 answered it: the member choice is now a function of the set, both
+# processes agree on every policy ("policy determinism: IDENTICAL"), and on
+# 2026-09-14 the leaver rules drew 1126/156/178 crossings (downtown/ucsb/
+# carpinteria) with 999/138/141 in-bundle, against draws ranging 1124-1142 and
+# 999-1021. The leaver rules tie the best draw downtown and win the in-bundle
+# count everywhere, but they also fire the collapse 7 times out of 208 while
+# the draws fire 20-24, so the tie needs to be read against what the collapse
+# is for. Run #13 adds the controls that price that: `never-collapse` (the gate
+# can never open) and `assume-stub-crowd` (the gate is nothing but the median
+# test), bracketing the fire-propensity axis, plus a `move`/`maxmove` column
+# measuring each rule's distance from the arrangement the draws' own median
+# puts the corridor in. Crossings is the criterion; `move` is how a crossing
+# count is checked not to have been bought by parking routes off their street,
+# which is the regression the A/B caught once already. Three service dates now
+# run, so the choice is not a fit to one snapshot; `pairs=` prints for the rule
+# that ships only, and an overlong report is truncated rather than posted
+# silently failing.
 #
 # The three service dates run sequentially inside one job so Swift builds once,
 # the dates share one .transitland-cache (keyed by area slug + date, so they
@@ -240,63 +260,95 @@ jobs:
               echo "$D INCONCLUSIVE (repeat exit=$RC)" | tee -a determinism.txt
               continue
             fi
-            if diff <(grep -v '"generatedAt"' "$A") \
-                    <(grep -v '"generatedAt"' "$B") > /dev/null 2>&1; then
+            # `generatedAt` is a timestamp; the cache fields record which pass
+            # had to fetch a snapshot and say nothing about the walk. Filtering
+            # them leaves the lane content as the only thing this diff can
+            # report on, so a green IDENTICAL is a real claim, and a genuine
+            # regression cannot hide behind bookkeeping that always differs.
+            volatile='"generatedAt"|"cacheHit"|"status" : "fetched"|"status" : "cached"|"cachedAreaCount"|"fetchedAreaCount"'
+            if diff <(grep -Ev "$volatile" "$A") \
+                    <(grep -Ev "$volatile" "$B") > /dev/null 2>&1; then
               echo "$D IDENTICAL" | tee -a determinism.txt
             else
               echo "$D DIFFERS" | tee -a determinism.txt
-              diff <(grep -v '"generatedAt"' "$A") \
-                   <(grep -v '"generatedAt"' "$B") | head -60 >> determinism.txt
+              diff <(grep -Ev "$volatile" "$A") \
+                   <(grep -Ev "$volatile" "$B") | head -60 >> determinism.txt
             fi
           done
           echo "---- determinism ----"
           cat determinism.txt
           exit 0
 
-      # Which member measures a departing public key? One run, every candidate
-      # rule, on the SAME cached snapshot: the sweep's draw samples reproduce
-      # what the retired last-writer-wins rule was doing, and the semantic
-      # candidates answer the question the revert left open. The criterion is
+      # Which member measures a departing public key? Every candidate rule, on
+      # cached snapshots, over three service dates: the sweep's draw samples
+      # reproduce what the retired last-writer-wins rule was doing, the leaver
+      # rules answer the question the revert left open, and the never-collapse
+      # and always-fire controls bracket the axis so a crossing count can be
+      # read as "this is what firing that often buys". The criterion is
       # crossings of the drawn ribbons -- fewest lines crossing wins -- with
       # the in-bundle crossings, wobble, separation, kink and off-street
       # displacement reported alongside so a cheap crossing count cannot hide
-      # a corridor parked off its own street. Zero Transitland requests.
+      # a corridor parked off its own street, and `move`/`maxmove` against the
+      # draws' median arrangement so it cannot hide a rule that moved the
+      # corridor instead of only repricing it. Zero Transitland requests.
       - name: Collapse-rider policy sweep (drawn crossings per rule)
         env:
           TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
         run: |
           set +e
           : > collapse-rider.txt
-          for D in 2026-09-14; do
-            echo "### service date $D" >> collapse-rider.txt
-            # Two processes over one cached snapshot, like the determinism
-            # check above: the metrics below are only usable as a comparison
-            # if the rule that produced them is reproducible, and the retired
-            # one was not.
-            for PASS in a b; do
+          PRIMARY=2026-09-14
+          for D in 2026-09-12 2026-09-13 2026-09-14; do
+            echo "### collapse-rider sweep $D" >> collapse-rider.txt
+            # The primary date runs in two processes, like the determinism
+            # check above: a table is only usable as a comparison if the rule
+            # that produced it is reproducible, and the retired one was not.
+            # The other two dates run once, for breadth -- a rule chosen on
+            # one snapshot's crossings is a rule fitted to one snapshot.
+            PASSES="a"
+            if [ "$D" = "$PRIMARY" ]; then PASSES="a b"; fi
+            for PASS in $PASSES; do
               swift run --package-path WayboundCore --configuration release \
                 waybound-transit-verify \
                 --areas-file areas.txt \
                 --date "$D" \
                 --cache-dir .transitland-cache \
                 --audit-collapse \
-                --output-dir "verification-output-policy-$PASS" \
+                --output-dir "verification-output-policy-$D-$PASS" \
                 > "ci-diagnostics/policy-$D-$PASS.log" 2>&1
               echo "pass $PASS exit=$?" >> collapse-rider.txt
               grep '^COLLAPSE-RIDER' "ci-diagnostics/policy-$D-$PASS.log" \
-                >> "ci-diagnostics/policy-$D-$PASS.lines"
+                > "ci-diagnostics/policy-$D-$PASS.lines"
             done
             cat "ci-diagnostics/policy-$D-a.lines" >> collapse-rider.txt
-            if diff "ci-diagnostics/policy-$D-a.lines" \
-                    "ci-diagnostics/policy-$D-b.lines" > /dev/null 2>&1; then
-              echo "policy determinism: IDENTICAL across processes" \
-                >> collapse-rider.txt
-            else
-              echo "policy determinism: DIFFERS across processes" \
-                >> collapse-rider.txt
-              diff "ci-diagnostics/policy-$D-a.lines" \
-                   "ci-diagnostics/policy-$D-b.lines" | head -40 \
-                >> collapse-rider.txt
+            # The winner per area, so the table does not have to be read by
+            # eye to answer the question the sweep was run for.
+            awk '/^COLLAPSE-RIDER / {
+                   slug = $2; value = $4;
+                   sub(/^crossings=/, "", value);
+                   if (!(slug in best) || value + 0 < best[slug] + 0) {
+                     best[slug] = value;
+                     line[slug] = $0;
+                   }
+                 }
+                 END {
+                   for (slug in best) {
+                     print "FEWEST " slug " " line[slug];
+                   }
+                 }' "ci-diagnostics/policy-$D-a.lines" \
+              | sort >> collapse-rider.txt
+            if [ "$D" = "$PRIMARY" ]; then
+              if diff "ci-diagnostics/policy-$D-a.lines" \
+                      "ci-diagnostics/policy-$D-b.lines" > /dev/null 2>&1; then
+                echo "policy determinism: IDENTICAL across processes" \
+                  >> collapse-rider.txt
+              else
+                echo "policy determinism: DIFFERS across processes" \
+                  >> collapse-rider.txt
+                diff "ci-diagnostics/policy-$D-a.lines" \
+                     "ci-diagnostics/policy-$D-b.lines" | head -40 \
+                  >> collapse-rider.txt
+              fi
             fi
           done
           cat collapse-rider.txt
@@ -388,6 +440,17 @@ jobs:
             find verification-output -type f 2>/dev/null | sort || echo "(no verification-output)"
             echo '```'
           } > pr-report.md
+
+          # GitHub caps a comment at 65536 characters, and a report that
+          # overruns it fails to post at all -- which is how a run can look
+          # silent. The sweep table is the part that must survive, so an
+          # overlong report loses its tail, not its head.
+          if [ "$(wc -c < pr-report.md)" -gt 60000 ]; then
+            head -c 60000 pr-report.md > pr-report-truncated.md
+            printf '\n\n_(report truncated to fit one comment)_\n' \
+              >> pr-report-truncated.md
+            mv pr-report-truncated.md pr-report.md
+          fi
 
           cat pr-report.md >> "$GITHUB_STEP_SUMMARY"
 

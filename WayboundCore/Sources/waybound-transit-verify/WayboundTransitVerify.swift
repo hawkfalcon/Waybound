@@ -233,10 +233,12 @@ private func usage() -> String {
       --cache-dir PATH   raw snapshot cache (default: .transitland-cache)
       --output-dir PATH  report and artifact directory (default: verification-output)
       --refresh          ignore an existing complete snapshot for this date
-      --audit-collapse   measure every collapse-rider policy (draw samples of
-                         the retired rule plus the candidate semantics) on the
-                         same journeys and print COLLAPSE-RIDER lines; reads
-                         the cache only, so it spends no API quota
+      --audit-collapse   measure every collapse-rider policy (the never-collapse
+                         control, draw samples of the retired rule, the leaver
+                         semantics, the always-fire limit) on the same journeys
+                         and print COLLAPSE-RIDER lines -- crossings first, then
+                         the displacement from the draws' median arrangement;
+                         reads the cache only, so it spends no API quota
       --help
 
     The Transitland API key is read only from TRANSITLAND_API_KEY.
@@ -1804,8 +1806,14 @@ struct WayboundTransitVerifyMain {
                     // Ordering criterion first: crossings of the drawn
                     // ribbons, then the in-bundle crossings that are the
                     // avoidable ones, then how far off the street the
-                    // arrangement parks its outer lanes.
-                    print(metrics.reportLine(slug: area.slug))
+                    // arrangement parks its outer lanes. The offending-pair
+                    // list is printed for the rule that ships only, so the
+                    // comment stays readable across three dates.
+                    print(metrics.reportLine(
+                        slug: area.slug,
+                        includePairs: metrics.policy
+                            == LaneCollapseRider.production.description
+                    ))
                 }
             }
 

@@ -99,10 +99,35 @@ public enum LaneCollapseRider: Equatable, Sendable, CustomStringConvertible {
     /// (longest of those per-key numbers across departing keys). Aggressive:
     /// a single stub leaver lets the surviving lattice translate back.
     case shortestLeaver
-    /// The member `laneComesBefore` ranks first, whatever it rode: the rule
-    /// afd55a1 tried and `ddf1b1d` reverted, when the A/B showed it
-    /// suppressing collapses the validated arrangement depends on.
+    /// The member `laneComesBefore` ranks first among the leavers: the ladder
+    /// order the founding cohort already sorts by, read at this boundary.
+    ///
+    /// afd55a1 took the highest-ranked member whether or not it was leaving,
+    /// which measures the same ride whenever the ranked member is the leaver,
+    /// and `ddf1b1d` reverted it because the layout moved routes 4-13 lanes
+    /// off their street. The sweep prices this case next to the others rather
+    /// than trusting either report.
     case rankedLeaver
+    /// Every departure is treated as a stub crowd, so the gate reduces to
+    /// "is the surviving lattice parked more than a lane off the street".
+    ///
+    /// The upper end of the fire-propensity axis, and the deterministic
+    /// limit of what the retired rule did: it drew a member out of every
+    /// member the key had in the corridor, including ones that had left at an
+    /// earlier boundary, and those read as a 0 m ride. `departedLength` was
+    /// therefore 0 far more often than any leaver rule makes it, and both
+    /// gate conditions passed trivially. Naming the limit is what lets the
+    /// sweep read a crossing count as "this is what firing that often
+    /// costs".
+    case assumeStubCrowd
+    /// The lower end of the same axis: no departing crowd is ever a stub, so
+    /// the gate never opens and the lattice never translates.
+    ///
+    /// A control, not a policy. The gate's first condition is `<`, so an
+    /// infinite ride length can only ever fail it, and the value reaches no
+    /// other arithmetic. Pricing this on the same snapshot is what turns the
+    /// collapse's cost into a number instead of an argument.
+    case neverCollapse
     /// Emulates the retired last-writer-wins pick by taking the member a
     /// seeded hash draws: one sample from the same distribution the
     /// per-process hash seed used to produce. Audit and test only — it is
@@ -114,22 +139,41 @@ public enum LaneCollapseRider: Equatable, Sendable, CustomStringConvertible {
         case .longestLeaver: return "longest-leaver"
         case .shortestLeaver: return "shortest-leaver"
         case .rankedLeaver: return "ranked-leaver"
+        case .assumeStubCrowd: return "assume-stub-crowd"
+        case .neverCollapse: return "never-collapse"
         case let .drawOrder(seed): return "draw-\(seed)"
         }
     }
 
     /// The rule the app and the verifier run.
+    ///
+    /// Every case here is a candidate; this one is the default until the
+    /// sweep in `LanePolicyAudit` prices them all on the cached snapshots,
+    /// because "fewest drawn crossings" is the criterion and only the sweep
+    /// can answer it. It is a leaver rule because a departure should be
+    /// measured by a ride that actually ended there.
     public static let production: LaneCollapseRider = .longestLeaver
 
-    /// Rules the verification sweep compares on one snapshot: seeded draws
-    /// of the retired behaviour first, so a report shows what the old code
-    /// was doing on the same data, then the candidate semantics.
+    /// Rules the verification sweep compares on one snapshot, ordered along
+    /// the fire-propensity axis: the never-collapse control, draws of the
+    /// retired behaviour, the leaver semantics, then the always-fire limit.
+    ///
+    /// The draws are the baseline the corridor sits on today -- four samples
+    /// of the per-process pick the bug introduced -- so a semantic candidate
+    /// is read against the distribution users actually see rather than
+    /// against one launch. The two controls bracket the axis, which is what
+    /// says whether fewer fires is what fewer crossings means.
     public static func auditSet(drawSeeds: Int = 4) -> [LaneCollapseRider] {
-        var out: [LaneCollapseRider] = []
+        var out: [LaneCollapseRider] = [.neverCollapse]
         for seed in 1...max(1, drawSeeds) {
             out.append(.drawOrder(seed: UInt64(seed)))
         }
-        out.append(contentsOf: [.longestLeaver, .shortestLeaver, .rankedLeaver])
+        out.append(contentsOf: [
+            .longestLeaver,
+            .shortestLeaver,
+            .rankedLeaver,
+            .assumeStubCrowd,
+        ])
         return out
     }
 }
@@ -304,6 +348,10 @@ public enum CorridorLaneSchedule {
             return rankedLeavers.map { $0.length }.min() ?? 0
         case .rankedLeaver:
             return rankedLeavers.first?.length ?? 0
+        case .assumeStubCrowd:
+            return 0
+        case .neverCollapse:
+            return .infinity
         case .drawOrder:
             return drawnLeaver?.length ?? 0
         }
