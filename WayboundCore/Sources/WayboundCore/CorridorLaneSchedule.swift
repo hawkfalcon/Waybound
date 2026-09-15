@@ -436,7 +436,9 @@ public enum CorridorLaneSchedule {
         var schedule = buildSchedule(
             strands: strands,
             scanRows: scanRows,
-            identities: identities
+            identities: identities,
+            collapseRider: collapseRider,
+            audit: audit
         )
         postFillSchedule(strands, scanRows, &schedule)
         pruneIslandScheduleEntries(&schedule)
@@ -450,7 +452,9 @@ public enum CorridorLaneSchedule {
     static func buildSchedule(
         strands: [StrandKey: Strand],
         scanRows: [StrandKey: [[Int: CorridorMembership.CandidateLocation]]],
-        identities: [Int: JourneyIdentity]
+        identities: [Int: JourneyIdentity],
+        collapseRider: LaneCollapseRider = LaneCollapseRider.production,
+        audit: LaneScheduleAudit? = nil
     ) -> [StrandKey: [Int: Sample]] {
         guard !strands.isEmpty else { return [:] }
 
