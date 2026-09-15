@@ -69,9 +69,22 @@ enum JourneyScoring {
         if lhs.departureIsRealtime != rhs.departureIsRealtime {
             return lhs.departureIsRealtime
         }
-        return lhs.route.fullDisplayName.localizedStandardCompare(
+        let nameComparison = lhs.route.fullDisplayName.localizedStandardCompare(
             rhs.route.fullDisplayName
-        ) == .orderedAscending
+        )
+        if nameComparison != .orderedSame {
+            return nameComparison == .orderedAscending
+        }
+        // Without this the comparator is not a strict total order: two journeys
+        // whose display names compare equal tie in both directions, and the
+        // one-metre distance deadband above is not transitive. TransitViewModel
+        // sorts and takes minimums over `Dictionary(grouping:).values`, whose
+        // sequence differs on every launch because Swift reseeds its hasher per
+        // process, and Swift's sort is not stable -- so tied journeys came out in
+        // a different order each run and the first-wins deduplication kept a
+        // different survivor, changing which journeys reached the map. Trip ids
+        // are unique, so they close the tie.
+        return lhs.tripID < rhs.tripID
     }
 
     /// Physical direction and endpoints, not Transitland source IDs, define
