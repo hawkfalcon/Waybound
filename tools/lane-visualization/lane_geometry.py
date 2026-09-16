@@ -12,9 +12,11 @@ lane gates measure:
     LaneHarness.segmentsCross(...)
     LaneHarness.countCrossings / countBundleCrossings
 
-Because the ribbons are built at 2 screen points per metre, one lane of
-4.2 points is 2.1 m on the ground: a picture drawn from `points` is a to-scale
-drawing of the corridor.
+Scale, stated exactly: the geometry is scaled by `metersPerUnit / mpp` and
+lane offsets are applied unscaled in points, so at this convention one lane of
+4.2 points spans 8.4 m of ground and the crossing counts are the ones the
+package's gates measure. They are not a prediction of what a user sees at a
+particular map zoom -- the app's own lane spacing varies with zoom.
 """
 
 import json

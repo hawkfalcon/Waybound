@@ -2,9 +2,10 @@
 
     python3 tools/lane-visualization/draw_lanes.py [export.json]
 
-The picture is to scale: `lane_geometry` builds ribbons with the package's own
-convention (2 screen points per metre), so one lane = 4.2 points = 2.1 m and the
-whole network fits one panel. Red crosses are in-bundle crossings -- two ribbons
+`lane_geometry` builds ribbons with the package's own convention
+(`screenPointsPerMapPoint = 2`), where one lane of 4.2 points spans 8.4 m of
+ground, so the whole network fits one panel and the counts here are the ones the
+package's gates measure. Red crosses are in-bundle crossings -- two ribbons
 crossing inside a shared run, which is an ordering artifact the corridor must
 not have -- and orange dots are every other crossing, where junction merges
 legitimately land.
@@ -256,10 +257,12 @@ def main(export_path):
                           for (a, b), n in in_bundle_pairs.most_common(3))
     figure.text(
         .03, .012,
-        "Scale: ribbons are built with the package's own convention "
-        "(LaneHarness.ribbon, screenPointsPerMapPoint = 2), i.e. 2 screen points "
-        "per metre, so one lane = 4.2 points = 2.1 m and the whole network fits "
-        "the top panel.\n"
+        "Scale: ribbons are built with the package's own measurement convention "
+        "(LaneHarness.ribbon, screenPointsPerMapPoint = 2). At that convention the "
+        "geometry is scaled by metersPerUnit / mpp while lane offsets are applied "
+        "in points, so one lane of 4.2 points spans 8.4 m of ground. These are the "
+        "crossings the package's own gates count; they are not a prediction of a "
+        "particular map zoom, where the app spaces lanes differently.\n"
         "A crossing is a proper intersection of two drawn ribbons; an in-bundle "
         "crossing is one where both ribbons are stacked and well inside their "
         "shared run \u2014 an ordering artifact the corridor must not have, "

@@ -47,8 +47,10 @@
 <p class="lede">
   Every line the app draws, rebuilt from the device's own recorded geometry and lane
   offsets (<code>tools/replay/data/waybound-lanes-1789254859.json</code> — 17 journeys,
-  South Coast). Drawn with the project's own convention, so the picture is to scale:
-  <strong>one lane = 4.2 points = 2.1 m</strong>.
+  South Coast). Drawn with the project's own measurement convention
+  (<code>LaneHarness.ribbon</code>, <code>screenPointsPerMapPoint = 2</code>), where one lane of
+  4.2 points spans <strong>8.4 m</strong> of ground — so these are the crossings the package's
+  own gates count, not a prediction of a particular map zoom.
 </p>
 
 <div class="legend">
@@ -59,7 +61,7 @@
 <figure>
   <img src="real-lines-web.png" alt="All 17 lane ribbons of the South Coast network with every crossing marked">
   <figcaption>
-    The whole network fits one panel because the drawing is to scale — 19 km of coast.
+    The whole network fits one panel because the drawing uses the gates' own scale.
     Almost all of the conflict is in one place: the downtown Santa Barbara core,
     which is zoom 1 below.
   </figcaption>
