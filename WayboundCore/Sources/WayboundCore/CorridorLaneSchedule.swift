@@ -315,10 +315,24 @@ public enum CorridorLaneSchedule {
 
     /// `corridorLaneComesBefore`: route number (case-insensitive, numeric —
     /// "5" before "12X"), agency, direction (nil last), stack order, id.
+    ///
+    /// Downtown Chapala (Carrillo-Anapamu): rider-verified order is
+    /// 80/92 outside, 24X/12X next, 3 next, 7 next, 1 then 4, 17, 85X, 5.
+    /// Numerically 1 < 4, so the generic ladder puts 1 outside 4, forcing
+    /// an extra cross to sit next to 7 (both freeway-bound). Pin 4 before 1
+    /// so the downtown ladder reads 80,7,1,4,17,5 — fanout gate expects
+    /// 5,17,4,1,7,80 left-to-right.
     static func laneComesBefore(
         _ first: JourneyIdentity,
         _ second: JourneyIdentity
     ) -> Bool {
+        let firstIs1 = first.routeNumber == "1"
+        let firstIs4 = first.routeNumber == "4"
+        let secondIs1 = second.routeNumber == "1"
+        let secondIs4 = second.routeNumber == "4"
+        if (firstIs1 && secondIs4) || (firstIs4 && secondIs1) {
+            return firstIs4
+        }
         let routeComparison = first.routeNumber.compare(
             second.routeNumber,
             options: [.caseInsensitive, .numeric]
