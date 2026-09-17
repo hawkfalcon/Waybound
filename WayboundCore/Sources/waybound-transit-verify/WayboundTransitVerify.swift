@@ -43,6 +43,9 @@ private struct VerificationOptions {
     var cacheDirectory = ".transitland-cache"
     var snapshotDate: String?
     var refresh = false
+    /// Sweep every collapse-rider policy over the same journeys and report
+    /// the drawn-corridor metrics. Cache-only: it adds no requests.
+    var auditCollapse = false
     var showHelp = false
 
     static func parse(_ arguments: [String]) throws -> VerificationOptions {
@@ -84,6 +87,8 @@ private struct VerificationOptions {
                 explicitLongitude = longitude
             case "--refresh":
                 options.refresh = true
+            case "--audit-collapse":
+                options.auditCollapse = true
             case "--help", "-h":
                 options.showHelp = true
             default:
@@ -228,6 +233,12 @@ private func usage() -> String {
       --cache-dir PATH   raw snapshot cache (default: .transitland-cache)
       --output-dir PATH  report and artifact directory (default: verification-output)
       --refresh          ignore an existing complete snapshot for this date
+      --audit-collapse   measure every collapse-rider policy (the never-collapse
+                         control, draw samples of the retired rule, the leaver
+                         semantics, the always-fire limit) on the same journeys
+                         and print COLLAPSE-RIDER lines -- crossings first, then
+                         the displacement from the draws' median arrangement;
+                         reads the cache only, so it spends no API quota
       --help
 
     The Transitland API key is read only from TRANSITLAND_API_KEY.
@@ -795,6 +806,13 @@ private struct AreaReport: Codable {
     let fetch: FetchReport
     let journeys: JourneyCountReport
     let laneCheck: LaneVerificationResult
+    /// Lateral lane order, innermost first: `ROUTE#journeyID@meanOffset`. The
+    /// aggregate counts above cannot see a lane swap, and this is what the map
+    /// actually draws, so it belongs in the audited record.
+    let laneOrder: [String]
+    /// Encoded only under `--audit-collapse`; nil leaves report.json
+    /// byte-for-byte what it was on runs that do not ask for the sweep.
+    let collapseRiders: [LaneDrawMetrics]?
 }
 
 private struct VerificationSummary: Codable {
@@ -843,6 +861,11 @@ private struct DepartureCandidate {
 private struct AreaAnalysis {
     let journeyCounts: JourneyCountReport
     let laneCheck: LaneVerificationResult
+    /// Lateral lane order, for diffing which side of the corridor each route's
+    /// ribbon draws on. Not part of the report schema.
+    let laneOrder: [String]
+    /// One measured pass per collapse-rider policy, when the run asks for it.
+    let collapseRiders: [LaneDrawMetrics]?
 }
 
 // MARK: - Area fetch and analysis
@@ -853,19 +876,22 @@ private final class LiveAreaVerifier {
     private let isLiveSearch: Bool
     private let cacheDirectory: URL
     private let outputDirectory: URL
+    private let auditCollapse: Bool
 
     init(
         client: TransitlandHTTPClient,
         date: String,
         isLiveSearch: Bool,
         cacheDirectory: URL,
-        outputDirectory: URL
+        outputDirectory: URL,
+        auditCollapse: Bool
     ) {
         self.client = client
         self.date = date
         self.isLiveSearch = isLiveSearch
         self.cacheDirectory = cacheDirectory
         self.outputDirectory = outputDirectory
+        self.auditCollapse = auditCollapse
     }
 
     func verify(
@@ -929,7 +955,9 @@ private final class LiveAreaVerifier {
                 issues: snapshot.issues
             ),
             journeys: analysis.journeyCounts,
-            laneCheck: analysis.laneCheck
+            laneCheck: analysis.laneCheck,
+            laneOrder: analysis.laneOrder,
+            collapseRiders: analysis.collapseRiders
         )
     }
 
@@ -1181,16 +1209,21 @@ private final class LiveAreaVerifier {
         var tripIDsByPattern: [String: Set<Int>] = [:]
         let stopByID = Dictionary(uniqueKeysWithValues: selectedStops.map { ($0.id, $0) })
 
+        // A `for ... where` clause takes a single boolean expression, so the
+        // per-response bindings have to live in a guard inside the body.
         for response in snapshot.responses
-        where response.name.hasPrefix("departures-"),
-              response.succeeded,
-              let stopID = Int(String(response.name.dropFirst("departures-".count))),
-              let stop = stopByID[stopID],
-              let data = response.bodyData,
-              let document = try? JSONDecoder().decode(
-                  TransitlandDeparturesResponse.self,
-                  from: data
-              ) {
+        where response.name.hasPrefix("departures-") {
+            guard response.succeeded,
+                  let stopID = Int(
+                      String(response.name.dropFirst("departures-".count))
+                  ),
+                  let stop = stopByID[stopID],
+                  let data = response.bodyData,
+                  let document = try? JSONDecoder().decode(
+                      TransitlandDeparturesResponse.self,
+                      from: data
+                  )
+            else { continue }
             let departures = document.stops.first { $0.id == stopID }?.departures ?? []
             for departure in departures {
                 guard let trip = departure.trip else { continue }
@@ -1225,8 +1258,21 @@ private final class LiveAreaVerifier {
         }
 
         var patternRepresentatives: [DepartureCandidate] = []
-        for (key, candidates) in candidatesByPattern {
-            guard let first = candidates.min(by: candidatePrecedes) else { continue }
+        // Dictionary iteration order changes on every launch because Swift seeds
+        // its hasher randomly per process. candidatePrecedes is deliberately
+        // tolerant -- its one-metre distance deadband lets A tie with B and B tie
+        // with C while A beats C on distance -- so it is not transitive, and
+        // Swift's sort is not stable. Feeding that sort an unordered array made
+        // the winning representative for a direction, and therefore the trip
+        // shapes handed to the lane pipeline, vary between runs over identical
+        // snapshots: scheduledSegmentCount and trunkVertexCount moved while every
+        // count stayed the same. Iterating patterns in a fixed order and
+        // canonically ordering the representatives makes the selection
+        // reproducible without changing what the comparator prefers.
+        for key in candidatesByPattern.keys.sorted() {
+            guard let first = candidatesByPattern[key]?
+                .min(by: candidatePrecedes)
+            else { continue }
             patternRepresentatives.append(DepartureCandidate(
                 routeID: first.routeID,
                 tripID: first.tripID,
@@ -1239,6 +1285,7 @@ private final class LiveAreaVerifier {
                 observedDepartureCount: tripIDsByPattern[key]?.count ?? 0
             ))
         }
+        patternRepresentatives.sort(by: candidateIdentityPrecedes)
 
         var selected: [DepartureCandidate] = []
         for routeID in routeIDs.sorted() {
@@ -1265,13 +1312,23 @@ private final class LiveAreaVerifier {
                 }
             }
         }
-        return selected.sorted {
-            if $0.routeID != $1.routeID { return $0.routeID < $1.routeID }
-            if $0.directionKey != $1.directionKey {
-                return $0.directionKey < $1.directionKey
-            }
-            return $0.tripID < $1.tripID
+        return selected.sorted(by: candidateIdentityPrecedes)
+    }
+
+    /// Canonical, transitive order over candidates: route, then direction, then
+    /// trip. `candidatePrecedes` expresses the audit's preference (proximity,
+    /// then departure time) but its distance deadband makes it intransitive, so
+    /// it cannot define a reproducible sequence on its own. Anything whose order
+    /// is observable has to go through this instead.
+    private func candidateIdentityPrecedes(
+        _ first: DepartureCandidate,
+        _ second: DepartureCandidate
+    ) -> Bool {
+        if first.routeID != second.routeID { return first.routeID < second.routeID }
+        if first.directionKey != second.directionKey {
+            return first.directionKey < second.directionKey
         }
+        return first.tripID < second.tripID
     }
 
     private func candidatePrecedes(
@@ -1313,9 +1370,12 @@ private final class LiveAreaVerifier {
                 directionCount: 0,
                 observedDepartureCount: 0
             )
+            let emptyMetrics: [LaneDrawMetrics]? = auditCollapse ? [] : nil
             return AreaAnalysis(
                 journeyCounts: emptyCounts,
-                laneCheck: LiveLaneVerification.verify(journeys: [])
+                laneCheck: LiveLaneVerification.verify(journeys: []),
+                laneOrder: [],
+                collapseRiders: emptyMetrics
             )
         }
 
@@ -1371,6 +1431,13 @@ private final class LiveAreaVerifier {
         }
 
         let laneCheck = LiveLaneVerification.verify(journeys: journeys)
+        let laneOrder = LiveLaneVerification.lateralOrder(journeys: journeys)
+        // Six to eight full pipeline passes over the same journeys, each one
+        // a different answer to "which member measures a departed key". Only
+        // runs that ask for it pay for it.
+        let collapseRiders: [LaneDrawMetrics]? = auditCollapse
+            ? LanePolicyAudit.sweep(journeys: journeys)
+            : nil
         let counts = JourneyCountReport(
             sourceStopCount: selectedStops.count,
             routeCount: routeIDsWithJourneys.count,
@@ -1384,7 +1451,12 @@ private final class LiveAreaVerifier {
                 $0 + $1.observedDepartureCount
             }
         )
-        return AreaAnalysis(journeyCounts: counts, laneCheck: laneCheck)
+        return AreaAnalysis(
+            journeyCounts: counts,
+            laneCheck: laneCheck,
+            laneOrder: laneOrder,
+            collapseRiders: collapseRiders
+        )
     }
 
     private func routeMetadata(
@@ -1710,7 +1782,8 @@ struct WayboundTransitVerifyMain {
                 date: date,
                 isLiveSearch: date == utcDateString(),
                 cacheDirectory: cacheDirectory,
-                outputDirectory: outputDirectory
+                outputDirectory: outputDirectory,
+                auditCollapse: options.auditCollapse
             )
             var areaReports: [AreaReport] = []
             for area in areas {
@@ -1724,6 +1797,36 @@ struct WayboundTransitVerifyMain {
                     "  \(report.fetch.status): \(report.journeys.journeyCount) journeys; "
                         + "lane \(report.laneCheck.status)"
                 )
+                print(
+                    "  LANE-ORDER \(area.slug): "
+                        + (report.laneOrder.isEmpty
+                            ? "-" : report.laneOrder.joined(separator: " "))
+                )
+                for metrics in report.collapseRiders ?? [] {
+                    // Ordering criterion first: crossings of the drawn
+                    // ribbons, then the in-bundle crossings that are the
+                    // avoidable ones, then how far off the street the
+                    // arrangement parks its outer lanes. The offending-pair
+                    // list is printed for the rule that ships only, so the
+                    // comment stays readable across three dates.
+                    print(metrics.reportLine(
+                        slug: area.slug,
+                        includePairs: metrics.policy
+                            == LaneCollapseRider.production.description
+                    ))
+                }
+                // The numbers behind a crossing count, per rule: where each
+                // journey's line actually sits. A total says one rule beats
+                // another; this says which lines moved, and is the only way to
+                // read a table of totals as a drawing.
+                for metrics in report.collapseRiders ?? [] {
+                    print(
+                        "LANE-POLICY \(area.slug) \(metrics.policy) "
+                            + (metrics.laneOrder.isEmpty
+                                ? "-"
+                                : metrics.laneOrder.joined(separator: " "))
+                    )
+                }
             }
 
             let fetched = areaReports.filter { $0.fetch.status == "fetched" }.count

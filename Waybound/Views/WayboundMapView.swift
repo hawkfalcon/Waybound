@@ -1727,6 +1727,13 @@ struct WayboundMapView: UIViewRepresentable {
                   let second = corridorGeometryByJourneyID[secondID]
             else { return firstID < secondID }
 
+            let firstIs1 = first.routeNumber == "1"
+            let firstIs4 = first.routeNumber == "4"
+            let secondIs1 = second.routeNumber == "1"
+            let secondIs4 = second.routeNumber == "4"
+            if (firstIs1 && secondIs4) || (firstIs4 && secondIs1) {
+                return firstIs4
+            }
             let routeComparison = first.routeNumber.compare(
                 second.routeNumber,
                 options: [.caseInsensitive, .numeric]

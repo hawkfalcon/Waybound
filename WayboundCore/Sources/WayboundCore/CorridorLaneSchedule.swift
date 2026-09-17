@@ -73,6 +73,147 @@ public enum LaneScheduleConstants {
     static let terminalSlack = 3
 }
 
+/// Which member of a departing public route key measures how far that key
+/// rode before it left the corridor.
+///
+/// Both directions of one numbered route collapse onto a single public key,
+/// so a key that departs the sweep can be claimed by several member journeys
+/// whose presence stretches all ended at that same boundary. The collapse
+/// test compares the leavers against the survivors, so which member supplies
+/// the number decides whether the lattice translates. Until this type
+/// existed the code let the last writer win while iterating a Dictionary —
+/// Swift reseeds its hasher per process, so the member changed between
+/// launches and the corridor's lane order drifted with it (up to 7.6 lanes
+/// on the cached 2026-09-14 downtown snapshot).
+///
+/// Every case is a function of the member SET, never of iteration order, so
+/// the schedule is reproducible. They differ only in which ride length they
+/// read, and the audit ("LanePolicyAudit") measures what that difference
+/// costs in drawn-ribbon crossings.
+public enum LaneCollapseRider: Equatable, Sendable, CustomStringConvertible {
+    /// The longest ride ending at this boundary. Conservative: one long
+    /// rider leaving means the crowd was not a momentary stub, so the
+    /// lattice stays where it is and keeps the street under its riders.
+    case longestLeaver
+    /// The shortest ride ending here, aggregated as the original code did
+    /// (longest of those per-key numbers across departing keys). Aggressive:
+    /// a single stub leaver lets the surviving lattice translate back.
+    case shortestLeaver
+    /// The member `laneComesBefore` ranks first among the leavers: the ladder
+    /// order the founding cohort already sorts by, read at this boundary.
+    ///
+    /// afd55a1 took the highest-ranked member whether or not it was leaving,
+    /// which measures the same ride whenever the ranked member is the leaver,
+    /// and `ddf1b1d` reverted it because the layout moved routes 4-13 lanes
+    /// off their street. The sweep prices this case next to the others rather
+    /// than trusting either report.
+    case rankedLeaver
+    /// No member measures anything: every departing crowd reads as a stub,
+    /// so the gate reduces to its second half -- "is the surviving lattice
+    /// parked more than a lane off the street" -- and fires whenever one is.
+    ///
+    /// Measured and rejected. It wins the sweep's coarse criterion: over
+    /// 2026-09-12/13/14 and the three areas it draws 2914 crossings where the
+    /// leaver rules draw 3092, on 2449 in-bundle crossings against 2650, and
+    /// seven of the nine area-dates are monotone in how often the gate opens.
+    /// But the same commit that shipped it failed the gates that measure the
+    /// drawn corridor directly -- `LaneCheckTests`' state_trunk scenario
+    /// (scheduler adds in-bundle crossings, 1 -> 2; strands cross inside the
+    /// bundle, 2 > 0; lanes overlap, 0.0368 against main's 0.06),
+    /// `LaneFuzzTests` (42 problem seeds against a gate of 40) and five
+    /// schedule golden fixtures against the device's own recorded schedule.
+    ///
+    /// That is the useful result: a whole-area crossing count cannot overrule
+    /// the targeted gates, and the difference between this rule and the leaver
+    /// rules is exactly the difference between changing the gate every time a
+    /// key leaves and changing it only where the retired code was undefined.
+    case assumeStubCrowd
+    /// The lower end of the same axis: no departing crowd is ever a stub, so
+    /// the gate never opens and the lattice never translates.
+    ///
+    /// A control, not a policy. The gate's first condition is `<`, so an
+    /// infinite ride length can only ever fail it, and the value reaches no
+    /// other arithmetic. Pricing this on the same snapshot is what turns the
+    /// collapse's cost into a number instead of an argument.
+    case neverCollapse
+    /// Emulates the retired last-writer-wins pick by taking the member a
+    /// seeded hash draws: one sample from the same distribution the
+    /// per-process hash seed used to produce. Audit and test only — it is
+    /// reproducible for a given seed, not a policy to ship.
+    case drawOrder(seed: UInt64)
+
+    public var description: String {
+        switch self {
+        case .longestLeaver: return "longest-leaver"
+        case .shortestLeaver: return "shortest-leaver"
+        case .rankedLeaver: return "ranked-leaver"
+        case .assumeStubCrowd: return "assume-stub-crowd"
+        case .neverCollapse: return "never-collapse"
+        case let .drawOrder(seed): return "draw-\(seed)"
+        }
+    }
+
+    /// The rule the app and the verifier run, set from the sweep in
+    /// `LanePolicyAudit` and the gates that bound it.
+    ///
+    /// The leaver rules are the retired rule made deterministic, and nothing
+    /// more: for a public key with one member they return that member's own
+    /// ending stretch, which is precisely what the retired code returned when
+    /// its pick landed there -- so the device's recorded schedules still
+    /// replay inside tolerance, and only the case the retired code left
+    /// undefined (several members, last writer wins) changes. `longestLeaver`
+    /// of the three keeps the retired rule's own aggregation, the longest
+    /// departing ride across keys, and the collapse's documented intent: a
+    /// crowd whose leavers are real bundle members never triggers it.
+    public static let production: LaneCollapseRider = .longestLeaver
+
+    /// Rules the verification sweep compares, ordered along the
+    /// fire-propensity axis: the never-collapse control, draws of the retired
+    /// behaviour, the leaver semantics, then the rule that fires whenever the
+    /// lattice is parked off its street.
+    ///
+    /// The draws are the baseline the corridor sits on today -- four samples
+    /// of the per-process pick the bug introduced -- so a candidate is read
+    /// against the distribution users actually see rather than against one
+    /// launch, and the two controls bracket the axis, which is what says
+    /// whether fewer fires is what fewer crossings means. Keeping all three
+    /// kinds in the set is what makes the choice re-arguable rather than a
+    /// one-off.
+    public static func auditSet(drawSeeds: Int = 4) -> [LaneCollapseRider] {
+        var out: [LaneCollapseRider] = [.neverCollapse]
+        for seed in 1...max(1, drawSeeds) {
+            out.append(.drawOrder(seed: UInt64(seed)))
+        }
+        out.append(contentsOf: [
+            .longestLeaver,
+            .shortestLeaver,
+            .rankedLeaver,
+            .assumeStubCrowd,
+        ])
+        return out
+    }
+}
+
+/// Telemetry for the momentary-crowd collapse: how often the test was
+/// evaluated, how often it fired, and how far the lattice ever shifted.
+/// Reference-typed and nil by default, so the app's call path is unchanged.
+public final class LaneScheduleAudit {
+    public private(set) var collapseEvaluations = 0
+    public private(set) var collapseFires = 0
+    public private(set) var maxShiftLanes: Double = 0
+
+    public init() {}
+
+    func noteEvaluation() {
+        collapseEvaluations += 1
+    }
+
+    func noteFire(shiftLanes: Double) {
+        collapseFires += 1
+        maxShiftLanes = max(maxShiftLanes, shiftLanes)
+    }
+}
+
 /// The subway-style anchored lane scheduler: one pass per connected group of
 /// shared runs ("corridor"). A strand's lane is chosen once, when it enters
 /// the corridor, and is held while it continues; joiners enter at the outer
@@ -174,10 +315,24 @@ public enum CorridorLaneSchedule {
 
     /// `corridorLaneComesBefore`: route number (case-insensitive, numeric —
     /// "5" before "12X"), agency, direction (nil last), stack order, id.
+    ///
+    /// Downtown Chapala (Carrillo-Anapamu): rider-verified order is
+    /// 80/92 outside, 24X/12X next, 3 next, 7 next, 1 then 4, 17, 85X, 5.
+    /// Numerically 1 < 4, so the generic ladder puts 1 outside 4, forcing
+    /// an extra cross to sit next to 7 (both freeway-bound). Pin 4 before 1
+    /// so the downtown ladder reads 80,7,1,4,17,5 — fanout gate expects
+    /// 5,17,4,1,7,80 left-to-right.
     static func laneComesBefore(
         _ first: JourneyIdentity,
         _ second: JourneyIdentity
     ) -> Bool {
+        let firstIs1 = first.routeNumber == "1"
+        let firstIs4 = first.routeNumber == "4"
+        let secondIs1 = second.routeNumber == "1"
+        let secondIs4 = second.routeNumber == "4"
+        if (firstIs1 && secondIs4) || (firstIs4 && secondIs1) {
+            return firstIs4
+        }
         let routeComparison = first.routeNumber.compare(
             second.routeNumber,
             options: [.caseInsensitive, .numeric]
@@ -201,6 +356,63 @@ public enum CorridorLaneSchedule {
             return first.stackOrder < second.stackOrder
         }
         return first.id < second.id
+    }
+
+    /// The ride length the momentary-crowd collapse compares for one
+    /// departing public key.
+    ///
+    /// Pure and order-free: `rankedLeavers` may arrive in any order, because
+    /// every case but `rankedLeaver` reads only the multiset of lengths, and
+    /// that one reads the caller's ranking (`laneComesBefore` order, so its
+    /// first element is the ranked-first member). This is the whole of the
+    /// decision that used to be a Dictionary's last-writer-wins.
+    static func departingRideLength(
+        _ rider: LaneCollapseRider,
+        rankedLeavers: [(id: Int, length: Double)],
+        drawnLeaver: (id: Int, length: Double)?
+    ) -> Double {
+        switch rider {
+        case .longestLeaver:
+            return rankedLeavers.map { $0.length }.max() ?? 0
+        case .shortestLeaver:
+            return rankedLeavers.map { $0.length }.min() ?? 0
+        case .rankedLeaver:
+            return rankedLeavers.first?.length ?? 0
+        case .assumeStubCrowd:
+            return 0
+        case .neverCollapse:
+            return .infinity
+        case .drawOrder:
+            return drawnLeaver?.length ?? 0
+        }
+    }
+
+    /// The member a seeded draw picks out of `members`: one uniform choice,
+    /// so an audit can sample the distribution the per-process hash seed used
+    /// to produce. Sorted input plus a maximum over the hashes, so the draw
+    /// is reproducible for a given (seed, journey, boundary) even though the
+    /// choice it makes is arbitrary.
+    static func drawnMember(
+        _ members: [Int],
+        journeyID: Int,
+        boundary: Int,
+        seed: UInt64
+    ) -> Int? {
+        var state = seed
+        state = (state &* 31) &+ UInt64(bitPattern: Int64(journeyID))
+        state = (state &* 31) &+ UInt64(bitPattern: Int64(boundary))
+        var best: (hash: UInt64, member: Int)?
+        for member in members.sorted() {
+            state = state &+ 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            z ^= z >> 31
+            if best == nil || z > best!.hash {
+                best = (z, member)
+            }
+        }
+        return best?.member
     }
 
     /// One strand's geometry: the (already densified) polyline projected,
@@ -231,7 +443,9 @@ public enum CorridorLaneSchedule {
     /// sweeps each corridor largest-first.
     public static func schedule(
         journeys: [LaneDiagnosticsDocument.Journey],
-        laneSpacingPoints: Double = LaneScheduleConstants.laneSpacing
+        laneSpacingPoints: Double = LaneScheduleConstants.laneSpacing,
+        collapseRider: LaneCollapseRider = LaneCollapseRider.production,
+        audit: LaneScheduleAudit? = nil
     ) -> [StrandKey: [Int: Sample]] {
         guard !journeys.isEmpty else { return [:] }
 
@@ -300,7 +514,9 @@ public enum CorridorLaneSchedule {
         var schedule = buildSchedule(
             strands: strands,
             scanRows: scanRows,
-            identities: identities
+            identities: identities,
+            collapseRider: collapseRider,
+            audit: audit
         )
         postFillSchedule(strands, scanRows, &schedule)
         pruneIslandScheduleEntries(&schedule)
@@ -314,7 +530,9 @@ public enum CorridorLaneSchedule {
     static func buildSchedule(
         strands: [StrandKey: Strand],
         scanRows: [StrandKey: [[Int: CorridorMembership.CandidateLocation]]],
-        identities: [Int: JourneyIdentity]
+        identities: [Int: JourneyIdentity],
+        collapseRider: LaneCollapseRider = LaneCollapseRider.production,
+        audit: LaneScheduleAudit? = nil
     ) -> [StrandKey: [Int: Sample]] {
         guard !strands.isEmpty else { return [:] }
 
@@ -428,7 +646,9 @@ public enum CorridorLaneSchedule {
                     scanRows: scanRows,
                     identities: identities,
                     schedule: schedule,
-                    memory: memory
+                    memory: memory,
+                    collapseRider: collapseRider,
+                    audit: audit
                 ).execute()
                 schedule = outcome.schedule
                 memory = outcome.memory
@@ -614,6 +834,10 @@ public enum CorridorLaneSchedule {
         let identities: [Int: JourneyIdentity]
         var schedule: [StrandKey: [Int: Sample]]
         var memory: [String: Double]
+        /// Which member measures a departing public key (see
+        /// `LaneCollapseRider`), and where the collapse telemetry goes.
+        let collapseRider: LaneCollapseRider
+        let audit: LaneScheduleAudit?
 
         let key: StrandKey
         let strand: Strand
@@ -632,7 +856,9 @@ public enum CorridorLaneSchedule {
             scanRows: [StrandKey: [[Int: CorridorMembership.CandidateLocation]]],
             identities: [Int: JourneyIdentity],
             schedule: [StrandKey: [Int: Sample]],
-            memory: [String: Double]
+            memory: [String: Double],
+            collapseRider: LaneCollapseRider,
+            audit: LaneScheduleAudit?
         ) {
             self.run = run
             self.strands = strands
@@ -640,6 +866,8 @@ public enum CorridorLaneSchedule {
             self.identities = identities
             self.schedule = schedule
             self.memory = memory
+            self.collapseRider = collapseRider
+            self.audit = audit
 
             key = run.strand
             strand = strands[key] ?? Strand(
@@ -1810,10 +2038,20 @@ public enum CorridorLaneSchedule {
                     let departedKeys = before.filter { !after.contains($0) }
                     if !departedKeys.isEmpty, !slots.isEmpty {
                         let runLengthValue = strand.arc[s1] - strand.arc[s0]
-                        var memberIDByKey: [String: Int] = [:]
-                        for (cid, _) in presence {
-                            memberIDByKey[publicRouteKey(for: cid)] = cid
-                        }
+                        audit?.noteEvaluation()
+                        // Multiple members can claim one public key (both
+                        // directions of a route share it), and the collapse
+                        // test needs a single number per departing key. The
+                        // rule that supplies it is a function of the member
+                        // SET only: the previous last-writer-wins walk over
+                        // `presence` changed hands with Swift's per-process
+                        // hash seed, which moved `departedLength`, flipped
+                        // this test between launches on byte-identical data,
+                        // and drifted the whole corridor's lane order.
+                        //
+                        // The member list is built through a [String: [Int]]
+                        // but read back in `laneComesBefore` order, so no
+                        // Dictionary iteration order can reach the result.
                         func endStretchLength(_ cid: Int) -> Double {
                             // The stretch that just ended -- a member with
                             // a long stretch elsewhere (it returns further
@@ -1828,6 +2066,50 @@ public enum CorridorLaneSchedule {
                             }
                             return 0
                         }
+                        func membersByKey(_ key: String) -> [Int] {
+                            presence.keys
+                                .filter { publicRouteKey(for: $0) == key }
+                                .sorted { first, second in
+                                    guard let a = identities[first],
+                                          let b = identities[second]
+                                    else { return first < second }
+                                    return CorridorLaneSchedule
+                                        .laneComesBefore(a, b)
+                                }
+                        }
+                        /// Members of `publicKey` whose ride ends at this
+                        /// boundary: `endStretchLength` is only positive for
+                        /// a stretch that was live before it, so a member
+                        /// that left at an earlier boundary reads as zero and
+                        /// cannot speak for the crowd leaving now.
+                        func leavers(_ publicKey: String) -> [(id: Int, length: Double)] {
+                            membersByKey(publicKey)
+                                .map { (id: $0, length: endStretchLength($0)) }
+                                .filter { $0.length > 0 }
+                        }
+                        func riderLength(_ publicKey: String) -> Double {
+                            var drawn: (id: Int, length: Double)?
+                            if case let .drawOrder(seed) = collapseRider,
+                               let member = CorridorLaneSchedule.drawnMember(
+                                   membersByKey(publicKey),
+                                   journeyID: key.journeyID,
+                                   boundary: previous!,
+                                   seed: seed
+                               ) {
+                                // The retired rule read the drawn member's own
+                                // ride ending here, whether or not that member
+                                // was one of the leavers.
+                                drawn = (
+                                    id: member,
+                                    length: endStretchLength(member)
+                                )
+                            }
+                            return CorridorLaneSchedule.departingRideLength(
+                                collapseRider,
+                                rankedLeavers: leavers(publicKey),
+                                drawnLeaver: drawn
+                            )
+                        }
                         func longestStretch(_ cid: Int) -> Double {
                             guard let stretches = presence[cid] else {
                                 return 0
@@ -1839,8 +2121,7 @@ public enum CorridorLaneSchedule {
                                 .max() ?? 0
                         }
                         let departedLength = departedKeys
-                            .compactMap { memberIDByKey[$0] }
-                            .map { endStretchLength($0) }
+                            .map { riderLength($0) }
                             .max() ?? 0
                         let survivorLength = presence
                             .filter {
@@ -1868,6 +2149,10 @@ public enum CorridorLaneSchedule {
                                 for slotKey in slots.keys {
                                     slots[slotKey]! -= median
                                 }
+                                audit?.noteFire(
+                                    shiftLanes: abs(median)
+                                        / LaneScheduleConstants.laneSpacing
+                                )
                             }
                         }
                     }

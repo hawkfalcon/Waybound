@@ -796,8 +796,8 @@ final class TransitViewModel: NSObject, ObservableObject {
                 by: { journeyDirectionIdentity(for: $0.trip) }
             )
             var representativeSelections = representativesByDirection.values
-                .compactMap { $0.min(by: { $0.departureDate < $1.departureDate }) }
-                .sorted { $0.departureDate < $1.departureDate }
+                .compactMap { $0.min(by: { departureSelectionPrecedes($0, $1) }) }
+                .sorted { departureSelectionPrecedes($0, $1) }
                 .prefix(3)
                 .map { $0 }
             let selectedTripIDs = Set(
@@ -807,7 +807,7 @@ final class TransitViewModel: NSObject, ObservableObject {
                 .filter { representative in
                     !selectedTripIDs.contains(representative.trip.id)
                 }
-                .sorted { $0.departureDate < $1.departureDate }
+                .sorted { departureSelectionPrecedes($0, $1) }
                 .prefix(max(0, 3 - representativeSelections.count))
             representativeSelections.append(contentsOf: fallbackSelections)
             selections.append(contentsOf: representativeSelections)
@@ -951,6 +951,27 @@ final class TransitViewModel: NSObject, ObservableObject {
             },
             busyDepartureWindowMinutes
         )
+    }
+
+    /// Total order over departure selections. Departure date alone is not a
+    /// strict weak ordering -- equal timestamps tie -- and the selections arrive
+    /// from `Dictionary(grouping:).values`, whose sequence differs on every
+    /// launch because Swift reseeds its hasher per process. Swift's sort is not
+    /// stable, so `.prefix(3)` could spend the trip-detail budget on a different
+    /// three selections each run, and which journeys appeared on the map changed
+    /// between launches on identical data. Realtime first, then the unique trip
+    /// id, closes every tie.
+    private func departureSelectionPrecedes(
+        _ lhs: JourneyDepartureSelection,
+        _ rhs: JourneyDepartureSelection
+    ) -> Bool {
+        if lhs.departureDate != rhs.departureDate {
+            return lhs.departureDate < rhs.departureDate
+        }
+        if lhs.departureIsRealtime != rhs.departureIsRealtime {
+            return lhs.departureIsRealtime
+        }
+        return lhs.trip.id < rhs.trip.id
     }
 
     private func journeyDirectionIdentity(
