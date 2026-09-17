@@ -103,6 +103,8 @@ final class LaneScheduleGoldenTests: XCTestCase {
         let twelveX = identity(12, "12X")
         let seventeen = identity(17, "17")
         let eightyFiveX = identity(85, "85X")
+        let one = identity(1, "1")
+        let four = identity(4, "4")
         XCTAssertTrue(
             CorridorLaneSchedule.laneComesBefore(five, twelveX),
             "numeric route order: 5 before 12X"
@@ -116,6 +118,18 @@ final class LaneScheduleGoldenTests: XCTestCase {
         )
         XCTAssertFalse(
             CorridorLaneSchedule.laneComesBefore(eightyFiveX, five)
+        )
+        // Downtown Chapala (Carrillo-Anapamu): rider-verified order is
+        // 80/92 outside, 24X/12X, 3, 7, 1 then 4, 17, 85X, 5. Numerically
+        // 1 < 4, so generic numeric order would put 1 outside 4, forcing
+        // an extra cross to sit next to 7 (both freeway-bound). Pin 4 before
+        // 1 so ladder reads 80,7,1,4,17,5.
+        XCTAssertTrue(
+            CorridorLaneSchedule.laneComesBefore(four, one),
+            "downtown Chapala: 4 before 1 so 1 sits next to 7"
+        )
+        XCTAssertFalse(
+            CorridorLaneSchedule.laneComesBefore(one, four)
         )
         // Same route number, different agency: agency breaks the tie.
         let otherAgency = identity(2, "5", agency: "ZZ Transit")
@@ -241,7 +255,14 @@ final class LaneScheduleGoldenTests: XCTestCase {
             var verdict = "OK"
             var isFailure = false
             if Self.pinnedFixtures.contains(name) {
-                if agree < 0.99 || offShare > 0.005 || refShare > 0.01 {
+                // 2026-09-17: pinned fixtures were exported before the
+                // downtown Chapala fix (pin 4 before 1). Routes 1 and 4
+                // share ~103 segments downtown (0.85% of rows); their
+                // offsets swap by one lane. Allow up to 1.5% offset share
+                // for that intentional change while still catching larger
+                // regressions.
+                let pinnedOffsetAllowance = 0.015
+                if agree < 0.99 || offShare > pinnedOffsetAllowance || refShare > 0.01 {
                     verdict = "RED: pinned fixture diverged"
                     isFailure = true
                     failures.append(
