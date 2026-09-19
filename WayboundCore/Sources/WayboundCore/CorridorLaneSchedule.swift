@@ -1196,6 +1196,44 @@ public enum CorridorLaneSchedule {
             return nil
         }
 
+        /// Full exit vector for cid at outSi, for generic ordering of
+        /// simultaneous leavers: two routes that peel at the same point
+        /// but head to different places (freeway west vs south) should
+        /// be ordered by where they go, not by numeric route number.
+        /// Returns the net displacement from the origin to the point
+        /// after walking exitLookahead (or 2.5× at corridor end), in
+        /// projected units. Used only as a tie-break when outSi is equal.
+        func exitVector(_ cid: Int, _ outSi: Int) -> (x: Double, y: Double)? {
+            var probe = max(s0, min(outSi, s1) - 1)
+            var match: CorridorMembership.CandidateLocation?
+            while probe >= s0 {
+                if let candidate = matched(cid, probe) {
+                    match = candidate
+                    break
+                }
+                probe -= 1
+            }
+            guard let match, let member = memberStrand(match, cid) else { return nil }
+            let originIndex = match.segmentIndex
+            guard originIndex < member.points.count - 1 else { return nil }
+            let lookahead = LaneScheduleConstants.exitLookahead
+                * (min(outSi, s1) >= s1 ? 2.5 : 1.0)
+            var forward = originIndex
+            var travelled = 0.0
+            var netX = 0.0
+            var netY = 0.0
+            while forward < member.points.count - 1 && travelled < lookahead {
+                travelled += member.points[forward]
+                    .distance(to: member.points[forward + 1])
+                    * strand.metersPerUnit
+                forward += 1
+                netX = member.points[forward].x - member.points[originIndex].x
+                netY = member.points[forward].y - member.points[originIndex].y
+            }
+            guard travelled > 1 else { return nil }
+            return (netX, netY)
+        }
+
         /// Ladder side for a straight-continuer where the corridor itself
         /// turns: the spine bends off the pre-turn line while this strand
         /// stays on it (it goes straight through the junction the corridor
@@ -1854,6 +1892,26 @@ public enum CorridorLaneSchedule {
                         let secondOut = min($1.outSi, s1)
                         if firstOut != secondOut {
                             return firstOut < secondOut
+                        }
+                        // Generic: simultaneous leavers ordered by where they
+                        // actually go after the split, not by numeric route.
+                        // Two routes peeling at the same point but heading
+                        // west (freeway) vs south should be ordered by exit
+                        // angle so same-direction routes stay adjacent and
+                        // crossings are minimized. This is what makes
+                        // downtown Chapala 1 next to 7 (both freeway west)
+                        // instead of 4 next to 7, without hardcoding 1/4.
+                        if let v0 = self.exitVector($0.journeyID, $0.outSi),
+                           let v1 = self.exitVector($1.journeyID, $1.outSi) {
+                            let a0 = atan2(v0.y, v0.x)
+                            let a1 = atan2(v1.y, v1.x)
+                            // Small angle difference = same direction; sort
+                            // by angle to keep same-direction routes together.
+                            // If angles differ by > ~10°, angle decides;
+                            // otherwise fall through to numeric.
+                            if abs(a0 - a1) > 0.17 {
+                                return a0 < a1
+                            }
                         }
                         guard let first = identities[$0.journeyID],
                               let second = identities[$1.journeyID]
