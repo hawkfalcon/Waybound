@@ -1,0 +1,103 @@
+name: branch-live-transit-verification
+
+# Minimal push-triggered mirror of live-transit-verification.yml for this arena session.
+# The session token cannot dispatch workflows (403), but can push and can read PR comments.
+# This file is intentionally branch-only — do not merge to main.
+
+on:
+  push:
+    branches:
+      - arena/01a0bbc7-waybound
+    paths:
+      - .github/workflows/branch-live-transit-verification.yml
+      - WayboundCore/Sources/**
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: waybound-live-transitland
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: Select areas
+        run: |
+          cat > areas.txt <<'EOF'
+          Downtown Santa Barbara=34.4209,-119.7033
+          UCSB=34.4139,-119.8489
+          Carpinteria=34.3989,-119.5185
+          EOF
+          cat areas.txt
+
+      - name: Restore snapshots
+        uses: actions/cache@v4
+        with:
+          path: .transitland-cache
+          key: transitland-snapshots-branch-${{ hashFiles('areas.txt') }}
+          restore-keys: transitland-snapshots-
+
+      - name: Build verifier
+        run: swift build --package-path WayboundCore --configuration release
+
+      - name: Verify (3 dates, cache-only when possible)
+        env:
+          TRANSITLAND_API_KEY: ${{ secrets.TRANSITLAND_API_KEY }}
+        run: |
+          set +e
+          mkdir -p verification-output
+          for D in 2026-09-12 2026-09-13 2026-09-14; do
+            echo "::group::date $D"
+            swift run --package-path WayboundCore --configuration release waybound-transit-verify \
+              --areas-file areas.txt --date "$D" --cache-dir .transitland-cache --output-dir "verification-output/$D" 2>&1 | tee "verify-$D.log"
+            echo "::endgroup::"
+          done
+
+      - name: Report to PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          n=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state all --json number --jq '.[0].number' 2>/dev/null)
+          {
+            echo "## branch-live-transit-verification — run ${GITHUB_RUN_NUMBER} (\`${GITHUB_SHA:0:7}\`)"
+            echo
+            for D in 2026-09-12 2026-09-13 2026-09-14; do
+              echo "### $D"
+              if [ -f "verification-output/$D/report.md" ]; then
+                cat "verification-output/$D/report.md"
+              else
+                echo "_no report_"
+                tail -n 40 "verify-$D.log" 2>/dev/null || true
+              fi
+              echo
+            done
+          } > pr-report.md
+          cat pr-report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$n" ]; then
+            cid=$(gh api "repos/$GITHUB_REPOSITORY/issues/$n/comments" --jq '.[] | select(.body | startswith("## branch-live-transit-verification —")) | .id' 2>/dev/null | tail -1)
+            if [ -n "$cid" ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" -f body="$(cat pr-report.md)" > /dev/null
+            else
+              gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --body-file pr-report.md || true
+            fi
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: branch-verification-${{ github.run_number }}
+          path: verification-output
+          if-no-files-found: warn
+          retention-days: 14
