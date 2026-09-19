@@ -1,14 +1,39 @@
+# Secrets
 Secrets.plist
+
+# macOS
+.DS_Store
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+project.xcworkspace/xcuserdata/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Python
 __pycache__/
+*.pyc
+.venv*/
 tools/replay/out/
 
-# Swift package build artifacts (WayboundCore)
+# Swift package build artifacts
 WayboundCore/.build/
+.build/
 
-# Live Transitland verifier output (raw snapshots stay outside Git)
+# Live Transitland verifier output
 .transitland-cache/
 verification-output/
 areas.txt
 
-# Local tooling for the lane-visualization script (matplotlib only)
-.venv*/
+# Lane diagnostics exports at repo root (device dumps)
+waybound-lanes-*.json
+*.orig
+
+# Generated lane visualization images
+tools/lane-visualization/*.png
+tools/lane-visualization/*.svg
+tools/lane-visualization/real-lines.png
