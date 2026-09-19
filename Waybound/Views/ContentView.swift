@@ -542,12 +542,12 @@ private struct JourneyOverviewSheet: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Where these routes go")
                         .font(
-                            .system(size: 20, weight: .black, design: .rounded)
+                            .system(size: 22, weight: .black, design: .rounded)
                             .width(.condensed)
                         )
                         .foregroundStyle(WayboundPalette.ink)
                     Text(contextDescription)
-                    .font(.system(size: 10.5, weight: .regular, design: .rounded))
+                    .font(.system(size: 11.5, weight: .regular, design: .rounded))
                     .foregroundStyle(WayboundPalette.ink.opacity(0.62))
                     .lineLimit(1)
                 }
@@ -674,15 +674,15 @@ private struct JourneyRow: View {
             // reading — the card visually *is* a piece of the route.
             RoundedRectangle(cornerRadius: 2, style: .continuous)
                 .fill(journey.route.color)
-                .frame(width: 3.5)
+                .frame(width: 4)
                 .padding(.vertical, 2)
 
-            RouteBadge(route: journey.route, size: 34)
+            RouteBadge(route: journey.route, size: 36)
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(journey.destinationName)
-                        .font(.system(size: 14.5, weight: .bold, design: .rounded))
+                        .font(.system(size: 15.5, weight: .bold, design: .rounded))
                         .foregroundStyle(WayboundPalette.ink)
                         .lineLimit(1)
                     Spacer(minLength: 3)
@@ -690,13 +690,13 @@ private struct JourneyRow: View {
                     // is what riders plan around; duration stays for comparing
                     // options against each other.
                     Text("Arrive \(arrivalTimeText)")
-                        .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
                         .foregroundStyle(journey.route.color)
                 }
 
                 HStack(spacing: 4) {
                     Text("Bus in \(journey.departureMinutesFromNow)")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                         .foregroundStyle(journey.route.color)
                     TimingChip(icon: "figure.walk", label: "walk", minutes: journey.walkMinutes)
                     TimingChip(icon: "hourglass", label: "wait", minutes: journey.waitMinutes)
@@ -708,7 +708,7 @@ private struct JourneyRow: View {
                         ScheduledBadge()
                     } else {
                         Text("\(journey.totalMinutes) min")
-                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                             .foregroundStyle(WayboundPalette.ink.opacity(0.55))
                     }
                 }
@@ -738,17 +738,17 @@ private struct UnavailableRouteRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            RouteBadge(route: route, size: 32)
+            RouteBadge(route: route, size: 34)
             VStack(alignment: .leading, spacing: 1) {
                 Text(route.fullDisplayName)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .font(.system(size: 13.5, weight: .semibold, design: .rounded))
                 Text(route.agencyName)
-                    .font(.system(size: 10.5, design: .rounded))
+                    .font(.system(size: 11, design: .rounded))
                     .foregroundStyle(.secondary)
             }
             Spacer()
             Text("Later")
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                 .foregroundStyle(.secondary)
         }
         .foregroundStyle(WayboundPalette.ink.opacity(0.72))
@@ -795,14 +795,14 @@ private struct JourneyDetailSheet: View {
                 }
                 .accessibilityLabel("Back to all destinations")
 
-                RouteBadge(route: journey.route, size: 38)
+                RouteBadge(route: journey.route, size: 40)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(journey.destinationName)
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                        .font(.system(size: 19, weight: .bold, design: .rounded))
                         .foregroundStyle(WayboundPalette.ink)
                         .lineLimit(1)
                     Text(timingDescription)
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                         .foregroundStyle(journey.route.color)
                 }
                 Spacer()
@@ -851,7 +851,7 @@ private struct JourneyDetailSheet: View {
                         }
                     } label: {
                         Label(option.title, systemImage: option.icon)
-                            .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
                             .foregroundStyle(
                                 prototype == option ? Color.white : WayboundPalette.ink
                             )
@@ -909,7 +909,7 @@ private struct JourneyDetailSheet: View {
                     Image(systemName: "map.fill")
                         .foregroundStyle(journey.route.color)
                     Text("All \(max(0, journey.stops.count - 1)) downstream stops are now labeled on the map. Other routes step aside; the flagship stays pinned.")
-                        .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
                         .foregroundStyle(WayboundPalette.ink.opacity(0.72))
                     Spacer(minLength: 0)
                 }
@@ -929,37 +929,37 @@ private struct StopLadderRow: View {
             VStack(spacing: 0) {
                 Rectangle()
                     .fill(stop.isBoarding ? Color.clear : routeColor.opacity(0.34))
-                    .frame(width: 2, height: 8)
+                    .frame(width: 2.5, height: 8)
                 ZStack {
                     Circle()
                         .fill(stop.isFlagship ? routeColor : WayboundPalette.cream)
                         .frame(
-                            width: stop.isFlagship ? 18 : 12,
-                            height: stop.isFlagship ? 18 : 12
+                            width: stop.isFlagship ? 20 : 13,
+                            height: stop.isFlagship ? 20 : 13
                         )
                     Circle()
-                        .stroke(routeColor, lineWidth: 2)
+                        .stroke(routeColor, lineWidth: 2.5)
                         .frame(
-                            width: stop.isFlagship ? 18 : 12,
-                            height: stop.isFlagship ? 18 : 12
+                            width: stop.isFlagship ? 20 : 13,
+                            height: stop.isFlagship ? 20 : 13
                         )
                     if stop.isFlagship {
                         Image(systemName: "star.fill")
-                            .font(.system(size: 7))
+                            .font(.system(size: 8))
                             .foregroundStyle(.white)
                     }
                 }
                 Rectangle()
                     .fill(routeColor.opacity(0.34))
-                    .frame(width: 2, height: 26)
+                    .frame(width: 2.5, height: 26)
             }
-            .frame(width: 20)
+            .frame(width: 22)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(stop.name)
                     .font(
                         .system(
-                            size: 13,
+                            size: 14,
                             weight: stop.isFlagship ? .bold : .medium,
                             design: .rounded
                         )
@@ -968,17 +968,17 @@ private struct StopLadderRow: View {
                     .lineLimit(2)
                 if stop.isBoarding {
                     Text("Board here")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                         .foregroundStyle(routeColor)
                 } else if stop.isFlagship {
                     Text("Flagship destination")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                         .foregroundStyle(routeColor)
                 }
             }
             Spacer()
             Text(stop.isBoarding ? "now" : "+\(stop.minutesFromBoarding) min")
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                 .foregroundStyle(stop.isFlagship ? routeColor : WayboundPalette.ink.opacity(0.58))
                 .padding(.top, 1)
         }
@@ -1032,12 +1032,12 @@ private struct TimingChip: View {
     var body: some View {
         HStack(spacing: 2) {
             Image(systemName: icon)
-                .font(.system(size: 7.5, weight: .semibold))
+                .font(.system(size: 8.5, weight: .semibold))
             Text("\(label) \(minutes)")
-                .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
+                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
         }
         .foregroundStyle(WayboundPalette.ink.opacity(0.68))
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 5)
         .padding(.vertical, 3)
         .background(WayboundPalette.ink.opacity(0.055))
         .clipShape(Capsule())
@@ -1052,9 +1052,9 @@ private struct ScheduledBadge: View {
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: "clock")
-                .font(.system(size: 8, weight: .semibold))
+                .font(.system(size: 8.5, weight: .semibold))
             Text("Sched")
-                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
         }
         .foregroundStyle(WayboundPalette.ink.opacity(0.55))
         .accessibilityLabel("Scheduled estimate, no live data")

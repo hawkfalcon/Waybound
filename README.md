@@ -57,7 +57,11 @@ two latitudes.
 Shared-street rendering keeps two distance gates apart. Corridor *membership*
 (who gets a lane in the ribbon) accepts partners up to 20 m of centerline
 separation, but centerline *adoption* — projecting a member's vertices onto
-the dominant route's shape — is capped at 6 m. Divided carriageways
+the dominant route's shape — is capped at 8 m for direct projection;
+members whose sticky reference is locally matched then take the
+street-anchor pull toward the reference line (up to 30 m), which closes
+endpoint and corner residuals against same-roadway references.
+Divided carriageways
 (Hollister, El Colegio, Calle Real) and freeway ramp braids sit 12–20 m apart,
 and snapping across that gap rendered the 9 loop and the 12x/24x expresses as
 tapered sideways detours onto the wrong side of the street. The correction a
@@ -65,6 +69,11 @@ lane adopts is also *rate*-limited (0.08 m per meter of street, smoothed from
 both ends): where the corridor's preferred reference changes — route 6 turns
 off Chapala at Sola, so the 12x/24x lane re-references there — the bounded
 correction used to arrive within a vertex or two as a one-sided diagonal jog.
+Finally the drawn centers are smoothed laterally along shared runs (±3
+vertices, σ ≈ 30 m, fading outside corridors and standing down near sharp
+turns): independent GTFS sampling wobble would otherwise let adjacent wide
+lanes touch, and the lateral-only pass converges corridor members onto one
+smooth spine without cutting corners.
 
 Stop-connector cleanup deletes an excursion only when the street provably
 continues straight through it: both span ends sit on each other's line of
