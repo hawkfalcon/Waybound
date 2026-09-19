@@ -25,21 +25,13 @@
   figcaption { font-size: 13.5px; color: #57606a; margin-top: 9px; max-width: 92ch; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
           gap: 22px; }
-  table { border-collapse: collapse; font-size: 14px; margin: 10px 0 6px; }
-  th, td { text-align: left; padding: 6px 16px 6px 0; border-bottom: 1px solid #eceef0; }
-  th { color: #57606a; font-weight: 600; font-size: 12.5px; text-transform: uppercase;
-       letter-spacing: .04em; }
-  td.num { font-variant-numeric: tabular-nums; }
   .note { font-size: 13px; color: #57606a; max-width: 92ch; }
-  .pill { background: #f1f3f5; border-radius: 999px; padding: 2px 9px; font-size: 12.5px;
-          color: #444d56; }
   code { background: #f1f3f5; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
   @media (prefers-color-scheme: dark) {
     body { background: #16191d; color: #e6e9ec; }
-    h2, figcaption, .note, .lede, th { color: #9aa4ae; }
+    h2, figcaption, .note, .lede { color: #9aa4ae; }
     img { border-color: #2b3137; }
-    th, td { border-color: #262c33; }
-    .pill, code { background: #23282e; color: #cfd5da; }
+    code { background: #23282e; color: #cfd5da; }
   }
 </style>
 
@@ -49,62 +41,28 @@
   offsets (<code>tools/replay/data/waybound-lanes-1789254859.json</code> — 17 journeys,
   South Coast). Drawn with the project's own measurement convention
   (<code>LaneHarness.ribbon</code>, <code>screenPointsPerMapPoint = 2</code>), where one lane of
-  4.2 points spans <strong>8.4 m</strong> of ground — so these are the crossings the package's
-  own gates count, not a prediction of a particular map zoom.
+  4.2 points spans <strong>8.4 m</strong> of ground.
+</p>
+
+<p class="note">
+  Images are generated artifacts (gitignored). Run
+  <code>python3 tools/lane-visualization/draw_lanes.py</code> to produce
+  <code>real-lines.png</code> and zoom windows. The script requires matplotlib only.
 </p>
 
 <div class="legend">
-  <span><span class="swatch" style="background:#c0392b"></span>in-bundle crossing — an ordering artifact (84)</span>
-  <span><span class="swatch" style="background:#f1a33c"></span>any other crossing — junction merges land here (126 total)</span>
+  <span><span class="swatch" style="background:#c0392b"></span>in-bundle crossing — ordering artifact</span>
+  <span><span class="swatch" style="background:#f1a33c"></span>any other crossing — junction merges</span>
 </div>
 
-<figure>
-  <img src="real-lines-web.png" alt="All 17 lane ribbons of the South Coast network with every crossing marked">
-  <figcaption>
-    The whole network fits one panel because the drawing uses the gates' own scale.
-    Almost all of the conflict is in one place: the downtown Santa Barbara core,
-    which is zoom 1 below.
-  </figcaption>
-</figure>
-
-<h2>The three hotspots</h2>
-<div class="grid">
-  <figure>
-    <img src="zoom1-downtown.png" alt="Downtown Santa Barbara lane ribbons and crossings">
-    <figcaption><strong>Zoom 1 — Downtown Santa Barbara.</strong> 26 crossings, 24 in-bundle.
-      Routes <strong>80 and 92</strong> cross each other eleven times inside a single shared
-      run; <strong>17 &amp; 5</strong> eight times, <strong>12X &amp; 24X</strong> seven.
-      Three pairs account for 26 of the 84 in-bundle crossings network-wide.</figcaption>
-  </figure>
-  <figure>
-    <img src="zoom2.png" alt="Lane ribbons and crossings 3.5 km from downtown">
-    <figcaption><strong>Zoom 2 — 3.5 km from downtown.</strong> 5 crossings, all in-bundle:
-      two corridors that should stay parallel swap sides.</figcaption>
-  </figure>
-  <figure>
-    <img src="zoom3.png" alt="Lane ribbons and crossings 2 km from UCSB">
-    <figcaption><strong>Zoom 3 — 2 km from UCSB.</strong> 5 crossings, all in-bundle.
-      A large network crosses two ribbons that are sharing a run.</figcaption>
-  </figure>
-</div>
-
-<h2>What this means for the decision</h2>
+<h2>What this means</h2>
 <p>
   A crossing is a proper intersection of two drawn ribbons. An <em>in-bundle</em> crossing is
   one where both ribbons are stacked and well inside their shared run — an ordering artifact
-  a subway-style corridor must not have, unlike a stub merge at a junction, which is inherent.
+  a subway-style corridor must not have, unlike a stub merge at a junction.
 </p>
 <p>
-  A lane-order rule does not move streets; it moves which lane each route occupies. So the
-  question the rule choice answers is exactly the one this picture asks: <strong>should
-  routes 80 and 92 keep trading sides eleven times downtown, or should one of them hold its
-  lane?</strong> The crossing counts CI measures are trying to answer that from the side —
-  this is the same question drawn.
-</p>
-<p class="note">
-  Measured on this drawing: <strong>126 crossings, 84 in-bundle</strong>, worst pairs
-  80&amp;92 (11), 17&amp;5 (8), 12X&amp;24X (7). Reproduce with
-  <code>python3 tools/lane-visualization/draw_lanes.py</code> (matplotlib only).
-  This is today's arrangement, not a per-rule redraw: the CI report carries lane orders
-  but not geometry.
+  A lane-order rule does not move streets; it moves which lane each route occupies.
+  The crossing counts CI measures answer: <strong>should routes 80 and 92 keep trading sides
+  eleven times downtown, or should one hold its lane?</strong>
 </p>

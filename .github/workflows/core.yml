@@ -2,11 +2,12 @@ name: core
 
 on:
   push:
-    branches: [main, arena/01a05bbd-waybound, arena/01a093c3-waybound, arena/01a0a355-waybound]
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,10 +15,6 @@ concurrency:
 
 jobs:
   test:
-    # The pure core (WayboundCore SPM package): no Apple frameworks, so it
-    # builds and tests on Linux — free, fast, no macOS queue. The golden
-    # tests recompute the lane membership scan over every committed export
-    # fixture and hold it to the device's own schedule.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,91 +22,8 @@ jobs:
         with:
           swift-version: "6.0"
 
-      # `swift test` builds only the library and the test target, so a broken
-      # executable slips straight through: waybound-transit-verify did not
-      # compile on main at 4c94c77 and nothing caught it, which meant
-      # live-transit-verification.yml could never have succeeded. `swift build`
-      # with no --product builds every target in the package, executables
-      # included, so this is the guard for the tools CI actually runs.
       - name: swift build (all products)
-        run: |
-          set -o pipefail
-          swift build --package-path WayboundCore 2>&1 | tee build.log
+        run: swift build --package-path WayboundCore
 
       - name: swift test
-        run: |
-          set -o pipefail
-          swift test --package-path WayboundCore 2>&1 | tee test.log
-
-      # The agent's sandbox cannot reach the Actions log/artifact hosts, but
-      # it CAN read PR comments through the GitHub API — so the branch's PR
-      # comment thread is the report channel for the iterate-from-CI loop.
-      # (checkout@v4 leaves a detached HEAD, so `gh pr view` cannot infer the
-      # branch — resolve it explicitly from the event env.)
-      - name: report
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
-          n=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" \
-                --state open --json number --jq '.[0].number' 2>&1 || true)
-          case "$n" in
-            ''|*[!0-9]*) n=$(gh pr list --repo "$GITHUB_REPOSITORY" \
-                              --head "$branch" --state all \
-                              --json number --jq '.[0].number' 2>/dev/null || true);;
-          esac
-          {
-            echo "## core — run ${GITHUB_RUN_NUMBER} (\`${GITHUB_SHA:0:7}\`, branch ${branch})"
-            echo
-            echo '```'
-            grep 'SCAN-GOLDEN' test.log || echo "(no scan-golden lines)"
-            echo '```'
-            echo
-            echo '```'
-            grep 'SCHED-GOLDEN' test.log | head -70 || echo "(no sched-golden lines)"
-            echo '```'
-            echo
-            echo '```'
-            grep 'LAYOUT-GOLDEN' test.log | head -40 || echo "(no layout-golden lines)"
-            echo '```'
-            echo
-            echo '```'
-            grep -E 'LANE-CHECK|LANE-FUZZ' test.log | head -50 || true
-            echo '```'
-            echo
-            if grep -q 'error:' build.log test.log 2>/dev/null; then
-              echo "### compiler/test errors"
-              echo '```'
-              grep -h 'error:' build.log test.log 2>/dev/null | sort -u | head -30
-              echo '```'
-            fi
-            if grep -q 'Fatal error' test.log; then
-              echo "### runtime crash — last test cases seen"
-              echo '```'
-              grep -B2 'Fatal error' test.log | tail -8
-              echo '```'
-              echo '```'
-              grep 'Test Case' test.log | tail -6
-              echo '```'
-            fi
-            echo '```'
-            tail -n 4 test.log
-            echo '```'
-          } > report.md
-          cat report.md >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "$n" ]; then
-            # edit OUR last comment (header-matched) instead of --edit-last,
-            # so the core and lanes workflows never overwrite each other
-            cid=$(gh api "repos/$GITHUB_REPOSITORY/issues/$n/comments" \
-                    --jq '.[] | select(.body | startswith("## core —")) | .id' 2>/dev/null | tail -1)
-            if [ -n "$cid" ]; then
-              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" \
-                -f body="$(cat report.md)" > /dev/null
-            else
-              gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --body-file report.md \
-                || echo "(could not post PR comment)"
-            fi
-          else
-            echo "(no PR found for branch ${branch}; report left in the step summary)"
-          fi
+        run: swift test --package-path WayboundCore

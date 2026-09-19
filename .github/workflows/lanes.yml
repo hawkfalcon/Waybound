@@ -2,11 +2,12 @@ name: lanes
 
 on:
   push:
-    branches: [main, arena/01a05bbd-waybound, arena/01a093c3-waybound, arena/01a0a355-waybound]
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,11 +15,6 @@ concurrency:
 
 jobs:
   harness:
-    # The lane harness gates, now plain Swift tests in WayboundCore (the
-    # Python mirrors are gone). lane_check renders main vs scheduled
-    # ribbons on the downtown scenarios and gates crossings/wobble/
-    # separation/kink; lane_fuzz runs 120 seeded random corridors and
-    # gates problem-seed count against its pinned baseline.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,67 +23,7 @@ jobs:
           swift-version: "6.0"
 
       - name: lane check (scenario gates)
-        continue-on-error: true
-        run: |
-          swift test --package-path WayboundCore \
-            --filter LaneCheckTests 2>&1 | tee check.log || true
+        run: swift test --package-path WayboundCore --filter LaneCheckTests
 
       - name: scheduler fuzz (seeded, pinned baseline)
-        continue-on-error: true
-        run: |
-          swift test --package-path WayboundCore \
-            --filter LaneFuzzTests 2>&1 | tee fuzz.log || true
-
-      - name: report
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
-          n=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" \
-                --state open --json number --jq '.[0].number' 2>&1 || true)
-          case "$n" in
-            ''|*[!0-9]*) n=$(gh pr list --repo "$GITHUB_REPOSITORY" \
-                              --head "$branch" --state all \
-                              --json number --jq '.[0].number' 2>/dev/null || true);;
-          esac
-          touch check.log fuzz.log
-          {
-            echo "## lanes — run ${GITHUB_RUN_NUMBER} (\`${GITHUB_SHA:0:7}\`, branch ${branch})"
-            echo
-            echo '```'
-            grep -hE 'LANE-CHECK|LANE-FUZZ|PROBE|PIPELINE' check.log fuzz.log \
-              | head -140 || echo "(no lane lines)"
-            echo '```'
-            echo
-            echo '```'
-            grep -h 'Test Case' check.log | tail -12
-            echo '```'
-            echo
-            if grep -h 'error:' check.log fuzz.log | head -1 > /dev/null; then
-              echo "### compiler/test errors"
-              echo '```'
-              grep -h 'error:' check.log fuzz.log | sort -u | head -30
-              echo '```'
-            fi
-            if grep -h 'Fatal error' check.log fuzz.log | head -1 > /dev/null; then
-              echo "### runtime crash (raw neighbourhood)"
-              echo '```'
-              grep -hA30 -B8 'Fatal error' check.log fuzz.log | head -60
-              echo '```'
-            fi
-          } > report.md
-          cat report.md >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "$n" ]; then
-            cid=$(gh api "repos/$GITHUB_REPOSITORY/issues/$n/comments" \
-                    --jq '.[] | select(.body | startswith("## lanes —")) | .id' 2>/dev/null | tail -1)
-            if [ -n "$cid" ]; then
-              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" \
-                -f body="$(cat report.md)" > /dev/null
-            else
-              gh pr comment "$n" --repo "$GITHUB_REPOSITORY" --body-file report.md \
-                || echo "(could not post PR comment)"
-            fi
-          else
-            echo "(no PR found for branch ${branch}; report left in the step summary)"
-          fi
+        run: swift test --package-path WayboundCore --filter LaneFuzzTests
