@@ -2,7 +2,7 @@ name: core
 
 on:
   push:
-    branches: [main, arena/01a0bbc7-waybound]
+    branches: [main]
   pull_request:
     branches: [main]
 
