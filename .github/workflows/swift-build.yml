@@ -2,7 +2,11 @@ name: swift-build
 
 on:
   push:
-    branches: [main, arena/01a05bbd-waybound, arena/01a093c3-waybound]
+    branches: [main, arena/01a05bbd-waybound, arena/01a093c3-waybound, arena/01a0a355-waybound]
+
+permissions:
+  contents: read
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,14 +34,68 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
-            build 2>&1 | xcbeautify || \
+            build 2>&1 | tee xcodebuild.log | xcbeautify || \
           xcodebuild \
             -project Waybound.xcodeproj \
             -scheme Waybound \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
-            build
+            build 2>&1 | tee -a xcodebuild.log
+
+      # This sandbox cannot reach the Actions log/artifact hosts, so like
+      # core.yml and lanes.yml the result is published to the branch's PR
+      # comment thread, which is readable through api.github.com.
+      - name: Report to PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          n=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" \
+                --state all --json number --jq '.[0].number' 2>/dev/null)
+          result=$(grep -E 'BUILD SUCCEEDED|BUILD FAILED|TEST SUCCEEDED|TEST FAILED' \
+                     xcodebuild.log 2>/dev/null | sort -u | head -5)
+          errors=$(grep -E 'error:' xcodebuild.log 2>/dev/null \
+                     | sed 's#.*/Waybound/##' | sort -u | head -40)
+          touched=$(grep -E 'warning:|error:' xcodebuild.log 2>/dev/null \
+                     | grep -E 'TransitViewModel|JourneyScoring' \
+                     | sed 's#.*/Waybound/##' | sort -u | head -20)
+          {
+            echo "## swift-build — run ${GITHUB_RUN_NUMBER} (\`${GITHUB_SHA:0:7}\`, branch ${branch})"
+            echo
+            echo "### result"
+            echo '```'
+            echo "${result:-(no build result line found)}"
+            echo '```'
+            echo
+            echo "### compiler errors"
+            echo '```'
+            echo "${errors:-(none)}"
+            echo '```'
+            echo
+            echo "### diagnostics in the files this branch touched"
+            echo '```'
+            echo "${touched:-(none)}"
+            echo '```'
+          } > build-report.md
+          cat build-report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$n" ]; then
+            cid=$(gh api "repos/$GITHUB_REPOSITORY/issues/$n/comments" \
+                    --jq '.[] | select(.body | startswith("## swift-build —")) | .id' \
+                    2>/dev/null | tail -1)
+            if [ -n "$cid" ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" \
+                -f body="$(cat build-report.md)" > /dev/null \
+                && echo "updated PR #$n comment $cid"
+            else
+              gh pr comment "$n" --repo "$GITHUB_REPOSITORY" \
+                --body-file build-report.md && echo "posted to PR #$n"
+            fi
+          else
+            echo "(no PR for branch ${branch}; report left in the step summary)"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: failure()

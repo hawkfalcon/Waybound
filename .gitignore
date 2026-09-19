@@ -9,3 +9,6 @@ WayboundCore/.build/
 .transitland-cache/
 verification-output/
 areas.txt
+
+# Local tooling for the lane-visualization script (matplotlib only)
+.venv*/
