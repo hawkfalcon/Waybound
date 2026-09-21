@@ -2673,6 +2673,7 @@ struct WayboundMapView: UIViewRepresentable {
                         (index > 0 && !tapSharedSegments[index - 1])
                         || (index + 1 < tapSegmentCount
                             && !tapSharedSegments[index + 1])
+                    let isBoundaryJoint = isShared && touchesIsolatedNeighbor
                     if !isShared || hasIsolatedCoverage || touchesIsolatedNeighbor {
                         considerSegment(
                             from: lanePoints[index],
@@ -2688,7 +2689,7 @@ struct WayboundMapView: UIViewRepresentable {
                     }
                     let ownsTrunk = laneSamples.trunkOwnerVertices[index]
                         && laneSamples.trunkOwnerVertices[index + 1]
-                    if ownsTrunk, trunkProgress > 0.05 {
+                    if ownsTrunk, !isBoundaryJoint, trunkProgress > 0.05 {
                         considerSegment(
                             from: laneSamples.points[index],
                             to: laneSamples.points[index + 1]
@@ -2856,19 +2857,28 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
         // interior. Its isolated neighbors draw at full strength at every
         // zoom; if the joint faded with the detail cross-fade instead, each
         // turning line would break into a little X at mid-zoom. Keep
-        // boundary joints fully drawn.
+        // boundary joints fully drawn on their own lane, and keep the
+        // corridor trunk off them: the trunk's single centerline cannot
+        // represent each route's own turn, so drawing both ghosts the
+        // corner.
+        let boundaryJointSegments = (0..<segmentCount).map { index in
+            sharedSegments[index]
+                && ((index > 0 && !sharedSegments[index - 1])
+                    || (index + 1 < segmentCount
+                        && !sharedSegments[index + 1]))
+        }
         let isolatedSegments = (0..<segmentCount).map { index in
             !sharedSegments[index]
                 || (laneSamples.isolatedVertices[index]
                     && laneSamples.isolatedVertices[index + 1])
-                || (index > 0 && !sharedSegments[index - 1])
-                || (index + 1 < segmentCount && !sharedSegments[index + 1])
+                || boundaryJointSegments[index]
         }
         let ownedTrunkSegments = (0..<segmentCount).map { index in
             sharedSegments[index]
                 && hasOwnerState
                 && laneSamples.trunkOwnerVertices[index]
                 && laneSamples.trunkOwnerVertices[index + 1]
+                && !boundaryJointSegments[index]
         }
         // Sub-point RDP cleanup after the lane offset is applied. With
         // tube-map-wide strokes the tolerance grows slightly so residual
