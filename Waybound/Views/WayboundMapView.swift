@@ -2659,6 +2659,13 @@ struct WayboundMapView: UIViewRepresentable {
                     laneSamples.sharedVertices[segmentIndex]
                         && laneSamples.sharedVertices[segmentIndex + 1]
                 }
+                let tapBoundaryJoints = (0..<tapSegmentCount).map { segmentIndex in
+                    tapSharedSegments[segmentIndex]
+                        && ((segmentIndex > 0
+                                && !tapSharedSegments[segmentIndex - 1])
+                            || (segmentIndex + 1 < tapSegmentCount
+                                && !tapSharedSegments[segmentIndex + 1]))
+                }
                 for index in 0..<tapSegmentCount {
                     let isShared = tapSharedSegments[index]
                     let hasIsolatedCoverage =
@@ -2673,7 +2680,10 @@ struct WayboundMapView: UIViewRepresentable {
                         (index > 0 && !tapSharedSegments[index - 1])
                         || (index + 1 < tapSegmentCount
                             && !tapSharedSegments[index + 1])
-                    let isBoundaryJoint = isShared && touchesIsolatedNeighbor
+                    let isCornerZone = tapBoundaryJoints[index]
+                        || (index > 0 && tapBoundaryJoints[index - 1])
+                        || (index + 1 < tapSegmentCount
+                            && tapBoundaryJoints[index + 1])
                     if !isShared || hasIsolatedCoverage || touchesIsolatedNeighbor {
                         considerSegment(
                             from: lanePoints[index],
@@ -2689,7 +2699,7 @@ struct WayboundMapView: UIViewRepresentable {
                     }
                     let ownsTrunk = laneSamples.trunkOwnerVertices[index]
                         && laneSamples.trunkOwnerVertices[index + 1]
-                    if ownsTrunk, !isBoundaryJoint, trunkProgress > 0.05 {
+                    if ownsTrunk, !isCornerZone, trunkProgress > 0.05 {
                         considerSegment(
                             from: laneSamples.points[index],
                             to: laneSamples.points[index + 1]
@@ -2867,6 +2877,15 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
                     || (index + 1 < segmentCount
                         && !sharedSegments[index + 1]))
         }
+        // The trunk's centerline legs would stab through each route's own
+        // lane-V at the corner, so the trunk stays off boundary joints and
+        // their immediate arms. Run interiors keep their spine.
+        let cornerZoneSegments = (0..<segmentCount).map { index in
+            boundaryJointSegments[index]
+                || (index > 0 && boundaryJointSegments[index - 1])
+                || (index + 1 < segmentCount
+                    && boundaryJointSegments[index + 1])
+        }
         let isolatedSegments = (0..<segmentCount).map { index in
             !sharedSegments[index]
                 || (laneSamples.isolatedVertices[index]
@@ -2878,7 +2897,7 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
                 && hasOwnerState
                 && laneSamples.trunkOwnerVertices[index]
                 && laneSamples.trunkOwnerVertices[index + 1]
-                && !boundaryJointSegments[index]
+                && !cornerZoneSegments[index]
         }
         // Sub-point RDP cleanup after the lane offset is applied. With
         // tube-map-wide strokes the tolerance grows slightly so residual
