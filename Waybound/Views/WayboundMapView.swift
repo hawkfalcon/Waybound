@@ -2654,16 +2654,26 @@ struct WayboundMapView: UIViewRepresentable {
                     }
                 }
 
-                for index in 0..<(lanePoints.count - 1) {
-                    let isShared = laneSamples.sharedVertices[index]
-                        && laneSamples.sharedVertices[index + 1]
+                let tapSegmentCount = lanePoints.count - 1
+                let tapSharedSegments = (0..<tapSegmentCount).map { segmentIndex in
+                    laneSamples.sharedVertices[segmentIndex]
+                        && laneSamples.sharedVertices[segmentIndex + 1]
+                }
+                for index in 0..<tapSegmentCount {
+                    let isShared = tapSharedSegments[index]
                     let hasIsolatedCoverage =
                         laneSamples.isolatedVertices[index]
                         && laneSamples.isolatedVertices[index + 1]
                     // Mirror the renderer: any segment still carrying isolated
                     // geometry is drawn at full strength at every zoom, so it
-                    // is always tappable.
-                    if !isShared || hasIsolatedCoverage {
+                    // is always tappable. Boundary joints (shared segments
+                    // touching an isolated neighbor) are drawn full for the
+                    // same reason.
+                    let touchesIsolatedNeighbor =
+                        (index > 0 && !tapSharedSegments[index - 1])
+                        || (index + 1 < tapSegmentCount
+                            && !tapSharedSegments[index + 1])
+                    if !isShared || hasIsolatedCoverage || touchesIsolatedNeighbor {
                         considerSegment(
                             from: lanePoints[index],
                             to: lanePoints[index + 1]
@@ -2841,10 +2851,18 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
         // coverage — treating those as purely shared made entire routes fade
         // with the detail cross-fade even though most of that stretch was not
         // interlined at all.
+        // A shared segment straddling a corridor boundary — the turn itself
+        // at a fork — reads as the route's own corner, not corridor
+        // interior. Its isolated neighbors draw at full strength at every
+        // zoom; if the joint faded with the detail cross-fade instead, each
+        // turning line would break into a little X at mid-zoom. Keep
+        // boundary joints fully drawn.
         let isolatedSegments = (0..<segmentCount).map { index in
             !sharedSegments[index]
                 || (laneSamples.isolatedVertices[index]
                     && laneSamples.isolatedVertices[index + 1])
+                || (index > 0 && !sharedSegments[index - 1])
+                || (index + 1 < segmentCount && !sharedSegments[index + 1])
         }
         let ownedTrunkSegments = (0..<segmentCount).map { index in
             sharedSegments[index]
