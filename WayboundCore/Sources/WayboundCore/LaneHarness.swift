@@ -1031,12 +1031,15 @@ enum LaneHarness {
             return Ribbon(points: pts, lateral: offsets)
         }
         var directions: [(x: Double, y: Double)] = []
+        var lengths: [Double] = []
         var previous: (x: Double, y: Double)?
         directions.reserveCapacity(n - 1)
+        lengths.reserveCapacity(n - 1)
         for i in 0..<(n - 1) {
             let dx = pts[i + 1].x - pts[i].x
             let dy = pts[i + 1].y - pts[i].y
-            let length = max(1e-4, (dx * dx + dy * dy).squareRoot())
+            let rawLength = (dx * dx + dy * dy).squareRoot()
+            let length = max(1e-4, rawLength)
             var ux = dx / length
             var uy = dy / length
             if let previous, ux * previous.x + uy * previous.y < -0.8 {
@@ -1044,11 +1047,19 @@ enum LaneHarness {
                 uy = -uy
             }
             directions.append((ux, uy))
+            lengths.append(rawLength)
             previous = (ux, uy)
         }
-        var out: [(x: Double, y: Double)] = []
+        // Pass 1: the natural mitered offset at every vertex (mirrors
+        // stableRouteOffsetPoints), plus each vertex's sin(beta) and drawn
+        // miter reach for the collapse pass below.
+        var natural: [(x: Double, y: Double)] = []
+        var sines: [Double] = []
+        var miterReach: [Double] = []
         var lateral: [Double] = []
-        out.reserveCapacity(n)
+        natural.reserveCapacity(n)
+        sines.reserveCapacity(n)
+        miterReach.reserveCapacity(n)
         lateral.reserveCapacity(n)
         for i in 0..<n {
             let pd = directions[i > 0 ? i - 1 : 0]
@@ -1061,19 +1072,66 @@ enum LaneHarness {
             let local = offsets[i]
             var normal = nn
             var scale = Double(local)
+            var sine = 0.0
             if sl > 0.001 {
                 normal = (sx / sl, sy / sl)
                 let denom = normal.x * nn.x + normal.y * nn.y
                 if denom > 0.25 {
                     scale = local / denom
                 }
+                if i > 0, i < n - 1 {
+                    sine = max(0, 1 - denom * denom).squareRoot()
+                }
             }
             let maximumMiter = abs(local) * 1.75
             scale = local >= 0
                 ? max(0, min(maximumMiter, scale))
                 : min(0, max(-maximumMiter, scale))
-            out.append((pts[i].x + normal.x * scale, pts[i].y + normal.y * scale))
+            natural.append(
+                (pts[i].x + normal.x * scale, pts[i].y + normal.y * scale)
+            )
+            sines.append(sine)
+            miterReach.append(abs(scale))
             lateral.append(scale * (normal.x * nn.x + normal.y * nn.y))
+        }
+
+        // Pass 2: collapse vertices the corner miter overshoots (mirrors
+        // stableRouteOffsetPoints). A miter sits scale * sin(beta) along
+        // each adjacent leg from the apex; when that reach passes a
+        // straight neighbor vertex, the neighbor's plain lateral shift
+        // lands past the offset lines' crossing and the polyline folds
+        // back over itself into a little X at the apex. Collapse the
+        // redundant neighbor onto the miter instead: the corner keeps its
+        // full sharp miter and the point count never changes.
+        var out = natural
+        if n > 2 {
+            for middle in 1..<(n - 1) {
+                // Plain enough to collapse: gentle joints (turns under
+                // ~11°) inside an overshoot zone are GTFS sampling wobble,
+                // not real corners — the reach test below already confines
+                // claims to the overshoot span, so distant real corners
+                // always stand.
+                guard sines[middle] <= 0.1 else { continue }
+                var claims: [(x: Double, y: Double)] = []
+                for apex in [middle - 1, middle + 1] {
+                    guard apex > 0, apex < n - 1,
+                          sines[apex] > 0.02
+                    else { continue }
+                    let leg = lengths[apex < middle ? apex : middle]
+                    if leg > 1e-4,
+                       miterReach[apex] * sines[apex] > leg {
+                        claims.append(natural[apex])
+                    }
+                }
+                if claims.count == 1 {
+                    out[middle] = claims[0]
+                } else if claims.count == 2 {
+                    out[middle] = (
+                        (claims[0].x + claims[1].x) / 2,
+                        (claims[0].y + claims[1].y) / 2
+                    )
+                }
+            }
         }
         return Ribbon(points: out, lateral: lateral)
     }

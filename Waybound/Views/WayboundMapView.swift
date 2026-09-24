@@ -3228,12 +3228,14 @@ private func stableRouteOffsetPoints(
           offsets.contains(where: { abs($0) > 0.0001 })
     else { return points }
     var directions: [CGPoint] = []
+    var lengths: [CGFloat] = []
     var previousDirection: CGPoint?
 
     for index in 0..<(points.count - 1) {
         let deltaX = points[index + 1].x - points[index].x
         let deltaY = points[index + 1].y - points[index].y
-        let length = max(0.0001, hypot(deltaX, deltaY))
+        let rawLength = hypot(deltaX, deltaY)
+        let length = max(0.0001, rawLength)
         var direction = CGPoint(x: deltaX / length, y: deltaY / length)
 
         // An abrupt reversal is almost always duplicate GTFS shape sampling.
@@ -3246,10 +3248,20 @@ private func stableRouteOffsetPoints(
             direction.y *= -1
         }
         directions.append(direction)
+        lengths.append(rawLength)
         previousDirection = direction
     }
 
-    return points.indices.map { index in
+    // Pass 1: the natural mitered offset at every vertex, with the 1.75x
+    // miter limit. Also records each vertex's sin(beta) and drawn miter
+    // reach for the collapse pass below.
+    var natural: [CGPoint] = []
+    var sines: [CGFloat] = []
+    var miterReach: [CGFloat] = []
+    natural.reserveCapacity(points.count)
+    sines.reserveCapacity(points.count)
+    miterReach.reserveCapacity(points.count)
+    for index in points.indices {
         let previousDirection = directions[index == 0 ? 0 : index - 1]
         let nextDirection = directions[
             index == points.count - 1 ? directions.count - 1 : index
@@ -3266,11 +3278,15 @@ private func stableRouteOffsetPoints(
         let localOffset = offsets[index]
         var normal = nextNormal
         var scale = localOffset
+        var sine: CGFloat = 0
         if sumLength > 0.001 {
             normal = CGPoint(x: sumX / sumLength, y: sumY / sumLength)
             let denominator = normal.x * nextNormal.x + normal.y * nextNormal.y
             if denominator > 0.25 {
                 scale = localOffset / denominator
+            }
+            if index > 0, index < points.count - 1 {
+                sine = sqrt(max(0, 1 - denominator * denominator))
             }
         }
         let maximumMiter = abs(localOffset) * 1.75
@@ -3279,11 +3295,56 @@ private func stableRouteOffsetPoints(
         } else {
             scale = min(0, max(-maximumMiter, scale))
         }
-        return CGPoint(
+        natural.append(CGPoint(
             x: points[index].x + normal.x * scale,
             y: points[index].y + normal.y * scale
-        )
+        ))
+        sines.append(sine)
+        miterReach.append(abs(scale))
     }
+
+    // Pass 2: collapse vertices the corner miter overshoots. A miter sits
+    // scale * sin(beta) along each adjacent leg from the apex; when that
+    // reach passes a straight neighbor vertex (route 5's 96° downtown
+    // corner: 22 m of miter reach on 12/14.5 m legs), the neighbor's
+    // plain lateral shift lands past the offset lines' crossing, and the
+    // polyline folds back over itself into a little X at the apex. The
+    // neighbor is redundant — the entry line already runs through the
+    // miter — so collapse it onto the miter instead. The corner keeps its
+    // full sharp miter; only the overshooting straight joints move.
+    // Apexes stand on their own miters, endpoints keep their coverage,
+    // and a vertex claimed from both sides takes the midpoint, so the
+    // pass is order-free and never changes the point count.
+    var output = natural
+    if points.count > 2 {
+        for middle in 1..<(points.count - 1) {
+            // Plain enough to collapse: gentle joints (turns under ~11°)
+            // inside an overshoot zone are GTFS sampling wobble, not real
+            // corners — the reach test below already confines claims to
+            // the overshoot span, so distant real corners always stand.
+            guard sines[middle] <= 0.1 else { continue }
+            var claims: [CGPoint] = []
+            for apex in [middle - 1, middle + 1] {
+                guard apex > 0, apex < points.count - 1,
+                      sines[apex] > 0.02
+                else { continue }
+                let leg = lengths[min(middle, apex)]
+                if leg > 0.0001,
+                   miterReach[apex] * sines[apex] > leg {
+                    claims.append(natural[apex])
+                }
+            }
+            if claims.count == 1 {
+                output[middle] = claims[0]
+            } else if claims.count == 2 {
+                output[middle] = CGPoint(
+                    x: (claims[0].x + claims[1].x) / 2,
+                    y: (claims[0].y + claims[1].y) / 2
+                )
+            }
+        }
+    }
+    return output
 }
 
 private func routePerpendicularDistance(
