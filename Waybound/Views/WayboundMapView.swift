@@ -1654,9 +1654,45 @@ struct WayboundMapView: UIViewRepresentable {
             // Reference changes can be several meters at a street corner. Keep
             // that correction continuous along the route; this is geometry-only
             // smoothing and cannot alter the package's crossing decisions.
+            // Small reference steps (inside the ramp budget) would still
+            // zigzag the drawn centerline across the corner vertex itself,
+            // and the lateral smoother stands down at corners — so the kink
+            // survives, and the innermost lane's miter inverts into a little
+            // X. Hold corrections constant across sharp corners instead; the
+            // exit street's correction ramps in after the turn.
+            var cornerVertices = Array(repeating: false, count: points.count)
+            if points.count > 2 {
+                var rawDirections: [(x: Double, y: Double)] = []
+                rawDirections.reserveCapacity(points.count - 1)
+                for index in 0..<(points.count - 1) {
+                    let stepX = points[index + 1].x - points[index].x
+                    let stepY = points[index + 1].y - points[index].y
+                    let length = hypot(stepX, stepY)
+                    if length > 0.000_001 {
+                        rawDirections.append(
+                            (stepX / length, stepY / length)
+                        )
+                    } else if let last = rawDirections.last {
+                        rawDirections.append(last)
+                    } else {
+                        rawDirections.append((x: 1, y: 0))
+                    }
+                }
+                for index in 1..<(points.count - 1) {
+                    let before = rawDirections[index - 1]
+                    let after = rawDirections[index]
+                    cornerVertices[index] =
+                        before.x * after.x + before.y * after.y < 0.7
+                }
+            }
             let maximumAlignmentRamp = 0.08  // meters of correction per meter
             if points.count > 2 {
                 for index in 1..<points.count {
+                    if cornerVertices[index] {
+                        alignmentDeltaX[index] = alignmentDeltaX[index - 1]
+                        alignmentDeltaY[index] = alignmentDeltaY[index - 1]
+                        continue
+                    }
                     let segmentMeters = points[index - 1].distance(
                         to: points[index]
                     ) * metersPerMapPoint
@@ -1675,6 +1711,11 @@ struct WayboundMapView: UIViewRepresentable {
                     }
                 }
                 for index in stride(from: points.count - 2, through: 0, by: -1) {
+                    if cornerVertices[index] {
+                        alignmentDeltaX[index] = alignmentDeltaX[index + 1]
+                        alignmentDeltaY[index] = alignmentDeltaY[index + 1]
+                        continue
+                    }
                     let segmentMeters = points[index].distance(
                         to: points[index + 1]
                     ) * metersPerMapPoint
