@@ -102,27 +102,44 @@ def ribbon(aligned, offsets, meters_per_unit_value,
         sines.append(sine)
         reach.append(abs(scale))
         lateral.append(scale * (normal[0] * nn[0] + normal[1] * nn[1]))
-    # Collapse pass (mirrors stableRouteOffsetPoints / LaneHarness): a
-    # straight neighbor vertex past the miter's reach along the leg is
-    # redundant — its plain shift lands past the offset lines' crossing
-    # and folds the polyline into an X. Collapse it onto the miter.
+    # Collapse pass (mirrors stableRouteOffsetPoints / LaneHarness):
+    # each corner miter walks outward and claims every plain contiguous
+    # joint within its reach along the legs — a claimed vertex is
+    # redundant (its plain shift would land past the offset lines'
+    # crossing and fold the polyline into an X), so it collapses onto
+    # the miter. The cascade matters at mid zoom, where constant-screen
+    # lane offsets outgrow ground-fixed legs and one miter can overshoot
+    # several vertices. Apexes stand, endpoints keep their coverage.
     out = list(natural)
     if n > 2:
-        for middle in range(1, n - 1):
-            if sines[middle] > 0.1:
+        claims = [[] for _ in range(n)]
+        for apex in range(1, n - 1):
+            if sines[apex] <= 0.02:
                 continue
-            claims = []
-            for apex in (middle - 1, middle + 1):
-                if not (0 < apex < n - 1) or sines[apex] <= 0.02:
-                    continue
-                leg = lengths[min(middle, apex)]
-                if leg > 1e-4 and reach[apex] * sines[apex] > leg:
-                    claims.append(natural[apex])
-            if len(claims) == 1:
-                out[middle] = claims[0]
-            elif len(claims) == 2:
-                out[middle] = ((claims[0][0] + claims[1][0]) / 2,
-                               (claims[0][1] + claims[1][1]) / 2)
+            apex_reach = reach[apex] * sines[apex]
+            for direction in (-1, 1):
+                path_distance = 0.0
+                cursor = apex
+                while True:
+                    nxt = cursor + direction
+                    if not (0 < nxt < n - 1):
+                        break
+                    if sines[nxt] > 0.1:
+                        break
+                    path_distance += lengths[min(cursor, nxt)]
+                    if not path_distance < apex_reach:
+                        break
+                    claims[nxt].append(natural[apex])
+                    cursor = nxt
+        for middle in range(1, n - 1):
+            if len(claims[middle]) == 1:
+                out[middle] = claims[middle][0]
+            elif len(claims[middle]) > 1:
+                count = len(claims[middle])
+                out[middle] = (
+                    sum(c[0] for c in claims[middle]) / count,
+                    sum(c[1] for c in claims[middle]) / count,
+                )
     return out, lateral
 
 

@@ -3303,43 +3303,54 @@ private func stableRouteOffsetPoints(
         miterReach.append(abs(scale))
     }
 
-    // Pass 2: collapse vertices the corner miter overshoots. A miter sits
+    // Pass 2: collapse vertices a corner miter overshoots. A miter sits
     // scale * sin(beta) along each adjacent leg from the apex; when that
     // reach passes a straight neighbor vertex (route 5's 96° downtown
-    // corner: 22 m of miter reach on 12/14.5 m legs), the neighbor's
-    // plain lateral shift lands past the offset lines' crossing, and the
-    // polyline folds back over itself into a little X at the apex. The
-    // neighbor is redundant — the entry line already runs through the
-    // miter — so collapse it onto the miter instead. The corner keeps its
-    // full sharp miter; only the overshooting straight joints move.
-    // Apexes stand on their own miters, endpoints keep their coverage,
-    // and a vertex claimed from both sides takes the midpoint, so the
-    // pass is order-free and never changes the point count.
+    // corner: 22 m of miter reach on 12/14.5 m legs at street scale, and
+    // more as constant-screen lane offsets outgrow ground-fixed legs when
+    // zooming out), the neighbor's plain lateral shift lands past the
+    // offset lines' crossing, and the polyline folds back over itself
+    // into a little X at the apex. The neighbor is redundant — the entry
+    // line already runs through the miter — so collapse it onto the
+    // miter instead. The walk runs outward while the miter's reach covers
+    // plain contiguous joints, so wide mid-zoom miters cascade past every
+    // vertex they overshoot. The corner keeps its full sharp miter; only
+    // overshot straight joints move. Apexes stand on their own miters,
+    // endpoints keep their coverage, and a vertex claimed from several
+    // sides takes the centroid, so the pass is order-free and never
+    // changes the point count.
     var output = natural
     if points.count > 2 {
-        for middle in 1..<(points.count - 1) {
-            // Plain enough to collapse: gentle joints (turns under ~11°)
-            // inside an overshoot zone are GTFS sampling wobble, not real
-            // corners — the reach test below already confines claims to
-            // the overshoot span, so distant real corners always stand.
-            guard sines[middle] <= 0.1 else { continue }
-            var claims: [CGPoint] = []
-            for apex in [middle - 1, middle + 1] {
-                guard apex > 0, apex < points.count - 1,
-                      sines[apex] > 0.02
-                else { continue }
-                let leg = lengths[min(middle, apex)]
-                if leg > 0.0001,
-                   miterReach[apex] * sines[apex] > leg {
-                    claims.append(natural[apex])
+        var claims: [[CGPoint]] = Array(
+            repeating: [],
+            count: points.count
+        )
+        for apex in 1..<(points.count - 1) {
+            guard sines[apex] > 0.02 else { continue }
+            let reach = miterReach[apex] * sines[apex]
+            for direction in [-1, 1] {
+                var pathDistance: CGFloat = 0
+                var cursor = apex
+                while true {
+                    let next = cursor + direction
+                    guard next > 0, next < points.count - 1,
+                          sines[next] <= 0.1
+                    else { break }
+                    pathDistance += lengths[min(cursor, next)]
+                    guard pathDistance < reach else { break }
+                    claims[next].append(natural[apex])
+                    cursor = next
                 }
             }
-            if claims.count == 1 {
-                output[middle] = claims[0]
-            } else if claims.count == 2 {
+        }
+        for middle in 1..<(points.count - 1) {
+            if claims[middle].count == 1 {
+                output[middle] = claims[middle][0]
+            } else if claims[middle].count > 1 {
+                let count = CGFloat(claims[middle].count)
                 output[middle] = CGPoint(
-                    x: (claims[0].x + claims[1].x) / 2,
-                    y: (claims[0].y + claims[1].y) / 2
+                    x: claims[middle].map(\.x).reduce(0, +) / count,
+                    y: claims[middle].map(\.y).reduce(0, +) / count
                 )
             }
         }

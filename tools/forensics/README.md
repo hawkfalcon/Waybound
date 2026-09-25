@@ -17,6 +17,16 @@ Run (from anywhere; export path is argv[1]):
 
     python3 tools/forensics/drawn_paths.py tools/replay/data/waybound-lanes-1790225339.json
     python3 tools/forensics/full_cross.py tools/replay/data/waybound-lanes-1790225339.json
+    python3 tools/forensics/zoom_render.py tools/replay/data/waybound-lanes-1790225339.json 11 12 13 14 15 16 17
+    python3 tools/forensics/zoom_px.py tools/replay/data/waybound-lanes-1790225339.json
+
+`zoom_render.py` replays the zoom-exact draw path (dedup + collapse ribbon
++ per-run RDP + isolated/detail/trunk split with live selected-trunk
+ownership) at levels 11-17 and reports pink crossings in 120 m windows at
+the downtown corners v1/v16/v26. `zoom_px.py` re-checks each crossing with
+its screen-pixel margin from the nearest segment endpoint, so sub-stroke
+endpoint grazes (buried in the round join) can be told apart from visible
+mid-segment Xes.
 
 What the scaffold proved (true scale, 1 unit = 1 m):
 
@@ -35,6 +45,12 @@ What the scaffold proved (true scale, 1 unit = 1 m):
   from 6 to 1 (a genuine mixed brown/pink braid 24 m out). Remaining
   route-5 self-crossings are all zero-offset isolated raw-shape overlaps
   (Mesa backtrack etc.), a separate phenomenon.
+- Mid zoom needs the cascade: constant-screen lane offsets outgrow
+  ground-fixed legs, so one miter overshoots several vertices (L16 v16:
+  58 m of reach on 12 m legs). The per-apex outward walk collapses every
+  plain contiguous joint within reach; the zoom sweep then reads clean
+  at L11-13 and L16-17, and street scale loses exactly one self-crossing
+  (segs 14x17, the v16 fold) with zero new crossings anywhere.
 
 One-line roles:
 

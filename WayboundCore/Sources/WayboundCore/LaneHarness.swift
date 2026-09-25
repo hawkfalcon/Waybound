@@ -1097,38 +1097,55 @@ enum LaneHarness {
 
         // Pass 2: collapse vertices the corner miter overshoots (mirrors
         // stableRouteOffsetPoints). A miter sits scale * sin(beta) along
-        // each adjacent leg from the apex; when that reach passes a
-        // straight neighbor vertex, the neighbor's plain lateral shift
-        // lands past the offset lines' crossing and the polyline folds
-        // back over itself into a little X at the apex. Collapse the
-        // redundant neighbor onto the miter instead: the corner keeps its
-        // full sharp miter and the point count never changes.
+        // each adjacent leg from the apex; each apex walks outward and
+        // claims every plain contiguous joint within that reach, because
+        // a claimed vertex's plain lateral shift would land past the
+        // offset lines' crossing and fold the polyline into an X. The
+        // cascade matters at mid zoom, where constant-screen lane
+        // offsets outgrow ground-fixed legs and one miter can overshoot
+        // several vertices. Apexes stand, endpoints keep their coverage,
+        // multi-claimed vertices take the centroid, and the point count
+        // never changes.
         var out = natural
         if n > 2 {
-            for middle in 1..<(n - 1) {
-                // Plain enough to collapse: gentle joints (turns under
-                // ~11°) inside an overshoot zone are GTFS sampling wobble,
-                // not real corners — the reach test below already confines
-                // claims to the overshoot span, so distant real corners
-                // always stand.
-                guard sines[middle] <= 0.1 else { continue }
-                var claims: [(x: Double, y: Double)] = []
-                for apex in [middle - 1, middle + 1] {
-                    guard apex > 0, apex < n - 1,
-                          sines[apex] > 0.02
-                    else { continue }
-                    let leg = lengths[apex < middle ? apex : middle]
-                    if leg > 1e-4,
-                       miterReach[apex] * sines[apex] > leg {
-                        claims.append(natural[apex])
+            var cascadeClaims: [[(x: Double, y: Double)]] = Array(
+                repeating: [],
+                count: n
+            )
+            for apex in 1..<(n - 1) {
+                guard sines[apex] > 0.02 else { continue }
+                let apexReach = miterReach[apex] * sines[apex]
+                for direction in [-1, 1] {
+                    var pathDistance: Double = 0
+                    var cursor = apex
+                    while true {
+                        let next = cursor + direction
+                        guard next > 0, next < n - 1,
+                              sines[next] <= 0.1
+                        else { break }
+                        pathDistance += lengths[
+                            cursor < next ? cursor : next
+                        ]
+                        guard pathDistance < apexReach else { break }
+                        cascadeClaims[next].append(natural[apex])
+                        cursor = next
                     }
                 }
-                if claims.count == 1 {
-                    out[middle] = claims[0]
-                } else if claims.count == 2 {
+            }
+            for middle in 1..<(n - 1) {
+                if cascadeClaims[middle].count == 1 {
+                    out[middle] = cascadeClaims[middle][0]
+                } else if cascadeClaims[middle].count > 1 {
+                    let count = Double(cascadeClaims[middle].count)
                     out[middle] = (
-                        (claims[0].x + claims[1].x) / 2,
-                        (claims[0].y + claims[1].y) / 2
+                        cascadeClaims[middle].map(\.x).reduce(
+                            0,
+                            +
+                        ) / count,
+                        cascadeClaims[middle].map(\.y).reduce(
+                            0,
+                            +
+                        ) / count
                     )
                 }
             }
