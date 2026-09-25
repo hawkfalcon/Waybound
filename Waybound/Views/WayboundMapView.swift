@@ -2678,11 +2678,11 @@ struct WayboundMapView: UIViewRepresentable {
                     minimumDistance: 0.245
                 )
                 // Use the same fanning geometry and visibility rules as drawing.
-                let lanePoints = stableRouteOffsetPoints(
+                let offsetLanePoints = stableRouteOffsetPoints(
                     laneSamples.points,
                     offsets: laneSamples.offsets
                 )
-                guard lanePoints.count >= 2 else { continue }
+                guard offsetLanePoints.count >= 2 else { continue }
 
                 func considerSegment(from start: CGPoint, to end: CGPoint) {
                     let distance = distanceFromPoint(
@@ -2695,11 +2695,26 @@ struct WayboundMapView: UIViewRepresentable {
                     }
                 }
 
-                let tapSegmentCount = lanePoints.count - 1
+                let tapSegmentCount = offsetLanePoints.count - 1
                 let tapSharedSegments = (0..<tapSegmentCount).map { segmentIndex in
                     laneSamples.sharedVertices[segmentIndex]
                         && laneSamples.sharedVertices[segmentIndex + 1]
                 }
+                // Same far-zoom fan pinch the renderer applies, so a route is
+                // tappable exactly where it is drawn.
+                let lanePoints = LaneRibbonPinch.pinchedRibbon(
+                    centre: laneSamples.points.map {
+                        (x: Double($0.x), y: Double($0.y))
+                    },
+                    ribbon: offsetLanePoints.map {
+                        (x: Double($0.x), y: Double($0.y))
+                    },
+                    sharedSegments: tapSharedSegments,
+                    minimumStreetWidth: RouteMapStyle.lineWidth(
+                        baseWidth: overlay.lineWidth,
+                        zoomScale: zoomScale
+                    ) + RouteMapStyle.separatorWidth
+                ).map { CGPoint(x: $0.x, y: $0.y) }
                 let tapBoundaryJoints = (0..<tapSegmentCount).map { segmentIndex in
                     tapSharedSegments[segmentIndex]
                         && ((segmentIndex > 0
@@ -2933,6 +2948,38 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
                     && laneSamples.isolatedVertices[index + 1])
                 || boundaryJointSegments[index]
         }
+        let lineWidth = RouteMapStyle.lineWidth(
+            baseWidth: routeOverlay.lineWidth,
+            zoomScale: zoomScale
+        )
+        // Far-zoom fan pinch. The corridor's lanes fan out at a constant
+        // on-screen spacing while the street they are drawn on stays the same
+        // width, so wherever a route doubles back its own two legs end up
+        // close together on the ground and the lane offset reaches across
+        // and folds the ribbon over itself — the saltire X at a downtown
+        // loop. Pull that run's lane back inside its own street.
+        //
+        // The scale is uniform over the whole shared run: the lane stays
+        // parallel to its corridor neighbours instead of pinching locally, no
+        // lane braids across another, and the route keeps every vertex so
+        // coverage cannot open a gap. Runs that are already simple, runs whose
+        // centerline folds (a route doubling back along one street), and city
+        // scale where there are no lane offsets at all are left untouched.
+        let drawnPoints: [CGPoint]
+        if detailProgress > 0.001 {
+            drawnPoints = LaneRibbonPinch.pinchedRibbon(
+                centre: laneSamples.points.map {
+                    (x: Double($0.x), y: Double($0.y))
+                },
+                ribbon: offsetPoints.map {
+                    (x: Double($0.x), y: Double($0.y))
+                },
+                sharedSegments: sharedSegments,
+                minimumStreetWidth: lineWidth + RouteMapStyle.separatorWidth
+            ).map { CGPoint(x: $0.x, y: $0.y) }
+        } else {
+            drawnPoints = offsetPoints
+        }
         let ownedTrunkSegments = (0..<segmentCount).map { index in
             sharedSegments[index]
                 && hasOwnerState
@@ -2945,12 +2992,12 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
         // shape noise cannot wiggle a strand's edge into its neighbor.
         let tolerance = 0.9 / zoomScale
         let isolatedPath = routeSegmentPath(
-            points: offsetPoints,
+            points: drawnPoints,
             includedSegments: isolatedSegments,
             tolerance: tolerance
         )
         let detailPath = routeSegmentPath(
-            points: offsetPoints,
+            points: drawnPoints,
             includedSegments: sharedSegments,
             tolerance: tolerance
         )
@@ -2962,10 +3009,6 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
             tolerance: tolerance
         )
 
-        let lineWidth = RouteMapStyle.lineWidth(
-            baseWidth: routeOverlay.lineWidth,
-            zoomScale: zoomScale
-        )
         let trunkProgress = 1 - zoomDetailProgress
         let baseOpacity = routeOverlay.opacity
         context.saveGState()
