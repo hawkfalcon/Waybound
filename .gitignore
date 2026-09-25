@@ -30,7 +30,6 @@ verification-output/
 areas.txt
 
 # Lane diagnostics exports at repo root (device dumps)
-waybound-lanes-*.json
 *.orig
 
 # Generated lane visualization images

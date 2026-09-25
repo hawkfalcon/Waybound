@@ -13,15 +13,21 @@ struct WayboundCameraRequest: Equatable {
 }
 
 private enum RouteMapStyle {
-    static let standardLineWidth: Double = 3.4
-    static let selectedLineWidth: Double = 3.65
-    /// The hairline ink gap drawn between interlined lanes. Several routes in
-    /// one hue family can share a corridor; the thin dark separator — not
-    /// color — is what keeps adjacent strands countable without clutter.
-    static let separatorWidth: Double = 0.8
-    static let trunkLineWidth: Double = 4.4
-    static let trunkCasingExpansion: Double = 0.9
-    static let laneSpacingPoints = standardLineWidth + separatorWidth
+    // Tube-map bold: strands stay legible from city scale down to the
+    // street, with the ink separator — not color — keeping adjacent
+    // lanes countable when several routes share one hue family.
+    static let standardLineWidth: Double = 5.0
+    static let selectedLineWidth: Double = 5.7
+    /// The dark gap drawn between interlined lanes.
+    static let separatorWidth: Double = 1.1
+    static let trunkLineWidth: Double = 6.0
+    static let trunkCasingExpansion: Double = 1.2
+    /// The lane schedule's unit: every scheduled offset is a multiple of
+    /// this. It must match `LaneScheduleConstants.laneSpacing` (4.2) — the
+    /// schedule, layout, diagnostics export, and golden fixtures are all
+    /// pinned to that unit, so the renderer rescales schedule units into
+    /// the wider on-screen spacing instead of changing the unit itself.
+    static let laneSpacingPoints = 4.2
 
     static func zoomLevel(for zoomScale: MKZoomScale) -> Double {
         log2(max(Double(zoomScale), 0.000_000_1)) + 20
@@ -61,14 +67,17 @@ private enum RouteMapStyle {
         baseWidth + zoomLineExpansion(for: zoomScale)
     }
 
+    /// On-screen center distance between adjacent lanes. It grows slightly
+    /// slower than the line width itself, so strands thicken as the rider
+    /// zooms in without the whole ribbon ballooning wider than the street
+    /// it represents — while the ink separator between colors survives.
     static func laneSpacing(for zoomScale: MKZoomScale) -> Double {
-        // Lanes grow at only three quarters of the line-width expansion, so
-        // strands thicken as the rider zooms in without the whole ribbon
-        // ballooning wider than the street it represents.
-        standardLineWidth + zoomLineExpansion(for: zoomScale) * 0.75
+        standardLineWidth + zoomLineExpansion(for: zoomScale) * 0.85
             + separatorWidth
     }
 
+    /// Rescales schedule-unit lane offsets (multiples of 4.2) into the
+    /// wider on-screen spacing above.
     static func laneOffsetScale(for zoomScale: MKZoomScale) -> Double {
         laneSpacing(for: zoomScale) / laneSpacingPoints
     }
@@ -651,7 +660,7 @@ struct WayboundMapView: UIViewRepresentable {
                     opacity: opacity,
                     lineWidth: isSelected
                         ? RouteMapStyle.selectedLineWidth
-                        : (isHighlighted ? RouteMapStyle.standardLineWidth : 2.5),
+                        : (isHighlighted ? RouteMapStyle.standardLineWidth : 4.0),
                     isSelected: isSelected,
                     dashed: false,
                     to: mapView
@@ -679,9 +688,12 @@ struct WayboundMapView: UIViewRepresentable {
             // Tags are ranked, collision-tested before insertion, and explicitly
             // budgeted. Selecting a route bypasses the overview budget, so every
             // route remains discoverable without forcing six labels onto the map.
+            // A tag that would land on another tag or a boarding marker tries
+            // the mirror placements before giving up its budget slot.
             var occupiedTagFrames: [CGRect] = []
             var insertedTagCount = 0
             let tagBudget = destinationTagBudget(in: mapView)
+            let clusterExclusions = boardingClusterExclusionRects(in: mapView)
             for (rank, journey) in parent.journeys.enumerated()
             where selectedID == nil || journey.id == selectedID {
                 guard insertedTagCount < tagBudget,
@@ -695,17 +707,34 @@ struct WayboundMapView: UIViewRepresentable {
                     anchor.coordinate,
                     toPointTo: mapView
                 )
-                let layout = destinationTagLayout(
+                let candidates = destinationTagCandidates(
                     at: anchorPoint,
                     edge: anchor.edge,
                     in: mapView
                 )
-                let collisionFrame = layout.frame.insetBy(dx: -5, dy: -4)
-                guard selectedID != nil || occupiedTagFrames.allSatisfy({
-                    !$0.intersects(collisionFrame)
-                }) else { continue }
+                var chosen: DestinationTagLayout?
+                for layout in candidates {
+                    let collisionFrame = layout.frame.insetBy(dx: -8, dy: -6)
+                    guard selectedID != nil || occupiedTagFrames.allSatisfy({
+                        !$0.intersects(collisionFrame)
+                    }) else { continue }
+                    guard !clusterExclusions.contains(where: {
+                        $0.intersects(collisionFrame)
+                    }) else { continue }
+                    chosen = layout
+                    break
+                }
+                if chosen == nil {
+                    // A selected route's tag always shows: accept the
+                    // preferred placement even over a boarding marker rather
+                    // than hiding the one label that names the selection.
+                    guard selectedID != nil, let preferred = candidates.first
+                    else { continue }
+                    chosen = preferred
+                }
+                guard let layout = chosen else { continue }
 
-                occupiedTagFrames.append(collisionFrame)
+                occupiedTagFrames.append(layout.frame.insetBy(dx: -8, dy: -6))
                 insertedTagCount += 1
                 mapView.addAnnotation(
                     DestinationMapAnnotation(
@@ -739,25 +768,60 @@ struct WayboundMapView: UIViewRepresentable {
             let pinCenter: CGPoint
         }
 
-        private func destinationTagLayout(
+        /// Preferred placement plus mirror alternates for one destination tag.
+        /// Must match `DestinationAnnotationView`'s frame exactly: the layout
+        /// frame is what collision-testing sees, the view is what draws.
+        private func destinationTagCandidates(
             at anchor: CGPoint,
             edge: DestinationViewportEdge,
             in mapView: MKMapView
-        ) -> DestinationTagLayout {
-            let width: CGFloat = 158
-            let height: CGFloat = 42
-            let preferredOffset: CGPoint
+        ) -> [DestinationTagLayout] {
+            let size = CGSize(width: 184, height: 54)
+            let preferred: CGPoint
             switch edge {
             case .inside, .bottom:
-                preferredOffset = CGPoint(x: 0, y: -height / 2)
+                preferred = CGPoint(x: 0, y: -size.height / 2)
             case .top:
-                preferredOffset = CGPoint(x: 0, y: height / 2)
+                preferred = CGPoint(x: 0, y: size.height / 2)
             case .right:
-                preferredOffset = CGPoint(x: -width / 2, y: 0)
+                preferred = CGPoint(x: -size.width / 2, y: 0)
             case .left:
-                preferredOffset = CGPoint(x: width / 2, y: 0)
+                preferred = CGPoint(x: size.width / 2, y: 0)
             }
+            let alternates = [
+                preferred,
+                CGPoint(x: preferred.x, y: -preferred.y),
+                CGPoint(x: -preferred.x, y: preferred.y),
+                CGPoint(x: -preferred.x, y: -preferred.y),
+            ]
+            // A zero component flips to itself; keep first-seen order.
+            var seenOffsets = Set<String>()
+            var seenFrames = Set<String>()
+            var layouts: [DestinationTagLayout] = []
+            for offset in alternates {
+                guard seenOffsets.insert("\(offset.x),\(offset.y)").inserted
+                else { continue }
+                let layout = destinationTagLayout(
+                    at: anchor,
+                    preferredOffset: offset,
+                    size: size,
+                    in: mapView
+                )
+                // Safe-rect clamping can collapse two mirrors onto one frame.
+                guard seenFrames.insert("\(layout.frame)").inserted else { continue }
+                layouts.append(layout)
+            }
+            return layouts
+        }
 
+        private func destinationTagLayout(
+            at anchor: CGPoint,
+            preferredOffset: CGPoint,
+            size: CGSize,
+            in mapView: MKMapView
+        ) -> DestinationTagLayout {
+            let width = size.width
+            let height = size.height
             let safeRect = destinationLabelScreenRect(in: mapView)
             let minimumCenterX = safeRect.minX + width / 2
             let maximumCenterX = safeRect.maxX - width / 2
@@ -784,10 +848,40 @@ struct WayboundMapView: UIViewRepresentable {
                     y: center.y - anchor.y
                 ),
                 pinCenter: CGPoint(
-                    x: max(3.5, min(width - 3.5, anchor.x - frame.minX)),
-                    y: max(3.5, min(height - 3.5, anchor.y - frame.minY))
+                    x: max(4.5, min(width - 4.5, anchor.x - frame.minX)),
+                    y: max(4.5, min(height - 4.5, anchor.y - frame.minY))
                 )
             )
+        }
+
+        /// Screen rectangles the destination tags must not cover: one per
+        /// boarding cluster, sized from its route numbers the same way the
+        /// marker view sizes itself, then inflated by the tag collision
+        /// padding so a tag never even grazes a marker.
+        private func boardingClusterExclusionRects(in mapView: MKMapView) -> [CGRect] {
+            mapView.annotations.compactMap { annotation -> CGRect? in
+                guard let cluster = annotation as? StopClusterMapAnnotation
+                else { return nil }
+                let point = mapView.convert(cluster.coordinate, toPointTo: mapView)
+                // Mirrors StopClusterAnnotationView at its 12 pt route font:
+                // ~7.2 pt per monospaced glyph plus the double-space gaps on
+                // a 28 pt pill, then inflated so a tag never grazes a marker.
+                var seenNumbers = Set<String>()
+                var textWidth: CGFloat = 0
+                for number in cluster.routeNumbers {
+                    guard seenNumbers.insert(number).inserted else { continue }
+                    if textWidth > 0 { textWidth += 13 }
+                    textWidth += CGFloat(number.count) * 7.2
+                }
+                let width = max(30, ceil(textWidth) + 16) + 16
+                let height: CGFloat = 28 + 12
+                return CGRect(
+                    x: point.x - width / 2,
+                    y: point.y - height / 2,
+                    width: width,
+                    height: height
+                )
+            }
         }
 
         private func routeStopVisibility(
@@ -895,8 +989,8 @@ struct WayboundMapView: UIViewRepresentable {
             return CGRect(
                 x: mapView.bounds.minX + horizontalMargin,
                 y: top,
-                width: max(158, mapView.bounds.width - horizontalMargin * 2),
-                height: max(42, bottom - top)
+                width: max(184, mapView.bounds.width - horizontalMargin * 2),
+                height: max(54, bottom - top)
             )
         }
 
@@ -1560,9 +1654,45 @@ struct WayboundMapView: UIViewRepresentable {
             // Reference changes can be several meters at a street corner. Keep
             // that correction continuous along the route; this is geometry-only
             // smoothing and cannot alter the package's crossing decisions.
+            // Small reference steps (inside the ramp budget) would still
+            // zigzag the drawn centerline across the corner vertex itself,
+            // and the lateral smoother stands down at corners — so the kink
+            // survives, and the innermost lane's miter inverts into a little
+            // X. Hold corrections constant across sharp corners instead; the
+            // exit street's correction ramps in after the turn.
+            var cornerVertices = Array(repeating: false, count: points.count)
+            if points.count > 2 {
+                var rawDirections: [(x: Double, y: Double)] = []
+                rawDirections.reserveCapacity(points.count - 1)
+                for index in 0..<(points.count - 1) {
+                    let stepX = points[index + 1].x - points[index].x
+                    let stepY = points[index + 1].y - points[index].y
+                    let length = hypot(stepX, stepY)
+                    if length > 0.000_001 {
+                        rawDirections.append(
+                            (stepX / length, stepY / length)
+                        )
+                    } else if let last = rawDirections.last {
+                        rawDirections.append(last)
+                    } else {
+                        rawDirections.append((x: 1, y: 0))
+                    }
+                }
+                for index in 1..<(points.count - 1) {
+                    let before = rawDirections[index - 1]
+                    let after = rawDirections[index]
+                    cornerVertices[index] =
+                        before.x * after.x + before.y * after.y < 0.7
+                }
+            }
             let maximumAlignmentRamp = 0.08  // meters of correction per meter
             if points.count > 2 {
                 for index in 1..<points.count {
+                    if cornerVertices[index] {
+                        alignmentDeltaX[index] = alignmentDeltaX[index - 1]
+                        alignmentDeltaY[index] = alignmentDeltaY[index - 1]
+                        continue
+                    }
                     let segmentMeters = points[index - 1].distance(
                         to: points[index]
                     ) * metersPerMapPoint
@@ -1581,6 +1711,11 @@ struct WayboundMapView: UIViewRepresentable {
                     }
                 }
                 for index in stride(from: points.count - 2, through: 0, by: -1) {
+                    if cornerVertices[index] {
+                        alignmentDeltaX[index] = alignmentDeltaX[index + 1]
+                        alignmentDeltaY[index] = alignmentDeltaY[index + 1]
+                        continue
+                    }
                     let segmentMeters = points[index].distance(
                         to: points[index + 1]
                     ) * metersPerMapPoint
@@ -1600,12 +1735,22 @@ struct WayboundMapView: UIViewRepresentable {
                 }
             }
 
-            let alignedCoordinates = points.indices.map { index in
-                MKMapPoint(
-                    x: points[index].x + alignmentDeltaX[index],
-                    y: points[index].y + alignmentDeltaY[index]
-                ).coordinate
-            }
+            // Finally, pull the drawn centers laterally toward their own
+            // neighborhood mean along shared runs. The delta smoothing above
+            // averages the *correction*; the raw GTFS wobble underneath it
+            // survives untouched, and with wide lanes that wobble is what
+            // lets adjacent strands touch. Smoothing the summed centers —
+            // lateral only, so corners are never cut — converges every
+            // corridor member onto the same smooth spine.
+            let smoothedCenters = smoothSharedLateralCenters(
+                points: points,
+                deltaX: alignmentDeltaX,
+                deltaY: alignmentDeltaY,
+                sharedVertices: packageLayout.shared,
+                metersPerMapPoint: metersPerMapPoint
+            )
+
+            let alignedCoordinates = smoothedCenters.map { $0.coordinate }
             return CorridorLaneLayout(
                 coordinates: alignedCoordinates,
                 offsets: packageLayout.offsets,
@@ -1697,6 +1842,181 @@ struct WayboundMapView: UIViewRepresentable {
                 deltaY[index] = 0.25 * originalDeltaY[index - 1]
                     + 0.50 * originalDeltaY[index]
                     + 0.25 * originalDeltaY[index + 1]
+            }
+        }
+
+        /// Pull each shared vertex's drawn center laterally toward its own
+        /// neighborhood mean (±3 vertices, σ ≈ 30 m by arc distance) so
+        /// independent GTFS sampling wobble cannot make adjacent wide lanes
+        /// touch. Laterals are measured against the vertex's held normal —
+        /// the same reversal-stable frame the renderer offsets in — and
+        /// longitudinal positions are untouched, so corners are never cut.
+        /// The pull fades to zero outside shared runs over the taper reach,
+        /// and high-curvature neighborhoods keep their raw centers so
+        /// hairpins and tight corners are not distorted. Corridor members
+        /// converge onto the same smooth spine (each adopted the reference
+        /// within the 8 m gate), which is what keeps the drawn lanes
+        /// parallel; divided carriageways beyond the gate keep their own
+        /// centers as before. One Jacobi iteration: every vertex reads the
+        /// pre-pass centers, so the result cannot depend on sweep order.
+        private func smoothSharedLateralCenters(
+            points: [MKMapPoint],
+            deltaX: [Double],
+            deltaY: [Double],
+            sharedVertices: [Bool],
+            metersPerMapPoint: Double
+        ) -> [MKMapPoint] {
+            let count = points.count
+            guard count >= 2,
+                  deltaX.count == count,
+                  deltaY.count == count,
+                  sharedVertices.count == count
+            else {
+                return points
+            }
+            let alignedX = points.indices.map { points[$0].x + deltaX[$0] }
+            let alignedY = points.indices.map { points[$0].y + deltaY[$0] }
+
+            // Held segment directions over the aligned centers, with the
+            // renderer's reversal hold.
+            var heldDirections: [(x: Double, y: Double)] = []
+            heldDirections.reserveCapacity(count - 1)
+            var previousHeld: (x: Double, y: Double)?
+            for index in 0..<(count - 1) {
+                let stepX = alignedX[index + 1] - alignedX[index]
+                let stepY = alignedY[index + 1] - alignedY[index]
+                let length = hypot(stepX, stepY)
+                guard length > 0.000_001 else {
+                    heldDirections.append(previousHeld ?? (x: 1, y: 0))
+                    continue
+                }
+                var unit = (stepX / length, stepY / length)
+                if let previousHeld,
+                   unit.0 * previousHeld.x + unit.1 * previousHeld.y < -0.8 {
+                    unit = (-unit.0, -unit.1)
+                }
+                heldDirections.append(unit)
+                previousHeld = unit
+            }
+            var normalX = Array(repeating: 0.0, count: count)
+            var normalY = Array(repeating: 1.0, count: count)
+            for index in 0..<count {
+                let previous = heldDirections[index == 0 ? 0 : index - 1]
+                let next = heldDirections[
+                    index == count - 1 ? count - 2 : index
+                ]
+                let sumX = -(previous.y + next.y) / 2
+                let sumY = (previous.x + next.x) / 2
+                let length = max(0.000_001, hypot(sumX, sumY))
+                normalX[index] = sumX / length
+                normalY[index] = sumY / length
+            }
+
+            // Raw segment directions for curvature gating: the held chain
+            // deliberately hides reversals, but smoothing must not span one.
+            var rawDirections: [(x: Double, y: Double)] = []
+            rawDirections.reserveCapacity(max(0, count - 1))
+            for index in 0..<(count - 1) {
+                let stepX = points[index + 1].x - points[index].x
+                let stepY = points[index + 1].y - points[index].y
+                let length = hypot(stepX, stepY)
+                if length > 0.000_001 {
+                    rawDirections.append((stepX / length, stepY / length))
+                } else if let last = rawDirections.last {
+                    rawDirections.append(last)
+                } else {
+                    rawDirections.append((x: 1, y: 0))
+                }
+            }
+
+            var arc = Array(repeating: 0.0, count: count)
+            for index in 1..<count {
+                arc[index] = arc[index - 1] + hypot(
+                    alignedX[index] - alignedX[index - 1],
+                    alignedY[index] - alignedY[index - 1]
+                ) * metersPerMapPoint
+            }
+
+            // Full weight on shared vertices, fading to zero over the same
+            // 58 m reach the centerline taper uses.
+            let taperReach: CLLocationDistance = 58
+            var weight = sharedVertices.map { $0 ? 1.0 : 0.0 }
+            var lastSharedArc = -Double.greatestFiniteMagnitude
+            for index in 0..<count {
+                if sharedVertices[index] {
+                    lastSharedArc = arc[index]
+                } else if arc[index] - lastSharedArc < taperReach {
+                    weight[index] = max(
+                        weight[index],
+                        1 - (arc[index] - lastSharedArc) / taperReach
+                    )
+                }
+            }
+            var nextSharedArc = Double.greatestFiniteMagnitude
+            for index in stride(from: count - 1, through: 0, by: -1) {
+                if sharedVertices[index] {
+                    nextSharedArc = arc[index]
+                } else if nextSharedArc - arc[index] < taperReach {
+                    weight[index] = max(
+                        weight[index],
+                        1 - (nextSharedArc - arc[index]) / taperReach
+                    )
+                }
+            }
+
+            let sigma = 30.0
+            let halfWindow = 3
+            var smoothedX = alignedX
+            var smoothedY = alignedY
+            for index in 0..<count {
+                guard weight[index] > 0.001 else { continue }
+                let lower = max(0, index - halfWindow)
+                let upper = min(count - 1, index + halfWindow)
+                // Curvature coherence: the minimum dot between consecutive
+                // raw segments in the window. Near 1 on a straight street
+                // (full smoothing), near -1 through a hairpin (none).
+                var coherence = 1.0
+                if rawDirections.count >= 2 {
+                    let firstSegment = max(0, lower)
+                    let lastSegment = min(upper, rawDirections.count - 1)
+                    if firstSegment < lastSegment {
+                        for segment in firstSegment..<lastSegment {
+                            coherence = min(
+                                coherence,
+                                rawDirections[segment].x
+                                    * rawDirections[segment + 1].x
+                                    + rawDirections[segment].y
+                                    * rawDirections[segment + 1].y
+                            )
+                        }
+                    }
+                }
+                let curvatureFactor = max(0, min(1, (coherence - 0.70) / 0.25))
+                let strength = weight[index] * 0.9 * curvatureFactor
+                guard strength > 0.001 else { continue }
+
+                let axisX = normalX[index]
+                let axisY = normalY[index]
+                var weightedSum = 0.0
+                var weightTotal = 0.0
+                for neighbor in lower...upper {
+                    let distance = abs(arc[neighbor] - arc[index])
+                    let gaussian = exp(
+                        -(distance / sigma) * (distance / sigma)
+                    )
+                    weightedSum += (
+                        alignedX[neighbor] * axisX + alignedY[neighbor] * axisY
+                    ) * gaussian
+                    weightTotal += gaussian
+                }
+                guard weightTotal > 0 else { continue }
+                let base = alignedX[index] * axisX + alignedY[index] * axisY
+                let shift = (weightedSum / weightTotal - base) * strength
+                smoothedX[index] += axisX * shift
+                smoothedY[index] += axisY * shift
+            }
+            return smoothedX.indices.map {
+                MKMapPoint(x: smoothedX[$0], y: smoothedY[$0])
             }
         }
 
@@ -1924,17 +2244,26 @@ struct WayboundMapView: UIViewRepresentable {
                 x: reference.start.x + progress * deltaX,
                 y: reference.start.y + progress * deltaY
             )
-            // Alignment corrects only small feed-to-feed centerline drift on
-            // the same roadway — two publishers sampling the same street a few
-            // meters apart. Santa Barbara's shared transit streets are largely
-            // divided carriageways 12–20 m apart (Hollister, El Colegio, Calle
-            // Real), and freeway ramps braid just as close to their frontage
-            // roads. Adopting a "reference" centerline across that gap is what
-            // drew the 9 loop, 12x, and 24x onto the wrong side of the street
-            // as tapered sideways detours. Partners that far apart still share
-            // the corridor and its lanes; they just keep their own
-            // authoritative centerline instead of snapping to their neighbor's.
-            return point.distance(to: projection) * metersPerMapPoint <= 6
+            // Alignment corrects feed-to-feed centerline drift on the same
+            // roadway — two publishers sampling the same street a few meters
+            // apart. With tube-map-wide lanes that drift must be adopted
+            // essentially fully, or adjacent strands touch wherever the raw
+            // shapes wander toward each other. Santa Barbara's shared transit
+            // streets are largely divided carriageways 12–20 m apart
+            // (Hollister, El Colegio, Calle Real), and freeway ramps braid
+            // just as close to their frontage roads. Adopting a "reference"
+            // centerline across that gap is what drew the 9 loop, 12x, and
+            // 24x onto the wrong side of the street as tapered sideways
+            // detours — so the gate sits at 8 m, comfortably clear of the
+            // 12 m carriageway floor. Partners beyond it still share the
+            // corridor and its lanes; they just keep their own authoritative
+            // centerline instead of snapping to their neighbor's. (This gate
+            // binds direct projection. Members whose sticky reference is
+            // locally matched additionally take the street-anchor pull below
+            // toward the reference line, up to 30 m out; sticky references
+            // are meant to be same-roadway partners, so in practice that
+            // range only closes endpoint and corner residuals.)
+            return point.distance(to: projection) * metersPerMapPoint <= 8
                 ? projection
                 : point
         }
@@ -2208,7 +2537,7 @@ struct WayboundMapView: UIViewRepresentable {
             if let pulse = overlay as? RoutePulseOverlay {
                 let renderer = MKMultiPolylineRenderer(multiPolyline: pulse)
                 renderer.strokeColor = pulse.color.withAlphaComponent(0.5)
-                renderer.lineWidth = 14
+                renderer.lineWidth = 18
                 renderer.lineCap = .round
                 renderer.lineJoin = .round
                 return renderer
@@ -2366,16 +2695,37 @@ struct WayboundMapView: UIViewRepresentable {
                     }
                 }
 
-                for index in 0..<(lanePoints.count - 1) {
-                    let isShared = laneSamples.sharedVertices[index]
-                        && laneSamples.sharedVertices[index + 1]
+                let tapSegmentCount = lanePoints.count - 1
+                let tapSharedSegments = (0..<tapSegmentCount).map { segmentIndex in
+                    laneSamples.sharedVertices[segmentIndex]
+                        && laneSamples.sharedVertices[segmentIndex + 1]
+                }
+                let tapBoundaryJoints = (0..<tapSegmentCount).map { segmentIndex in
+                    tapSharedSegments[segmentIndex]
+                        && ((segmentIndex > 0
+                                && !tapSharedSegments[segmentIndex - 1])
+                            || (segmentIndex + 1 < tapSegmentCount
+                                && !tapSharedSegments[segmentIndex + 1]))
+                }
+                for index in 0..<tapSegmentCount {
+                    let isShared = tapSharedSegments[index]
                     let hasIsolatedCoverage =
                         laneSamples.isolatedVertices[index]
                         && laneSamples.isolatedVertices[index + 1]
                     // Mirror the renderer: any segment still carrying isolated
                     // geometry is drawn at full strength at every zoom, so it
-                    // is always tappable.
-                    if !isShared || hasIsolatedCoverage {
+                    // is always tappable. Boundary joints (shared segments
+                    // touching an isolated neighbor) are drawn full for the
+                    // same reason.
+                    let touchesIsolatedNeighbor =
+                        (index > 0 && !tapSharedSegments[index - 1])
+                        || (index + 1 < tapSegmentCount
+                            && !tapSharedSegments[index + 1])
+                    let isCornerZone = tapBoundaryJoints[index]
+                        || (index > 0 && tapBoundaryJoints[index - 1])
+                        || (index + 1 < tapSegmentCount
+                            && tapBoundaryJoints[index + 1])
+                    if !isShared || hasIsolatedCoverage || touchesIsolatedNeighbor {
                         considerSegment(
                             from: lanePoints[index],
                             to: lanePoints[index + 1]
@@ -2390,7 +2740,7 @@ struct WayboundMapView: UIViewRepresentable {
                     }
                     let ownsTrunk = laneSamples.trunkOwnerVertices[index]
                         && laneSamples.trunkOwnerVertices[index + 1]
-                    if ownsTrunk, trunkProgress > 0.05 {
+                    if ownsTrunk, !isCornerZone, trunkProgress > 0.05 {
                         considerSegment(
                             from: laneSamples.points[index],
                             to: laneSamples.points[index + 1]
@@ -2399,7 +2749,7 @@ struct WayboundMapView: UIViewRepresentable {
                 }
             }
 
-            if let best, best.distance <= 14,
+            if let best, best.distance <= 18,
                parent.journeys.contains(where: { $0.id == best.journeyID }) {
                 parent.onSelectJourney(best.journeyID)
             }
@@ -2553,18 +2903,47 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
         // coverage — treating those as purely shared made entire routes fade
         // with the detail cross-fade even though most of that stretch was not
         // interlined at all.
+        // A shared segment straddling a corridor boundary — the turn itself
+        // at a fork — reads as the route's own corner, not corridor
+        // interior. Its isolated neighbors draw at full strength at every
+        // zoom; if the joint faded with the detail cross-fade instead, each
+        // turning line would break into a little X at mid-zoom. Keep
+        // boundary joints fully drawn on their own lane, and keep the
+        // corridor trunk off them: the trunk's single centerline cannot
+        // represent each route's own turn, so drawing both ghosts the
+        // corner.
+        let boundaryJointSegments = (0..<segmentCount).map { index in
+            sharedSegments[index]
+                && ((index > 0 && !sharedSegments[index - 1])
+                    || (index + 1 < segmentCount
+                        && !sharedSegments[index + 1]))
+        }
+        // The trunk's centerline legs would stab through each route's own
+        // lane-V at the corner, so the trunk stays off boundary joints and
+        // their immediate arms. Run interiors keep their spine.
+        let cornerZoneSegments = (0..<segmentCount).map { index in
+            boundaryJointSegments[index]
+                || (index > 0 && boundaryJointSegments[index - 1])
+                || (index + 1 < segmentCount
+                    && boundaryJointSegments[index + 1])
+        }
         let isolatedSegments = (0..<segmentCount).map { index in
             !sharedSegments[index]
                 || (laneSamples.isolatedVertices[index]
                     && laneSamples.isolatedVertices[index + 1])
+                || boundaryJointSegments[index]
         }
         let ownedTrunkSegments = (0..<segmentCount).map { index in
             sharedSegments[index]
                 && hasOwnerState
                 && laneSamples.trunkOwnerVertices[index]
                 && laneSamples.trunkOwnerVertices[index + 1]
+                && !cornerZoneSegments[index]
         }
-        let tolerance = 0.7 / zoomScale
+        // Sub-point RDP cleanup after the lane offset is applied. With
+        // tube-map-wide strokes the tolerance grows slightly so residual
+        // shape noise cannot wiggle a strand's edge into its neighbor.
+        let tolerance = 0.9 / zoomScale
         let isolatedPath = routeSegmentPath(
             points: offsetPoints,
             includedSegments: isolatedSegments,
@@ -2652,8 +3031,22 @@ private final class RouteLaneRenderer: MKOverlayRenderer {
 
         // Branches never become gray or disappear. Their persistent route color,
         // edge destination tag, and selected-route emphasis preserve where each
-        // service goes even while only shared geometry is consolidated.
+        // service goes even while only shared geometry is consolidated. The ink
+        // casing matches the shared ribbon's: where two branches' GTFS shapes
+        // run close without sharing a corridor, the overlap reads as a clean
+        // crossing instead of a color blend.
         if isolatedPath.hasContent {
+            context.addPath(isolatedPath.path)
+            context.setStrokeColor(
+                UIColor.black.withAlphaComponent(
+                    CGFloat(min(0.72, baseOpacity * 0.72))
+                ).cgColor
+            )
+            context.setLineWidth(
+                CGFloat(lineWidth + RouteMapStyle.separatorWidth) / zoomScale
+            )
+            context.strokePath()
+
             context.addPath(isolatedPath.path)
             context.setStrokeColor(
                 routeOverlay.color.withAlphaComponent(CGFloat(baseOpacity)).cgColor
@@ -2835,12 +3228,14 @@ private func stableRouteOffsetPoints(
           offsets.contains(where: { abs($0) > 0.0001 })
     else { return points }
     var directions: [CGPoint] = []
+    var lengths: [CGFloat] = []
     var previousDirection: CGPoint?
 
     for index in 0..<(points.count - 1) {
         let deltaX = points[index + 1].x - points[index].x
         let deltaY = points[index + 1].y - points[index].y
-        let length = max(0.0001, hypot(deltaX, deltaY))
+        let rawLength = hypot(deltaX, deltaY)
+        let length = max(0.0001, rawLength)
         var direction = CGPoint(x: deltaX / length, y: deltaY / length)
 
         // An abrupt reversal is almost always duplicate GTFS shape sampling.
@@ -2853,10 +3248,20 @@ private func stableRouteOffsetPoints(
             direction.y *= -1
         }
         directions.append(direction)
+        lengths.append(rawLength)
         previousDirection = direction
     }
 
-    return points.indices.map { index in
+    // Pass 1: the natural mitered offset at every vertex, with the 1.75x
+    // miter limit. Also records each vertex's sin(beta) and drawn miter
+    // reach for the collapse pass below.
+    var natural: [CGPoint] = []
+    var sines: [CGFloat] = []
+    var miterReach: [CGFloat] = []
+    natural.reserveCapacity(points.count)
+    sines.reserveCapacity(points.count)
+    miterReach.reserveCapacity(points.count)
+    for index in points.indices {
         let previousDirection = directions[index == 0 ? 0 : index - 1]
         let nextDirection = directions[
             index == points.count - 1 ? directions.count - 1 : index
@@ -2873,11 +3278,15 @@ private func stableRouteOffsetPoints(
         let localOffset = offsets[index]
         var normal = nextNormal
         var scale = localOffset
+        var sine: CGFloat = 0
         if sumLength > 0.001 {
             normal = CGPoint(x: sumX / sumLength, y: sumY / sumLength)
             let denominator = normal.x * nextNormal.x + normal.y * nextNormal.y
             if denominator > 0.25 {
                 scale = localOffset / denominator
+            }
+            if index > 0, index < points.count - 1 {
+                sine = sqrt(max(0, 1 - denominator * denominator))
             }
         }
         let maximumMiter = abs(localOffset) * 1.75
@@ -2886,11 +3295,67 @@ private func stableRouteOffsetPoints(
         } else {
             scale = min(0, max(-maximumMiter, scale))
         }
-        return CGPoint(
+        natural.append(CGPoint(
             x: points[index].x + normal.x * scale,
             y: points[index].y + normal.y * scale
-        )
+        ))
+        sines.append(sine)
+        miterReach.append(abs(scale))
     }
+
+    // Pass 2: collapse vertices a corner miter overshoots. A miter sits
+    // scale * sin(beta) along each adjacent leg from the apex; when that
+    // reach passes a straight neighbor vertex (route 5's 96° downtown
+    // corner: 22 m of miter reach on 12/14.5 m legs at street scale, and
+    // more as constant-screen lane offsets outgrow ground-fixed legs when
+    // zooming out), the neighbor's plain lateral shift lands past the
+    // offset lines' crossing, and the polyline folds back over itself
+    // into a little X at the apex. The neighbor is redundant — the entry
+    // line already runs through the miter — so collapse it onto the
+    // miter instead. The walk runs outward while the miter's reach covers
+    // plain contiguous joints, so wide mid-zoom miters cascade past every
+    // vertex they overshoot. The corner keeps its full sharp miter; only
+    // overshot straight joints move. Apexes stand on their own miters,
+    // endpoints keep their coverage, and a vertex claimed from several
+    // sides takes the centroid, so the pass is order-free and never
+    // changes the point count.
+    var output = natural
+    if points.count > 2 {
+        var claims: [[CGPoint]] = Array(
+            repeating: [],
+            count: points.count
+        )
+        for apex in 1..<(points.count - 1) {
+            guard sines[apex] > 0.02 else { continue }
+            let reach = miterReach[apex] * sines[apex]
+            for direction in [-1, 1] {
+                var pathDistance: CGFloat = 0
+                var cursor = apex
+                while true {
+                    let next = cursor + direction
+                    guard next > 0, next < points.count - 1,
+                          sines[next] <= 0.1
+                    else { break }
+                    pathDistance += lengths[min(cursor, next)]
+                    guard pathDistance < reach else { break }
+                    claims[next].append(natural[apex])
+                    cursor = next
+                }
+            }
+        }
+        for middle in 1..<(points.count - 1) {
+            if claims[middle].count == 1 {
+                output[middle] = claims[middle][0]
+            } else if claims[middle].count > 1 {
+                let count = CGFloat(claims[middle].count)
+                output[middle] = CGPoint(
+                    x: claims[middle].map(\.x).reduce(0, +) / count,
+                    y: claims[middle].map(\.y).reduce(0, +) / count
+                )
+            }
+        }
+    }
+    return output
 }
 
 private func routePerpendicularDistance(
@@ -3041,8 +3506,10 @@ private final class DestinationAnnotationView: MKAnnotationView {
 
     func configure(with annotation: DestinationMapAnnotation) {
         subviews.forEach { $0.removeFromSuperview() }
-        let width: CGFloat = 158
-        let height: CGFloat = 42
+        // Must match destinationTagCandidates' size: the layout frame is
+        // what collision-testing sees, this view is what draws.
+        let width: CGFloat = 184
+        let height: CGFloat = 54
         frame = CGRect(x: 0, y: 0, width: width, height: height)
         centerOffset = annotation.viewCenterOffset
         alpha = annotation.isDimmed ? 0.24 : 1
@@ -3051,11 +3518,11 @@ private final class DestinationAnnotationView: MKAnnotationView {
             : (annotation.rank < 3 ? .defaultHigh : .defaultLow)
 
         let routeColor = UIColor(annotation.journey.route.color)
-        let card = UIView(frame: CGRect(x: 4, y: 4, width: 150, height: 34))
+        let card = UIView(frame: CGRect(x: 4, y: 4, width: 176, height: 46))
         card.backgroundColor = UIColor(
             red: 0.965, green: 0.945, blue: 0.89, alpha: 0.97
         )
-        card.layer.cornerRadius = 9
+        card.layer.cornerRadius = 11
         card.layer.borderWidth = 1
         card.layer.borderColor = routeColor.cgColor
         card.layer.shadowColor = UIColor.black.cgColor
@@ -3064,27 +3531,27 @@ private final class DestinationAnnotationView: MKAnnotationView {
         card.layer.shadowOffset = CGSize(width: 0, height: 1)
         addSubview(card)
 
-        let colorBar = UIView(frame: CGRect(x: 0, y: 0, width: 5, height: 34))
+        let colorBar = UIView(frame: CGRect(x: 0, y: 0, width: 6, height: 46))
         colorBar.backgroundColor = routeColor
-        colorBar.layer.cornerRadius = 2.5
+        colorBar.layer.cornerRadius = 3
         card.addSubview(colorBar)
 
         let routePrefix = annotation.journey.route.routeNumber.map { "\($0) · " } ?? ""
-        let destinationLabel = UILabel(frame: CGRect(x: 10, y: 3, width: 134, height: 15))
-        destinationLabel.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        let destinationLabel = UILabel(frame: CGRect(x: 12, y: 5, width: 158, height: 19))
+        destinationLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
         destinationLabel.textColor = UIColor(
             red: 0.14, green: 0.19, blue: 0.18, alpha: 1
         )
         // The tag's one job is naming the place. The compact landmark form
-        // ("Camino Real Marketplace") survives 134 points; the full stop name
+        // ("Camino Real Marketplace") survives 158 points; the full stop name
         // usually truncates into "Hollister & Camin…", which names nothing.
         destinationLabel.text = routePrefix
             + annotation.journey.compactDestinationName
         destinationLabel.lineBreakMode = .byTruncatingTail
         card.addSubview(destinationLabel)
 
-        let timeLabel = UILabel(frame: CGRect(x: 10, y: 18, width: 134, height: 13))
-        timeLabel.font = .monospacedDigitSystemFont(ofSize: 9, weight: .bold)
+        let timeLabel = UILabel(frame: CGRect(x: 12, y: 25, width: 158, height: 16))
+        timeLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .bold)
         timeLabel.textColor = routeColor
         let arrivalTime = annotation.journey.arrivalDate.formatted(
             date: .omitted,
@@ -3095,15 +3562,15 @@ private final class DestinationAnnotationView: MKAnnotationView {
 
         let pin = UIView(
             frame: CGRect(
-                x: annotation.pinCenter.x - 3.5,
-                y: annotation.pinCenter.y - 3.5,
-                width: 7,
-                height: 7
+                x: annotation.pinCenter.x - 4.5,
+                y: annotation.pinCenter.y - 4.5,
+                width: 9,
+                height: 9
             )
         )
         pin.backgroundColor = routeColor
-        pin.layer.cornerRadius = 3.5
-        pin.layer.borderWidth = 1.5
+        pin.layer.cornerRadius = 4.5
+        pin.layer.borderWidth = 2
         pin.layer.borderColor = UIColor.white.cgColor
         addSubview(pin)
 
@@ -3117,7 +3584,7 @@ private final class RouteStopAnnotationView: MKAnnotationView {
 
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
-        frame = CGRect(x: 0, y: 0, width: 11, height: 11)
+        frame = CGRect(x: 0, y: 0, width: 14, height: 14)
         centerOffset = .zero
         collisionMode = .none
         displayPriority = .required
@@ -3156,7 +3623,7 @@ private final class RouteStopAnnotationView: MKAnnotationView {
         )
         context.fillEllipse(in: outerCircle)
 
-        let markerCircle = rect.insetBy(dx: 2.25, dy: 2.25)
+        let markerCircle = rect.insetBy(dx: 3, dy: 3)
         let visibleColors = colors.isEmpty
             ? [UIColor.systemGray] : Array(colors.prefix(6))
         if visibleColors.count == 1 {
@@ -3186,8 +3653,8 @@ private final class RouteStopAnnotationView: MKAnnotationView {
 
 private final class StopClusterAnnotationView: MKAnnotationView {
     private let routeLabel = UILabel()
-    private let horizontalInset: CGFloat = 6
-    private let verticalInset: CGFloat = 4
+    private let horizontalInset: CGFloat = 8
+    private let verticalInset: CGFloat = 5
 
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
@@ -3244,7 +3711,7 @@ private final class StopClusterAnnotationView: MKAnnotationView {
                 NSAttributedString(
                     string: item.0,
                     attributes: [
-                        .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .black),
+                        .font: UIFont.monospacedSystemFont(ofSize: 12, weight: .black),
                         .foregroundColor: item.1,
                     ]
                 )
@@ -3253,17 +3720,17 @@ private final class StopClusterAnnotationView: MKAnnotationView {
         routeLabel.attributedText = text
 
         let labelSize = routeLabel.sizeThatFits(
-            CGSize(width: CGFloat.greatestFiniteMagnitude, height: 20)
+            CGSize(width: CGFloat.greatestFiniteMagnitude, height: 24)
         )
         bounds.size = CGSize(
-            width: max(25, ceil(labelSize.width) + horizontalInset * 2),
-            height: 23
+            width: max(30, ceil(labelSize.width) + horizontalInset * 2),
+            height: 28
         )
         setNeedsLayout()
 
         alpha = annotation.isDimmed ? 0.22 : 1
         transform = annotation.isSelected
-            ? CGAffineTransform(scaleX: 1.1, y: 1.1)
+            ? CGAffineTransform(scaleX: 1.12, y: 1.12)
             : .identity
         let numbers = numberColors.map { $0.0 }.joined(separator: ", ")
         accessibilityLabel = "\(annotation.stop.name), routes \(numbers)"
@@ -3286,21 +3753,21 @@ private final class LadderStopAnnotationView: MKAnnotationView {
 
     func configure(with annotation: LadderStopMapAnnotation) {
         subviews.forEach { $0.removeFromSuperview() }
-        frame = CGRect(x: 0, y: 0, width: 170, height: 28)
-        centerOffset = CGPoint(x: 80, y: 0)
+        frame = CGRect(x: 0, y: 0, width: 200, height: 34)
+        centerOffset = CGPoint(x: 94, y: 0)
 
-        let dot = UIView(frame: CGRect(x: 0, y: 8.5, width: 11, height: 11))
+        let dot = UIView(frame: CGRect(x: 0, y: 10.5, width: 13, height: 13))
         dot.backgroundColor = UIColor(annotation.journey.route.color)
-        dot.layer.cornerRadius = 5.5
+        dot.layer.cornerRadius = 6.5
         dot.layer.borderColor = UIColor.white.cgColor
         dot.layer.borderWidth = 2
         addSubview(dot)
 
-        let label = UILabel(frame: CGRect(x: 15, y: 2, width: 151, height: 24))
+        let label = UILabel(frame: CGRect(x: 17, y: 3, width: 179, height: 28))
         label.backgroundColor = UIColor(red: 0.965, green: 0.945, blue: 0.89, alpha: 0.92)
-        label.layer.cornerRadius = 7
+        label.layer.cornerRadius = 8
         label.layer.masksToBounds = true
-        label.font = .systemFont(ofSize: 9.5, weight: .medium)
+        label.font = .systemFont(ofSize: 11.5, weight: .medium)
         label.textColor = UIColor(red: 0.14, green: 0.19, blue: 0.18, alpha: 1)
         label.text = "  +\(annotation.stop.minutesFromBoarding)  \(annotation.stop.name)"
         label.lineBreakMode = .byTruncatingTail

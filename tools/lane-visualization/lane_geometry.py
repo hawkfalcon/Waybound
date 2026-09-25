@@ -54,7 +54,8 @@ def meters_per_unit(latitude):
 def ribbon(aligned, offsets, meters_per_unit_value,
            screen_points_per_map_point=SCREEN_POINTS_PER_MAP_POINT):
     """LaneHarness.ribbon, in Python: averaged-normal offsetting with the
-    reversal side-hold and the 1.75x miter limit."""
+    reversal side-hold, the 1.75x miter limit, and the overshoot collapse
+    (straight neighbors past the miter's reach fold onto the miter)."""
     k = meters_per_unit_value / screen_points_per_map_point
     points = [(x * k, y * k) for x, y in aligned]
     n = len(points)
@@ -62,18 +63,21 @@ def ribbon(aligned, offsets, meters_per_unit_value,
         return points, list(offsets)
 
     directions = []
+    lengths = []
     previous = None
     for i in range(n - 1):
         dx = points[i + 1][0] - points[i][0]
         dy = points[i + 1][1] - points[i][1]
-        length = max(1e-4, math.hypot(dx, dy))
+        raw_length = math.hypot(dx, dy)
+        length = max(1e-4, raw_length)
         ux, uy = dx / length, dy / length
         if previous and ux * previous[0] + uy * previous[1] < -0.8:
             ux, uy = -ux, -uy
         directions.append((ux, uy))
+        lengths.append(raw_length)
         previous = (ux, uy)
 
-    out, lateral = [], []
+    natural, sines, reach, lateral = [], [], [], []
     for i in range(n):
         pd = directions[max(i - 1, 0)]
         nd = directions[min(i, n - 2)]
@@ -82,18 +86,60 @@ def ribbon(aligned, offsets, meters_per_unit_value,
         sx, sy = pn[0] + nn[0], pn[1] + nn[1]
         sl = math.hypot(sx, sy)
         local = offsets[i]
-        normal, scale = nn, local
+        normal, scale, sine = nn, local, 0.0
         if sl > 0.001:
             normal = (sx / sl, sy / sl)
             denom = normal[0] * nn[0] + normal[1] * nn[1]
             if denom > 0.25:
                 scale = local / denom
+            if 0 < i < n - 1:
+                sine = math.sqrt(max(0.0, 1.0 - denom * denom))
         maximum_miter = abs(local) * 1.75
         scale = (max(0.0, min(maximum_miter, scale)) if local >= 0
                  else min(0.0, max(-maximum_miter, scale)))
-        out.append((points[i][0] + normal[0] * scale,
-                    points[i][1] + normal[1] * scale))
+        natural.append((points[i][0] + normal[0] * scale,
+                        points[i][1] + normal[1] * scale))
+        sines.append(sine)
+        reach.append(abs(scale))
         lateral.append(scale * (normal[0] * nn[0] + normal[1] * nn[1]))
+    # Collapse pass (mirrors stableRouteOffsetPoints / LaneHarness):
+    # each corner miter walks outward and claims every plain contiguous
+    # joint within its reach along the legs — a claimed vertex is
+    # redundant (its plain shift would land past the offset lines'
+    # crossing and fold the polyline into an X), so it collapses onto
+    # the miter. The cascade matters at mid zoom, where constant-screen
+    # lane offsets outgrow ground-fixed legs and one miter can overshoot
+    # several vertices. Apexes stand, endpoints keep their coverage.
+    out = list(natural)
+    if n > 2:
+        claims = [[] for _ in range(n)]
+        for apex in range(1, n - 1):
+            if sines[apex] <= 0.02:
+                continue
+            apex_reach = reach[apex] * sines[apex]
+            for direction in (-1, 1):
+                path_distance = 0.0
+                cursor = apex
+                while True:
+                    nxt = cursor + direction
+                    if not (0 < nxt < n - 1):
+                        break
+                    if sines[nxt] > 0.1:
+                        break
+                    path_distance += lengths[min(cursor, nxt)]
+                    if not path_distance < apex_reach:
+                        break
+                    claims[nxt].append(natural[apex])
+                    cursor = nxt
+        for middle in range(1, n - 1):
+            if len(claims[middle]) == 1:
+                out[middle] = claims[middle][0]
+            elif len(claims[middle]) > 1:
+                count = len(claims[middle])
+                out[middle] = (
+                    sum(c[0] for c in claims[middle]) / count,
+                    sum(c[1] for c in claims[middle]) / count,
+                )
     return out, lateral
 
 
